@@ -8,6 +8,40 @@ import matplotlib.pyplot as plt
 from functools import partial
 
 
+# --- Allgather-based mini-batch variance (an toàn/nhanh) ---
+def mb_variance_allgather_per_sample(a):
+    """
+    Tính variance (σ²) cho activation a tại một layer, theo mini-batch,
+    bằng cách: reduce theo (H,W,C,...) -> vector [B_local], rồi allgather
+    vector đó để lấy [B_global]. Trả về mean σ² trên global batch.
+    """
+    a32 = a.astype(jnp.float32)
+    # Giữ trục batch, reduce các trục còn lại
+    red_axes = tuple(range(1, a32.ndim)) if a32.ndim >= 2 else ()
+    mean_b = jnp.mean(a32, axis=red_axes)                 # [B_local]
+    mean2_b = jnp.mean(a32 * a32, axis=red_axes)           # [B_local]
+    var_b = jnp.maximum(mean2_b - mean_b * mean_b, 0.0)  # [B_local]
+
+    # allgather vector [B_local] -> [num_hosts, B_local] rồi ghép về [B_global]
+    var_b_g = jax.experimental.multihost_utils.process_allgather(var_b)
+    var_b_g = np.array(var_b_g).reshape(-1)                # [B_global]
+    # scalar (σ² trung bình theo batch)
+    return float(var_b_g.mean())
+
+
+def mb_l2_allgather_per_sample(a):
+    """
+    (Nếu bạn muốn log thêm L2 norm theo batch) – cùng kỹ thuật:
+    reduce theo không-batch -> vector [B_local], allgather -> mean.
+    """
+    a32 = a.astype(jnp.float32)
+    red_axes = tuple(range(1, a32.ndim)) if a32.ndim >= 2 else ()
+    l2_b = jnp.sqrt(jnp.sum(a32 * a32, axis=red_axes))     # [B_local]
+    l2_b_g = jax.experimental.multihost_utils.process_allgather(l2_b)
+    l2_b_g = np.array(l2_b_g).reshape(-1)
+    return float(l2_b_g.mean())
+
+
 def eval_model(
     FLAGS,
     train_state,
@@ -25,6 +59,12 @@ def eval_model(
     fid_from_stats,
     truth_fid_stats,
 ):
+
+    # các biến theo dõi trong quá trình denoising
+    TRACK_STEPS = [1, 4, 32, 128]
+    TRACK_LAYERS = [f"dit_block_{i}" for i in range(
+        FLAGS.model.depth)] + ["patch_embed", "final_layer"]
+
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
@@ -164,7 +204,7 @@ def eval_model(
 
         print("Denoising at N steps")
 
-        denoise_timesteps_list = [1, 2, 4, 8, 16, 32]
+        denoise_timesteps_list = TRACK_STEPS
         if FLAGS.model.denoise_timesteps == 128:
             denoise_timesteps_list.append(128)
         if FLAGS.model.cfg_scale != 0:
@@ -179,6 +219,11 @@ def eval_model(
             delta_t = 1.0 / denoise_timesteps
             x = eps  # [local_batch, ...]
             x = shard_data(x)  # [batch, ...] (on all devices)
+
+            # lưu các biến tính var theo layer cho từng timesteps
+            var_series = {k: [] for k in TRACK_LAYERS}
+            # log_prod_sigma = []  # (tuỳ chọn)
+
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps  # From x_0 (noise) to x_1 (data)
                 t_vector = jnp.full((eps.shape[0],), t)
@@ -190,6 +235,22 @@ def eval_model(
                     v, logvars, activations = call_model(train_state, x, t_vector, dt_base,
                                                          visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond,
                                                          return_activations=True)
+
+                    # --- tính σ² theo batch cho từng layer (dùng allgather) ---
+                    # sigmas = []
+                    for lname in TRACK_LAYERS:
+                        a = activations.get(lname, None)
+                        if a is None:
+                            continue
+                        var_l = mb_variance_allgather_per_sample(
+                            a)   # σ² (global-batch)
+                        var_series[lname].append(var_l)
+                        # nếu muốn log product-of-sigma
+                        # sigmas.append(np.sqrt(max(var_l, 1e-12)))
+
+                    # if sigmas:  # (tuỳ chọn) log ∑log σ để ổn định số học
+                    #     log_prod_sigma.append(
+                    #         float(np.sum(np.log(np.maximum(sigmas, 1e-12)))))
 
                 else:
                     v_cond = call_model(
@@ -234,6 +295,20 @@ def eval_model(
                 d_label = 'cfg' if do_cfg else denoise_timesteps
                 wandb.log({f'sample_N/{d_label}': wandb.Image(fig)}, step=step)
                 plt.close(fig)
+
+                # --- NEW: log variance theo layer/timestep cho N này ---
+                if jax.process_index() == 0:
+                    for lname, ys in var_series.items():
+                        tbl = wandb.Table(
+                            columns=["timestep", "variance", "checkpoint", "N", "layer"])
+                        for tt, val in enumerate(ys):
+                            tbl.add_data(tt, float(val), int(
+                                step), int(denoise_timesteps), lname)
+                        wandb.log({
+                            f"input_variance/{lname}/N={denoise_timesteps}":
+                            wandb.plot.line(tbl, x="timestep", y="variance", stroke="checkpoint",
+                                            title=f"{lname} | N={denoise_timesteps} (σ² over minibatch)")
+                        }, step=step)
 
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
