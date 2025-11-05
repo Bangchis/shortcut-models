@@ -61,7 +61,8 @@ def eval_model(
 ):
 
     # các biến theo dõi trong quá trình denoising
-    TRACK_STEPS = [1, 4, 32, 128]
+    TRACK_STEPS = [1, 4, 32] + \
+        ([128] if FLAGS.model.denoise_timesteps == 128 else [])
     TRACK_LAYERS = [f"dit_block_{i}" for i in range(
         FLAGS.model.depth)] + ["patch_embed", "final_layer"]
 
