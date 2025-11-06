@@ -52,7 +52,6 @@ def eval_model(
 ):
 
     # các biến theo dõi trong quá trình denoising
-    TRACK_STEPS = [1, 4, 32]
     TRACK_LAYERS = [f"dit_block_{i}" for i in range(
         FLAGS.model.depth)] + ["patch_embed", "final_layer"]
 
@@ -195,13 +194,16 @@ def eval_model(
 
         print("Denoising at N steps")
 
-        denoise_timesteps_list = TRACK_STEPS
+        # đã bỏ và thay bằng variance_steps và fid_steps
+        denoise_timesteps_list = [1, 4, 32]
         if FLAGS.model.denoise_timesteps == 128:
             denoise_timesteps_list.append(128)
         if FLAGS.model.cfg_scale != 0:
             denoise_timesteps_list.append('cfg')
 
-        for denoise_timesteps in denoise_timesteps_list:
+        variance_steps = sorted({1, 4, 32, int(FLAGS.model.denoise_timesteps)})
+
+        for denoise_timesteps in variance_steps:
             do_cfg = False
             if denoise_timesteps == 'cfg':
                 denoise_timesteps = denoise_timesteps_list[-2]
@@ -358,7 +360,11 @@ def eval_model(
                 denoise_timesteps_list.append(128)
             if FLAGS.model.cfg_scale != 0:
                 denoise_timesteps_list.append('cfg')
-            for denoise_timesteps in denoise_timesteps_list:
+
+            fid_steps = variance_steps + \
+                (['cfg'] if FLAGS.model.cfg_scale != 0 else [])
+
+            for denoise_timesteps in fid_steps:
                 if denoise_timesteps == 'cfg':
                     activations = do_fid_calc(
                         FLAGS.model.cfg_scale, FLAGS.model.denoise_timesteps)
