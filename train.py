@@ -270,16 +270,24 @@ def main(_):
             loss = jnp.mean(mse_v)
 
             def _mb_variance_per_sample(a: jnp.ndarray) -> jnp.ndarray:
+                DP_AXIS = "dp"  # đổi thành "data" nếu mesh của bạn đặt tên như vậy
+
                 a32 = a.astype(jnp.float32)
-                # giữ trục batch, reduce phần còn lại
-                red_axes = tuple(range(1, a32.ndim))
-                mean_b = jnp.mean(a32, axis=red_axes)          # [B_local]
-                mean2_b = jnp.mean(a32 * a32, axis=red_axes)    # [B_local]
+                red_axes = tuple(range(1, a32.ndim))           # giữ trục batch
+                mean_b = jnp.mean(a32, axis=red_axes)         # [B_local]
+                mean2_b = jnp.mean(a32 * a32, axis=red_axes)   # [B_local]
                 var_b = jnp.maximum(mean2_b - mean_b *
                                     mean_b, 0.0)  # [B_local]
-                # gather toàn bộ batch xuyên device (pjit-friendly)
-                var_b_global = all_gather(var_b)                # [B_global]
-                return jnp.mean(var_b_global)                   # scalar
+
+                # --- Global mean = (psum(sum_local) / psum(n_local)) để đúng cả khi batch không đều ---
+                sum_local = jnp.sum(var_b)
+                n_local = jnp.array(var_b.shape[0], dtype=sum_local.dtype)
+
+                sum_global = jax.lax.psum(sum_local, axis_name=DP_AXIS)
+                n_global = jax.lax.psum(n_local,   axis_name=DP_AXIS)
+
+                return sum_global / n_global
+                # scalar
 
             # Chọn đúng các tensor "theo lớp" (post-activation là đủ)
             layer_order = (
