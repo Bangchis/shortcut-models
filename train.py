@@ -59,7 +59,7 @@ model_config = ml_collections.ConfigDict({
     'target_update_rate': 0.999,
     'use_ema': 1,
     'use_stable_vae': 1,
-    'sharding': 'fsdp',  # dp or fsdp.
+    'sharding': 'dp',  # dp or fsdp.
     't_sampling': 'discrete-dt',
     'dt_sampling': 'uniform',
     'bootstrap_cfg': 0,
