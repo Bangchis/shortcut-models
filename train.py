@@ -63,7 +63,7 @@ model_config = ml_collections.ConfigDict({
     't_sampling': 'discrete-dt',
     'dt_sampling': 'uniform',
     'bootstrap_cfg': 0,
-    'bootstrap_every': 16,  # Make sure its a divisor of batch size.
+    'bootstrap_every': 24,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut'  # or naive.
@@ -269,48 +269,27 @@ def main(_):
             mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
             loss = jnp.mean(mse_v)
 
-            def _mb_variance_per_sample(a: jnp.ndarray) -> jnp.ndarray:
-                DP_AXIS = "dp"  # đổi thành "data" nếu mesh của bạn đặt tên như vậy
-
+            def _mb_var_simple(a: jnp.ndarray) -> jnp.ndarray:
+                # Var per-sample rồi mean (LOCAL, không collective)
                 a32 = a.astype(jnp.float32)
-                red_axes = tuple(range(1, a32.ndim))           # giữ trục batch
-                mean_b = jnp.mean(a32, axis=red_axes)         # [B_local]
-                mean2_b = jnp.mean(a32 * a32, axis=red_axes)   # [B_local]
-                var_b = jnp.maximum(mean2_b - mean_b *
-                                    mean_b, 0.0)  # [B_local]
+                red_axes = tuple(range(1, a32.ndim)) if a32.ndim >= 2 else ()
+                per_sample_var = jnp.var(
+                    a32, axis=red_axes) if red_axes else jnp.var(a32)
+                return jnp.mean(per_sample_var)  # scalar local
 
-                # --- Global mean = (psum(sum_local) / psum(n_local)) để đúng cả khi batch không đều ---
-                sum_local = jnp.sum(var_b)
-                n_local = jnp.array(var_b.shape[0], dtype=sum_local.dtype)
+                # 1) Input variance (x_t là input của model)
+            var_input_xt = _mb_var_simple(x_t)
 
-                sum_global = jax.lax.psum(sum_local, axis_name=DP_AXIS)
-                n_global = jax.lax.psum(n_local,   axis_name=DP_AXIS)
-
-                return sum_global / n_global
-                # scalar
-
-            # Chọn đúng các tensor "theo lớp" (post-activation là đủ)
-            layer_order = (
-                ['patch_embed']
-                + [f'dit_block_{i}' for i in range(FLAGS.model['depth'])]
-                + ['final_layer']
-            )
-            layer_sigma2_vals = []   # để tính product log
-            # để đưa vào info (mỗi layer thành một metric riêng)
+            # 2) Variance theo layer (patch_embed, các dit_block, final_layer)
+            layer_order = (['patch_embed']
+                           + [f'dit_block_{i}' for i in range(FLAGS.model['depth'])]
+                           + ['final_layer'])
             layer_sigma2_dict = {}
 
             for li, lname in enumerate(layer_order):
                 if lname in activations:
-                    sigma2 = _mb_variance_per_sample(
-                        activations[lname])  # dùng hàm mới
+                    sigma2 = _mb_var_simple(activations[lname])
                     layer_sigma2_dict[f'var_mb/Layer {li} ({lname})'] = sigma2
-                    layer_sigma2_vals.append(jnp.maximum(sigma2, 1e-12))
-
-            # product log variance qua các layer (để xem khuynh hướng “co/giãn”)
-            product_log_sigma2 = (
-                jnp.sum(jnp.log(jnp.stack(layer_sigma2_vals)))
-                if layer_sigma2_vals else jnp.array(0.0, jnp.float32)
-            )
 
             # --- NEW ----------------------------------------------------------------}
             # cái này là tính cho cả batch
