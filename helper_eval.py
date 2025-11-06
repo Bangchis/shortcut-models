@@ -29,17 +29,8 @@ def mb_variance_allgather_per_sample(a):
     return float(var_b_g.mean())
 
 
-def mb_l2_allgather_per_sample(a):
-    """
-    (Nếu bạn muốn log thêm L2 norm theo batch) – cùng kỹ thuật:
-    reduce theo không-batch -> vector [B_local], allgather -> mean.
-    """
-    a32 = a.astype(jnp.float32)
-    red_axes = tuple(range(1, a32.ndim)) if a32.ndim >= 2 else ()
-    l2_b = jnp.sqrt(jnp.sum(a32 * a32, axis=red_axes))     # [B_local]
-    l2_b_g = jax.experimental.multihost_utils.process_allgather(l2_b)
-    l2_b_g = np.array(l2_b_g).reshape(-1)
-    return float(l2_b_g.mean())
+# Cache bảng theo (layer, N) để cộng dồn qua nhiều lần eval
+VAR_TABLES = {}  # {(layer_name, N): wandb.Table}
 
 
 def eval_model(
@@ -61,8 +52,7 @@ def eval_model(
 ):
 
     # các biến theo dõi trong quá trình denoising
-    TRACK_STEPS = [1, 4, 32] + \
-        ([128] if FLAGS.model.denoise_timesteps == 128 else [])
+    TRACK_STEPS = [1, 4, 32]
     TRACK_LAYERS = [f"dit_block_{i}" for i in range(
         FLAGS.model.depth)] + ["patch_embed", "final_layer"]
 
@@ -223,7 +213,6 @@ def eval_model(
 
             # lưu các biến tính var theo layer cho từng timesteps
             var_series = {k: [] for k in TRACK_LAYERS}
-            # log_prod_sigma = []  # (tuỳ chọn)
 
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps  # From x_0 (noise) to x_1 (data)
@@ -238,7 +227,6 @@ def eval_model(
                                                          return_activations=True)
 
                     # --- tính σ² theo batch cho từng layer (dùng allgather) ---
-                    # sigmas = []
                     for lname in TRACK_LAYERS:
                         a = activations.get(lname, None)
                         if a is None:
@@ -246,12 +234,6 @@ def eval_model(
                         var_l = mb_variance_allgather_per_sample(
                             a)   # σ² (global-batch)
                         var_series[lname].append(var_l)
-                        # nếu muốn log product-of-sigma
-                        # sigmas.append(np.sqrt(max(var_l, 1e-12)))
-
-                    # if sigmas:  # (tuỳ chọn) log ∑log σ để ổn định số học
-                    #     log_prod_sigma.append(
-                    #         float(np.sum(np.log(np.maximum(sigmas, 1e-12)))))
 
                 else:
                     v_cond = call_model(
@@ -300,15 +282,23 @@ def eval_model(
                 # --- NEW: log variance theo layer/timestep cho N này ---
                 if jax.process_index() == 0:
                     for lname, ys in var_series.items():
-                        tbl = wandb.Table(
-                            columns=["timestep", "variance", "checkpoint", "N", "layer"])
+                        key = (lname, int(denoise_timesteps))
+                        if key not in VAR_TABLES:
+                            VAR_TABLES[key] = wandb.Table(
+                                columns=["timestep", "variance",
+                                         "checkpoint", "N", "layer"]
+                            )
+                        tbl = VAR_TABLES[key]
                         for tt, val in enumerate(ys):
                             tbl.add_data(tt, float(val), int(
                                 step), int(denoise_timesteps), lname)
+
                         wandb.log({
-                            f"input_variance/{lname}/N={denoise_timesteps}":
-                            wandb.plot.line(tbl, x="timestep", y="variance", stroke="checkpoint",
-                                            title=f"{lname} | N={denoise_timesteps} (σ² over minibatch)")
+                            f"input_variance/{lname}/N={int(denoise_timesteps)}":
+                            wandb.plot.line(
+                                tbl, x="timestep", y="variance", stroke="checkpoint",
+                                title=f"{lname} | N={int(denoise_timesteps)} (σ² over minibatch)"
+                            )
                         }, step=step)
 
         def do_fid_calc(cfg_scale, denoise_timesteps):

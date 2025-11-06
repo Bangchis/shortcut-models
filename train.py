@@ -269,11 +269,17 @@ def main(_):
             mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
             loss = jnp.mean(mse_v)
 
-            # --- NEW: variance over mini-batch theo từng layer + product (log scale)
-            def _mb_variance(a: jnp.ndarray) -> jnp.ndarray:
-                # variance gộp mọi chiều (gồm cả batch) như figure trong paper
+            def _mb_variance_per_sample(a: jnp.ndarray) -> jnp.ndarray:
                 a32 = a.astype(jnp.float32)
-                return jnp.var(a32)  # = mean((a - mean(a))**2) over all dims
+                # giữ trục batch, reduce phần còn lại
+                red_axes = tuple(range(1, a32.ndim))
+                mean_b = jnp.mean(a32, axis=red_axes)          # [B_local]
+                mean2_b = jnp.mean(a32 * a32, axis=red_axes)    # [B_local]
+                var_b = jnp.maximum(mean2_b - mean_b *
+                                    mean_b, 0.0)  # [B_local]
+                # gather toàn bộ batch xuyên device (pjit-friendly)
+                var_b_global = all_gather(var_b)                # [B_global]
+                return jnp.mean(var_b_global)                   # scalar
 
             # Chọn đúng các tensor "theo lớp" (post-activation là đủ)
             layer_order = (
@@ -287,18 +293,16 @@ def main(_):
 
             for li, lname in enumerate(layer_order):
                 if lname in activations:
-                    # scalar σ² của layer tại step này
-                    sigma2 = _mb_variance(activations[lname])
-                    layer_sigma2_dict[f'var_mb/Layer {li}'] = sigma2
-                    layer_sigma2_vals.append(sigma2)
+                    sigma2 = _mb_variance_per_sample(
+                        activations[lname])  # dùng hàm mới
+                    layer_sigma2_dict[f'var_mb/Layer {li} ({lname})'] = sigma2
+                    layer_sigma2_vals.append(jnp.maximum(sigma2, 1e-12))
 
-            # Product of variances (log scale) giống panel bên phải trong ảnh
-            if layer_sigma2_vals:
-                sigma2_vec = jnp.stack(layer_sigma2_vals)            # [L]
-                product_log_sigma2 = jnp.sum(
-                    jnp.log(jnp.maximum(sigma2_vec, 1e-12)))
-            else:
-                product_log_sigma2 = jnp.array(0.0, dtype=jnp.float32)
+            # product log variance qua các layer (để xem khuynh hướng “co/giãn”)
+            product_log_sigma2 = (
+                jnp.sum(jnp.log(jnp.stack(layer_sigma2_vals)))
+                if layer_sigma2_vals else jnp.array(0.0, jnp.float32)
+            )
 
             # --- NEW ----------------------------------------------------------------}
             # cái này là tính cho cả batch
