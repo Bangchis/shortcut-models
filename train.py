@@ -63,7 +63,7 @@ model_config = ml_collections.ConfigDict({
     't_sampling': 'discrete-dt',
     'dt_sampling': 'uniform',
     'bootstrap_cfg': 0,
-    'bootstrap_every': 16,  # Make sure its a divisor of batch size.
+    'bootstrap_every': 24,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut'  # or naive.
