@@ -302,7 +302,6 @@ def main(_):
                 **{'activations_L2_norm/' + k: jnp.sqrt(jnp.sum(jnp.square(v))) for k, v in activations.items()},
                 # mỗi layer 1 metric -> mỗi layer 1 chart trên W&B
                 **layer_sigma2_dict,
-                'var_mb/product_log_of_all_layer': product_log_sigma2,  # tổng log σ² qua các layer
                 # --- NEW -------------------------------------
             }
 
