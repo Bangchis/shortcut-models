@@ -31,7 +31,7 @@ flags.DEFINE_string(
 flags.DEFINE_string('fid_stats', None, 'FID stats file.')
 # Must be the same across all processes.
 flags.DEFINE_integer('seed', 10, 'Random seed.')
-flags.DEFINE_integer('log_interval', 20000, 'Logging interval.')
+flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
 flags.DEFINE_integer('save_interval', 100000, 'Eval interval.')
 flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
@@ -47,7 +47,7 @@ model_config = ml_collections.ConfigDict({
     'use_cosine': 0,
     'warmup': 0,
     'dropout': 0.0,
-    'hidden_size': 64,  # change this!
+    'hidden_size': 128,  # change this!
     'patch_size': 8,  # change this!
     'depth': 2,  # change this!
     'num_heads': 2,  # change this!
@@ -59,11 +59,11 @@ model_config = ml_collections.ConfigDict({
     'target_update_rate': 0.999,
     'use_ema': 1,
     'use_stable_vae': 1,
-    'sharding': 'dp',  # dp or fsdp.
+    'sharding': 'fsdp',  # dp or fsdp.
     't_sampling': 'discrete-dt',
     'dt_sampling': 'uniform',
     'bootstrap_cfg': 0,
-    'bootstrap_every': 8,  # Make sure its a divisor of batch size.
+    'bootstrap_every': 16,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut'  # or naive.
