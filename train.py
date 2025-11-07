@@ -277,7 +277,7 @@ def main(_):
                     a32, axis=red_axes) if red_axes else jnp.var(a32)
                 return jnp.mean(per_sample_var)  # scalar local
 
-            # 1) Input variance (x_t là input của model)
+                # 1) Input variance (x_t là input của model)
             var_input_xt = _mb_var_simple(x_t)
 
             # 2) Variance theo layer (patch_embed, các dit_block, final_layer)
@@ -285,10 +285,12 @@ def main(_):
                            + [f'dit_block_{i}' for i in range(FLAGS.model['depth'])]
                            + ['final_layer'])
             layer_sigma2_dict = {}
+
             for li, lname in enumerate(layer_order):
                 if lname in activations:
                     sigma2 = _mb_var_simple(activations[lname])
                     layer_sigma2_dict[f'var_mb/Layer {li} ({lname})'] = sigma2
+
             # --- NEW ----------------------------------------------------------------}
             # cái này là tính cho cả batch
             info = {
