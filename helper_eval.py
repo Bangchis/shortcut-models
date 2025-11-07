@@ -282,26 +282,41 @@ def eval_model(
                 plt.close(fig)
 
                 # --- NEW: log variance theo layer/timestep cho N này ---
-                if jax.process_index() == 0:
-                    for lname, ys in var_series.items():
-                        key = (lname, int(denoise_timesteps))
-                        if key not in VAR_TABLES:
-                            VAR_TABLES[key] = wandb.Table(
-                                columns=["timestep", "variance",
-                                         "checkpoint", "N", "layer"]
-                            )
-                        tbl = VAR_TABLES[key]
-                        for tt, val in enumerate(ys):
-                            tbl.add_data(tt, float(val), int(
-                                step), int(denoise_timesteps), lname)
+                # Thêm cấu hình cho stride theo phase nếu muốn linh hoạt
+                PHASE_STRIDE = getattr(FLAGS, "phase_stride", 20000)
 
-                        wandb.log({
-                            f"input_variance/{lname}/N={int(denoise_timesteps)}":
-                            wandb.plot.line(
-                                tbl, x="timestep", y="variance", stroke="checkpoint",
-                                title=f"{lname} | N={int(denoise_timesteps)} (σ² over minibatch)"
-                            )
-                        }, step=step)
+                # ... trong khối if jax.process_index() == 0: sau khi tính var_series ...
+                for lname, ys in var_series.items():
+                    key_tbl = (lname, int(denoise_timesteps))
+                    # Dùng cột 'phase' (string) thay vì 'checkpoint' (int)
+                    if key_tbl not in VAR_TABLES:
+                        VAR_TABLES[key_tbl] = wandb.Table(
+                            columns=["timestep", "variance",
+                                     "phase", "N", "layer"]
+                        )
+                    tbl = VAR_TABLES[key_tbl]
+
+                    # Tạo nhãn giai đoạn 20k/40k/... (string) để làm stroke
+                    # 0, 20000, 40000, ...
+                    phase_floor = (int(step) // PHASE_STRIDE) * PHASE_STRIDE
+                    # "0k","20k","40k",...
+                    phase_label = f"{phase_floor // 1000}k"
+
+                    # Append toàn bộ điểm (tt, var) của lần eval này vào bảng, kèm phase
+                    for tt, val in enumerate(ys):
+                        tbl.add_data(int(tt), float(val), phase_label,
+                                     int(denoise_timesteps), lname)
+
+                    # Vẽ lại plot từ cùng một Table (cập nhật nhiều đường/phase)
+                    wandb.log({
+                        f"input_variance/{lname}/N={int(denoise_timesteps)}": wandb.plot.line(
+                            tbl,
+                            x="timestep",
+                            y="variance",
+                            stroke="phase",  # quan trọng: string → mỗi phase một đường/màu
+                            title=f"{lname} | N={int(denoise_timesteps)} (σ² over minibatch)"
+                        )
+                    }, step=int(step))
 
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
