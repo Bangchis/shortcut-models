@@ -9,6 +9,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from einops import rearrange
+from utils.norm import ConditionalBatchNormSpecialT
 
 Array = Any
 PRNGKey = Any
@@ -327,7 +328,7 @@ class DiT(nn.Module):
         return x
 
 
-class ConditionalInstanceNormDiT(nn.Module):
+class ConditionalBatchNormSpecialT(nn.Module):
     # copy hết config của DiT
     patch_size: int
     hidden_size: int
@@ -351,7 +352,7 @@ class ConditionalInstanceNormDiT(nn.Module):
         labels = y
 
         # 1) norm theo t đặc biệt: x_cin là state sau CIN
-        x_cin, masked_norm_diff, norm_diff, norm_percentage = ConditionalInstanceNorm2dNHWC(
+        x_cin, masked_norm_diff, norm_diff, norm_percentage = ConditionalBatchNormSpecialT(
             num_channels=x.shape[-1],
             special_t=self.special_t,
             use_affine=self.use_affine,
@@ -397,3 +398,5 @@ class ConditionalInstanceNormDiT(nn.Module):
             )
             # Trả (v, x_cin)
             return v, x_cin
+
+

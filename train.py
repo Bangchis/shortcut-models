@@ -19,7 +19,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
-from model import DiT, ConditionalInstanceNormDiT
+from model import   ConditionalBatchNormSpecialT
 from helper_eval import eval_model
 from helper_inference import do_inference
 
@@ -160,7 +160,7 @@ def main(_):
         'use_affine': bool(FLAGS.model['use_affine_norm']),
 
     }
-    model_def = ConditionalInstanceNormDiT(**dit_args)
+    model_def = ConditionalBatchNormSpecialT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)),
           jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
@@ -183,12 +183,32 @@ def main(_):
         example_dt = jnp.zeros((1,))
         example_label = jnp.zeros((1,), dtype=jnp.int32)
         example_obs = jnp.zeros(example_obs_shape)
-        model_rngs = {'params': param_key,
-                      'label_dropout': dropout_key, 'dropout': dropout2_key}
-        params = model_def.init(model_rngs, example_obs,
-                                example_t, example_dt, example_label)['params']
+        model_rngs = {
+            'params': param_key,
+            'label_dropout': dropout_key,
+            'dropout': dropout2_key,
+        }
+
+        # Lấy full variables: params + batch_stats (cho BatchNorm)
+        variables = model_def.init(
+            model_rngs,
+            example_obs,
+            example_t,
+            example_dt,
+            example_label,
+        )
+        params = variables['params']
+        batch_stats = variables.get('batch_stats', None)
+
         opt_state = tx.init(params)
-        return TrainStateEma.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
+        return TrainStateEma.create(
+            model_def=model_def,
+            params=params,
+            rng=rng,
+            tx=tx,
+            opt_state=opt_state,
+            batch_stats=batch_stats,
+        )
 
     rng = jax.random.PRNGKey(FLAGS.seed)
     train_state_shape = jax.eval_shape(init, rng)
@@ -276,9 +296,28 @@ def main(_):
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
 
-        def loss_fn(grad_params):
-            v_prime, x_cin, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
-                'dropout': dropout_key}, params=grad_params, return_activations=True)
+        def loss_fn(grad_params, batch_stats):
+            # 1) pack variables cho Flax: params + batch_stats
+            variables = {"params": grad_params}
+            if batch_stats is not None:
+                variables["batch_stats"] = batch_stats
+
+            # 2) gọi model_def.apply với mutable=['batch_stats']
+            (v_prime, x_cin, logvars, activations), new_vars = train_state.model_def.apply(
+                variables,
+                x_t,
+                t,
+                dt_base,
+                labels,
+                train=True,
+                rngs={'dropout': dropout_key},
+                return_activations=True,
+                mutable=['batch_stats'],   # <- Quan trọng: cho phép BN update EMA
+            )
+
+            new_batch_stats = new_vars.get("batch_stats", batch_stats)
+
+            # 3) tính loss như cũ
             mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
             loss = jnp.mean(mse_v)
 
@@ -293,10 +332,19 @@ def main(_):
                 info['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
                 info['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
 
-            return loss, info
+            # aux: (info, new_batch_stats)
+            return loss, (info, new_batch_stats)
 
-        grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
+
+        (grads, (new_info, new_batch_stats)) = jax.grad(
+            loss_fn,
+            argnums=0,       # chỉ lấy grad theo grad_params
+            has_aux=True,
+        )(train_state.params, train_state.batch_stats)
+
+        # new_info là dict metrics, new_batch_stats là tree EMA mới
         info = {**info, **new_info}
+
         updates, new_opt_state = train_state.tx.update(
             grads, train_state.opt_state, train_state.params)
         new_params = optax.apply_updates(train_state.params, updates)
@@ -306,8 +354,14 @@ def main(_):
         info['param_norm'] = optax.global_norm(new_params)
         info['lr'] = lr_schedule(train_state.step)
 
+                
         train_state = train_state.replace(
-            rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
+            rng=new_rng,
+            step=train_state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            batch_stats=new_batch_stats,    # <–– gán EMA stats mới
+        )
         train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
         return train_state, info
 

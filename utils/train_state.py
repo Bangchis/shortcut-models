@@ -25,25 +25,42 @@ class TrainStateEma(flax.struct.PyTreeNode):
     params_ema: Any
     tx: Any = nonpytree_field()
     opt_state: Any
+    batch_stats: Any = None   # <–– thêm field này
+
 
     @classmethod
-    def create(cls, model_def, params, rng, tx=None, opt_state=None, **kwargs):
+    def create(cls, model_def, params, rng, tx=None, opt_state=None, batch_stats=None, **kwargs):
         if tx is not None and opt_state is None:
             opt_state = tx.init(params)
 
         return cls(
-            rng=rng, step=1, apply_fn=model_def.apply, model_def=model_def, params=params, params_ema=params,
-            tx=tx, opt_state=opt_state, **kwargs,
+            rng=rng,
+            step=1,
+            apply_fn=model_def.apply,
+            model_def=model_def,
+            params=params,
+            params_ema=params,
+            tx=tx,
+            opt_state=opt_state,
+            batch_stats=batch_stats,
+            **kwargs,
         )
+
 
     # Call model_def.apply_fn.
     def __call__(self, *args, params=None, method=None, **kwargs,):
         if params is None:
             params = self.params
+
         variables = {"params": params}
+        # nếu có batch_stats (BN đặc biệt) thì truyền vào
+        if self.batch_stats is not None:
+            variables["batch_stats"] = self.batch_stats
+
         if isinstance(method, str):
             method = getattr(self.model_def, method)
         return self.apply_fn(variables, *args, method=method, **kwargs)
+
 
     def call_model(self, *args, params=None, method=None, **kwargs):
         return self.__call__(*args, params=params, method=method, **kwargs)
@@ -65,7 +82,9 @@ class TrainStateEma(flax.struct.PyTreeNode):
             'params_ema': self.params_ema,
             'opt_state': self.opt_state,
             'step': self.step,
+            'batch_stats': self.batch_stats,   # <–– thêm dòng này
         }
+
     
     def load(self, data):
         return self.replace(**data)
