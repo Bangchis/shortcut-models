@@ -171,6 +171,7 @@ class ConditionalBatchNormSpecialT(nn.Module):
     eps: float = 1e-5
     momentum: float = 0.1
     use_affine: bool = True
+    num_channels: int
 
     @nn.compact
     def __call__(self, x: Array, t: Array):

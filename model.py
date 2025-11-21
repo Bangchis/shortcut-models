@@ -326,9 +326,7 @@ class DiT(nn.Module):
         if return_activations:
             return x, logvars, activations
         return x
-
-
-class ConditionalBatchNormSpecialT(nn.Module):
+class ConditionalBatchNormDiT(nn.Module):
     # copy hết config của DiT
     patch_size: int
     hidden_size: int
@@ -342,23 +340,27 @@ class ConditionalBatchNormSpecialT(nn.Module):
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
 
-    # thêm config cho norm
-    special_t: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    # config cho BatchNorm theo t đặc biệt
+    special_t: Sequence[float] = (0.25, 0.5, 0.75)
     use_affine: bool = True
 
     @nn.compact
-    def __call__(self, x, t, dt, y, train=False, return_activations=False):
-        # y ở đây là class labels → đổi tên cho rõ
+    def __call__(self, x, t, dt, y, train: bool = False, return_activations: bool = False):
+        # y ở đây là class labels
         labels = y
 
-        # 1) norm theo t đặc biệt: x_cin là state sau CIN
-        x_cin, masked_norm_diff, norm_diff, norm_percentage = ConditionalBatchNormSpecialT(
+        # 1) Chuẩn hóa bằng BatchNorm theo t đặc biệt
+        x_bn, masked_norm_diff, norm_diff, norm_percentage = ConditionalBatchNormSpecialT(
             num_channels=x.shape[-1],
             special_t=self.special_t,
             use_affine=self.use_affine,
-        )(x, t)
+        )(
+            x,
+            t,
+            use_running_average=not train,   # train=True → dùng batch stats + update EMA, eval → dùng EMA
+        )
 
-        # 2) DiT “thật” phía sau chạy trên x_cin
+        # 2) DiT “thật” phía sau chạy trên x_bn
         dit = DiT(
             patch_size=self.patch_size,
             hidden_size=self.hidden_size,
@@ -375,28 +377,34 @@ class ConditionalBatchNormSpecialT(nn.Module):
 
         if return_activations:
             v, logvars, activations = dit(
-                x_cin, t, dt, labels,
+                x_bn,
+                t,
+                dt,
+                labels,
                 train=train,
                 return_activations=True,
                 norm_diff=norm_diff,
                 masked_norm_diff=masked_norm_diff,
                 norm_percentage=norm_percentage,
             )
-            # Lưu luôn state sau CIN vào activations nếu muốn debug
-            activations["cin_state"] = x_cin
-            # TRẢ CẢ v và x_cin (y_t)
-            return v, x_cin, logvars, activations
+            # Lưu luôn state sau BN vào activations nếu muốn debug
+            activations["bn_state"] = x_bn
+            # TRẢ CẢ v và x_bn (y_t)
+            return v, x_bn, logvars, activations
 
         else:
             v = dit(
-                x_cin, t, dt, labels,
+                x_bn,
+                t,
+                dt,
+                labels,
                 train=train,
                 return_activations=False,
                 norm_diff=norm_diff,
                 masked_norm_diff=masked_norm_diff,
                 norm_percentage=norm_percentage,
             )
-            # Trả (v, x_cin)
-            return v, x_cin
+            # Trả (v, x_bn)
+            return v, x_bn
 
 

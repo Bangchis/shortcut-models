@@ -19,7 +19,8 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
-from model import   ConditionalBatchNormSpecialT
+from model import ConditionalBatchNormDiT
+
 from helper_eval import eval_model
 from helper_inference import do_inference
 
@@ -160,7 +161,8 @@ def main(_):
         'use_affine': bool(FLAGS.model['use_affine_norm']),
 
     }
-    model_def = ConditionalBatchNormSpecialT(**dit_args)
+    model_def = ConditionalBatchNormDiT(**dit_args)
+
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)),
           jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
@@ -303,17 +305,18 @@ def main(_):
                 variables["batch_stats"] = batch_stats
 
             # 2) gọi model_def.apply với mutable=['batch_stats']
-            (v_prime, x_cin, logvars, activations), new_vars = train_state.model_def.apply(
-                variables,
-                x_t,
-                t,
-                dt_base,
-                labels,
-                train=True,
-                rngs={'dropout': dropout_key},
-                return_activations=True,
-                mutable=['batch_stats'],   # <- Quan trọng: cho phép BN update EMA
-            )
+            (v_prime, x_bn, logvars, activations), new_vars = train_state.model_def.apply(
+                    variables,
+                    x_t,
+                    t,
+                    dt_base,
+                    labels,
+                    train=True,
+                    rngs={'dropout': dropout_key},
+                    return_activations=True,
+                    mutable=['batch_stats'],   # BN update EMA
+                )
+
 
             new_batch_stats = new_vars.get("batch_stats", batch_stats)
 
