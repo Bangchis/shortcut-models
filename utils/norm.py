@@ -8,6 +8,9 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from einops import rearrange
+from typing import Sequence
+import jax.numpy as jnp
+import flax.linen as nn
 
 Array = Any
 PRNGKey = Any
@@ -155,126 +158,129 @@ class ConditionalInstanceNorm2dNHWC(nn.Module):
         return jnp.where(mask, x_norm, x), masked_avg_mse, avg_mse, norm_percentage
 
 
-
 class ConditionalBatchNormSpecialT(nn.Module):
-    """
-    BatchNorm trên NHWC dành cho diffusion shortcut:
-
-    - x: [B,H,W,C], t: [B]
-    - Chỉ chuẩn hoá sample có t ∈ special_t.
-    - Mỗi τ_k có EMA riêng: mean[k,1,1,C], var[k,1,1,C].
-    - Train: dùng batch stats để update EMA, nhưng NORM luôn dùng EMA.
-    - Eval: không update, chỉ dùng EMA.
-    """
+    # số kênh C của latent x (NHWC)
     num_channels: int
+    # list các timestep đặc biệt, ví dụ (0.25, 0.5, 0.75)
     special_t: Sequence[float]
     eps: float = 1e-5
     momentum: float = 0.1
     use_affine: bool = True
-    num_channels: int
 
     @nn.compact
-    def __call__(self, x: Array, t: Array):
+    def __call__(self, x, t, use_running_average: bool = False):
         """
-        x: [B,H,W,C]
-        t: [B]
-        Trả về: (x_out, masked_avg_mse, avg_mse, norm_percentage)
+        x: (B, H, W, C)
+        t: (B,) timesteps liên tục [0,1]
+        use_running_average=False: train → dùng batch stats + update EMA
+        use_running_average=True:  eval  → chỉ dùng EMA
         """
+
         B, H, W, C = x.shape
-        assert C == self.num_channels, f"num_channels mismatch: {C} vs {self.num_channels}"
+        assert C == self.num_channels
 
-        # 1) special_t & mask
-        special_t = jnp.asarray(self.special_t, dtype=t.dtype)  # [K]
-        K = special_t.shape[0]
-
-        # mask_bk[b,k] = True nếu t[b] == τ_k (xấp xỉ)
-        diff = jnp.abs(t[:, None] - special_t[None, :])         # [B,K]
-        mask_bk = diff < 1e-6                                   # [B,K] bool
-        mask_fk = mask_bk.astype(x.dtype)                       # [B,K] float
-
-        # 2) EMA stats: [K,1,1,C]
-        mu_ema = self.variable(
-            "batch_stats", "mean",
-            lambda: jnp.zeros((K, 1, 1, C), dtype=x.dtype),
-        )
-        var_ema = self.variable(
-            "batch_stats", "var",
-            lambda: jnp.ones((K, 1, 1, C), dtype=x.dtype),
-        )
-
-        is_training = self.is_mutable_collection("batch_stats")
-
-        # 3) Nếu train: tính batch stats để update EMA
-        if is_training:
-            # broadcast mask ra [B,H,W,C,K]
-            mask_full = mask_fk[:, None, None, None, :]                 # [B,1,1,1,K]
-            x_exp = x[..., None]                                        # [B,H,W,C,1]
-            mask_full = mask_full * jnp.ones_like(x_exp)                # [B,H,W,C,K]
-
-            # sum_x, count per (C,K)
-            sum_x = (x_exp * mask_full).sum(axis=(0, 1, 2))             # [C,K]
-            count = mask_full.sum(axis=(0, 1, 2))                       # [C,K]
-            count_safe = jnp.maximum(count, 1.0)
-
-            mean_ck = sum_x / count_safe                                # [C,K]
-
-            # var: E[(x - mean)^2]
-            mean_exp = mean_ck[None, None, None, :, :]                  # [1,1,1,C,K]
-            diff_sq = (x_exp - mean_exp) ** 2                           # [B,H,W,C,K]
-            sum_diff2 = (diff_sq * mask_full).sum(axis=(0, 1, 2))       # [C,K]
-            var_ck = sum_diff2 / count_safe                             # [C,K]
-
-            # chuyển [C,K] -> [K,1,1,C]
-            mean_batch = jnp.transpose(mean_ck, (1, 0))[:, None, None, :]  # [K,1,1,C]
-            var_batch = jnp.transpose(var_ck, (1, 0))[:, None, None, :]    # [K,1,1,C]
-
-            # τ_k nào thực sự có sample?
-            has_data_k = (mask_fk.sum(axis=0) > 0).astype(x.dtype)      # [K]
-            has_data = has_data_k[:, None, None, None]                  # [K,1,1,1]
-
-            m = jnp.asarray(self.momentum, dtype=x.dtype)
-
-            mu_new = (1.0 - m * has_data) * mu_ema.value + m * has_data * mean_batch
-            var_new = (1.0 - m * has_data) * var_ema.value + m * has_data * var_batch
-
-            mu_ema.value = mu_new
-            var_ema.value = var_new
-
-        # 4) NORM LUÔN BẰNG EMA stats
-        mu = mu_ema.value   # [K,1,1,C]
-        var = var_ema.value # [K,1,1,C]
-
-        # tạo x_norm_k cho từng τ_k: [K,B,H,W,C]
-        x_b = x[None, ...]                                            # [1,B,H,W,C]
-        x_centered = x_b - mu[:, None, :, :, :]                       # [K,B,H,W,C]
-        x_hat_k = x_centered / jnp.sqrt(var[:, None, :, :, :] + self.eps)  # [K,B,H,W,C]
-
-        # combine theo mask: mỗi sample chỉ thuộc tối đa 1 τ_k
-        mask_kb = mask_bk.T[:, None, :, None, None]                   # [K,1,B,1,1]
-        mask_kb = mask_kb * jnp.ones_like(x_hat_k)                    # [K,B,H,W,C]
-        x_norm = (mask_kb * x_hat_k).sum(axis=0)                      # [B,H,W,C]
-
-        # sample không thuộc special_t: giữ nguyên x
-        mask_any = mask_bk.any(axis=1)                                # [B]
-        mask_any_bc = mask_any[:, None, None, None]                   # [B,1,1,1]
-        x_after = jnp.where(mask_any_bc, x_norm, x)                   # [B,H,W,C]
-
-        # 5) Affine γ, β
+        # Tham số gamma, beta giống BatchNorm thường
         if self.use_affine:
-            gamma = self.param("gamma", nn.initializers.ones, (1, 1, 1, C))
-            beta = self.param("beta", nn.initializers.zeros, (1, 1, 1, C))
-            y = x_after * gamma + beta
+            gamma = self.param("gamma", nn.initializers.ones, (C,))
+            beta = self.param("beta", nn.initializers.zeros, (C,))
         else:
-            y = x_after
+            gamma = None
+            beta = None
 
-        # 6) Logging các thống kê (giữ API như InstanceNorm cũ)
-        sq_err = (x - x_after) ** 2                                   # [B,H,W,C]
-        mse_per_sample = sq_err.mean(axis=(1, 2, 3))                  # [B]
-        mask_f_any = mask_any.astype(x.dtype)
-        denom = jnp.maximum(mask_f_any.sum(), 1.0)
+        K = len(self.special_t)
+        special_t = jnp.asarray(self.special_t, dtype=x.dtype)  # (K,)
 
-        masked_avg_mse = (mse_per_sample * mask_f_any).sum() / denom
-        avg_mse = mse_per_sample.mean()
-        norm_percentage = mask_f_any.mean()
+        # EMA stats cho từng τ_k: shape (K, C)
+        running_mean = self.variable(
+            "batch_stats",
+            "mean",
+            lambda: jnp.zeros((K, C), dtype=x.dtype),
+        )
+        running_var = self.variable(
+            "batch_stats",
+            "var",
+            lambda: jnp.ones((K, C), dtype=x.dtype),
+        )
 
-        return y, masked_avg_mse, avg_mse, norm_percentage
+        # Xác định sample nào rơi vào timestep đặc biệt nào
+        t = t.astype(x.dtype)                      # (B,)
+        diff = jnp.abs(t[:, None] - special_t[None, :])  # (B,K)
+        is_special = diff < 1e-6                  # (B,K) bool
+
+        x_in = x
+        x_out = x
+
+        # lặp qua từng τ_k
+        for k in range(K):
+            mask_b = is_special[:, k].astype(
+                x.dtype).reshape(B, 1, 1, 1)  # (B,1,1,1)
+
+            # tổng / đếm với mask
+            denom = jnp.sum(mask_b)                             # scalar
+            sum_x = jnp.sum(mask_b * x_in, axis=(0, 1, 2))      # (C,)
+            sum_x2 = jnp.sum(mask_b * (x_in ** 2), axis=(0, 1, 2))
+
+            count = jnp.maximum(denom, 1.0)
+            mean_batch = sum_x / count                          # (C,)
+            var_batch = sum_x2 / count - mean_batch ** 2        # (C,)
+
+            has_sample = denom > 0.0
+
+            # stats dùng để chuẩn hóa
+            mean_used_train = jnp.where(
+                has_sample, mean_batch, running_mean.value[k])
+            var_used_train = jnp.where(
+                has_sample, var_batch, running_var.value[k])
+
+            mean_used = jnp.where(
+                use_running_average,
+                running_mean.value[k],
+                mean_used_train,
+            )
+            var_used = jnp.where(
+                use_running_average,
+                running_var.value[k],
+                var_used_train,
+            )
+
+            # update EMA chỉ khi train + có sample
+            if not use_running_average:
+                new_mean_k = jnp.where(
+                    has_sample,
+                    (1.0 - self.momentum) *
+                    running_mean.value[k] + self.momentum * mean_batch,
+                    running_mean.value[k],
+                )
+                new_var_k = jnp.where(
+                    has_sample,
+                    (1.0 - self.momentum) *
+                    running_var.value[k] + self.momentum * var_batch,
+                    running_var.value[k],
+                )
+                running_mean.value = running_mean.value.at[k].set(new_mean_k)
+                running_var.value = running_var.value.at[k].set(new_var_k)
+
+            # chuẩn hóa tất cả, rồi chỉ ghi đè lên sample thuộc τ_k
+            mean_broadcast = mean_used[None, None, None, :]
+            var_broadcast = var_used[None, None, None, :]
+            x_norm = (x_in - mean_broadcast) / \
+                jnp.sqrt(var_broadcast + self.eps)
+
+            if self.use_affine:
+                x_norm = x_norm * gamma + beta
+
+            # chỉ những sample có t ∈ special_t[k] mới bị thay đổi
+            x_out = jnp.where(mask_b > 0, x_norm, x_out)
+
+        # logging: độ lệch norm
+        diff_all = x_out - x_in
+        norm_diff = jnp.mean(diff_all ** 2)
+
+        mask_any = jnp.any(is_special, axis=1).astype(x.dtype)   # (B,)
+        mask_any_b = mask_any.reshape(B, 1, 1, 1)
+        diff_masked = diff_all * mask_any_b
+        masked_norm_diff = jnp.mean(diff_masked ** 2)
+
+        norm_percentage = jnp.mean(mask_any)
+
+        return x_out, masked_norm_diff, norm_diff, norm_percentage
