@@ -37,30 +37,40 @@ def get_fid_network():
 
 
 def fid_from_stats(mu1, sigma1, mu2, sigma2):
-    # Đưa hết về JAX float32
-    mu1 = jnp.asarray(mu1, dtype=jnp.float32)
-    sigma1 = jnp.asarray(sigma1, dtype=jnp.float32)
-    mu2 = jnp.asarray(mu2, dtype=jnp.float32)
-    sigma2 = jnp.asarray(sigma2, dtype=jnp.float32)
-
+    print("[FID] Starting FID calculation...", flush=True)
     diff = mu1 - mu2
 
-    # Ổn định covariance product
-    eps = 1e-6
-    eye = jnp.eye(sigma1.shape[0], dtype=jnp.float32)
-    cov_prod = (sigma1 + eps * eye) @ (sigma2 + eps * eye)
+    # Convert to JAX arrays for faster computation
+    sigma1_jax = jnp.array(sigma1)
+    sigma2_jax = jnp.array(sigma2)
 
-    # Symmetrize để tránh sai số số học
-    cov_prod = 0.5 * (cov_prod + cov_prod.T)
+    # Add numerical stability offset
+    offset = jnp.eye(sigma1.shape[0]) * 1e-6
 
-    # sqrtm(A) với A PSD: trace(sqrtm(A)) = sum sqrt(eigenvalues)
-    evals, _ = jnp.linalg.eigh(cov_prod)
-    evals = jnp.clip(evals, a_min=0.0)          # clamp noise âm
-    trace_covmean = jnp.sum(jnp.sqrt(evals))    # tr(sqrtm)
+    print("[FID] Computing matrix product...", flush=True)
+    # Compute (sigma1 + offset) @ (sigma2 + offset)
+    product = (sigma1_jax + offset) @ (sigma2_jax + offset)
 
-    fid = diff @ diff + jnp.trace(sigma1) + \
-        jnp.trace(sigma2) - 2.0 * trace_covmean
-    # trả về float Python cho wandb.log
+    # Make sure it's symmetric (for numerical stability)
+    product = (product + product.T) / 2
+
+    print("[FID] Computing eigenvalues (this takes ~30 seconds on first run)...", flush=True)
+    # Compute sqrt via eigenvalue decomposition: sqrt(A) = V @ diag(sqrt(λ)) @ V.T
+    eigenvalues, eigenvectors = jnp.linalg.eigh(product)
+
+    print("[FID] Computing matrix square root...", flush=True)
+    # Clip negative eigenvalues for numerical stability
+    eigenvalues = jnp.maximum(eigenvalues, 0)
+    sqrt_eigenvalues = jnp.sqrt(eigenvalues)
+
+    # Reconstruct sqrt(product) = V @ diag(sqrt(λ)) @ V.T
+    covmean = eigenvectors @ jnp.diag(sqrt_eigenvalues) @ eigenvectors.T
+    covmean = jnp.real(covmean)
+
+    print("[FID] Computing final FID score...", flush=True)
+    fid = diff @ diff + jnp.trace(sigma1_jax + sigma2_jax - 2 * covmean)
+
+    print(f"[FID] Done! FID score = {fid:.2f}", flush=True)
     return float(fid)
 
 
