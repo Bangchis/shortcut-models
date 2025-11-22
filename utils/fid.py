@@ -37,27 +37,30 @@ def get_fid_network():
 
 
 def fid_from_stats(mu1, sigma1, mu2, sigma2):
-    mu1 = np.asarray(mu1, dtype=np.float64)
-    sigma1 = np.asarray(sigma1, dtype=np.float64)
-    mu2 = np.asarray(mu2, dtype=np.float64)
-    sigma2 = np.asarray(sigma2, dtype=np.float64)
+    # Đưa hết về JAX float32
+    mu1 = jnp.asarray(mu1, dtype=jnp.float32)
+    sigma1 = jnp.asarray(sigma1, dtype=jnp.float32)
+    mu2 = jnp.asarray(mu2, dtype=jnp.float32)
+    sigma2 = jnp.asarray(sigma2, dtype=jnp.float32)
 
     diff = mu1 - mu2
-    cov_prod = sigma1.dot(sigma2)
 
-    covmean, info = scipy.linalg.sqrtm(cov_prod, disp=False)
-    if not np.isfinite(covmean).all():
-        eps = 1e-6
-        offset = np.eye(sigma1.shape[0]) * eps
-        cov_prod = (sigma1 + offset).dot(sigma2 + offset)
-        covmean, info = scipy.linalg.sqrtm(cov_prod, disp=False)
+    # Ổn định covariance product
+    eps = 1e-6
+    eye = jnp.eye(sigma1.shape[0], dtype=jnp.float32)
+    cov_prod = (sigma1 + eps * eye) @ (sigma2 + eps * eye)
 
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
+    # Symmetrize để tránh sai số số học
+    cov_prod = 0.5 * (cov_prod + cov_prod.T)
 
-    tr_covmean = np.trace(covmean)
-    fid = diff.dot(diff) + np.trace(sigma1) + \
-        np.trace(sigma2) - 2.0 * tr_covmean
+    # sqrtm(A) với A PSD: trace(sqrtm(A)) = sum sqrt(eigenvalues)
+    evals, _ = jnp.linalg.eigh(cov_prod)
+    evals = jnp.clip(evals, a_min=0.0)          # clamp noise âm
+    trace_covmean = jnp.sum(jnp.sqrt(evals))    # tr(sqrtm)
+
+    fid = diff @ diff + jnp.trace(sigma1) + \
+        jnp.trace(sigma2) - 2.0 * trace_covmean
+    # trả về float Python cho wandb.log
     return float(fid)
 
 
