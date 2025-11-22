@@ -32,6 +32,11 @@ def eval_model(
     fid_from_stats,
     truth_fid_stats,
 ):
+    if jax.process_index() == 0:
+        print(f"\n{'='*80}", flush=True)
+        print(f"[EVAL] Starting eval_model at step={step}", flush=True)
+        print(f"{'='*80}\n", flush=True)
+
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
@@ -346,9 +351,19 @@ def eval_model(
             activations = []
             images_shape = batch_images.shape
             num_generations = 4096
-            print(
-                f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
-            for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
+            if jax.process_index() == 0:
+                print(f"[FID-P{jax.process_index()}] START do_fid_calc: CFG={cfg_scale}, T={denoise_timesteps}", flush=True)
+
+            # Only show tqdm on process 0 to avoid I/O blocking
+            iterator = range(num_generations // FLAGS.batch_size)
+            if jax.process_index() == 0:
+                iterator = tqdm.tqdm(iterator, desc=f"FID CFG={cfg_scale} T={denoise_timesteps}")
+
+            for fid_it in iterator:
+                # Log first iteration to confirm loop starts
+                if fid_it == 0 and jax.process_index() == 0:
+                    print(f"[FID-P{jax.process_index()}] First iteration of sampling loop", flush=True)
+
                 key = jax.random.PRNGKey(42)
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
@@ -394,30 +409,51 @@ def eval_model(
                 acts = jax.experimental.multihost_utils.process_allgather(acts)
                 acts = np.array(acts)
                 activations.append(acts)
+
+            if jax.process_index() == 0:
+                print(f"[FID-P{jax.process_index()}] DONE do_fid_calc: CFG={cfg_scale}, T={denoise_timesteps}, collected {len(activations)} batches", flush=True)
             return activations
 
         if FLAGS.fid_stats is not None:
+            if jax.process_index() == 0:
+                print(f"\n[EVAL] Starting FID calculation section...", flush=True)
             denoise_timesteps_list = [1, 4, 32]
             if FLAGS.model.denoise_timesteps == 128:
                 denoise_timesteps_list.append(128)
             if FLAGS.model.cfg_scale != 0:
                 denoise_timesteps_list.append('cfg')
             for denoise_timesteps in denoise_timesteps_list:
+                if jax.process_index() == 0:
+                    cfg_val = FLAGS.model.cfg_scale if denoise_timesteps == 'cfg' else (1 if FLAGS.model.cfg_scale != 0 else 0)
+                    print(f"[FID] Starting T={denoise_timesteps}, cfg_scale={cfg_val}", flush=True)
+
                 if denoise_timesteps == 'cfg':
                     activations = do_fid_calc(
                         FLAGS.model.cfg_scale, FLAGS.model.denoise_timesteps)
                 else:
                     activations = do_fid_calc(
                         1 if FLAGS.model.cfg_scale != 0 else 0, denoise_timesteps)
+
                 if jax.process_index() == 0:
+                    print(f"[FID] Returned from do_fid_calc T={denoise_timesteps}, now computing stats...", flush=True)
+
+                # Sync all processes before stats computation
+                jax.experimental.multihost_utils.sync_global_devices(f"fid_sync_{denoise_timesteps}")
+
+                if jax.process_index() == 0:
+                    print(f"[FID] Concatenating activations T={denoise_timesteps}...", flush=True)
                     activations = np.concatenate(activations, axis=0)
                     activations = activations.reshape(
                         (-1, activations.shape[-1]))
+                    print(f"[FID] Computing mean T={denoise_timesteps}...", flush=True)
                     mu1 = np.mean(activations, axis=0)
+                    print(f"[FID] Computing covariance T={denoise_timesteps}...", flush=True)
                     sigma1 = np.cov(activations, rowvar=False)
+                    print(f"[FID] Computing FID score T={denoise_timesteps}...", flush=True)
                     fid = fid_from_stats(
                         mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
                     print(
-                        f"FID for denoise_timesteps {denoise_timesteps} is {fid}")
+                        f"[FID] FINISHED T={denoise_timesteps}: FID = {fid}", flush=True)
                     wandb.log(
                         {f'fid/timesteps/{denoise_timesteps}': fid}, step=step)
+                    print(f"[FID] Logged to wandb T={denoise_timesteps}", flush=True)
