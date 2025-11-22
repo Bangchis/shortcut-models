@@ -202,6 +202,31 @@ class ConditionalBatchNormSpecialT(nn.Module):
             lambda: jnp.ones((K, C), dtype=x.dtype),
         )
 
+        # Diagnostic: Check batch_stats for NaN/Inf/invalid values
+        if jax.process_index() == 0:
+            import numpy as np
+            rm_cpu = np.array(running_mean.value)
+            rv_cpu = np.array(running_var.value)
+            print(f"[BN-DEBUG] BatchStats check: K={K}, C={C}, mode={'EVAL' if use_running_average else 'TRAIN'}", flush=True)
+            print(f"[BN-DEBUG] running_mean: shape={rm_cpu.shape}, has_nan={np.isnan(rm_cpu).any()}, has_inf={np.isinf(rm_cpu).any()}", flush=True)
+            print(f"[BN-DEBUG] running_var: shape={rv_cpu.shape}, has_nan={np.isnan(rv_cpu).any()}, has_inf={np.isinf(rv_cpu).any()}", flush=True)
+
+            # Check per special_t
+            for k in range(K):
+                mean_k = rm_cpu[k]
+                var_k = rv_cpu[k]
+                print(f"[BN-DEBUG] special_t[{k}]={self.special_t[k]:.2f}: mean min={mean_k.min():.4e}, max={mean_k.max():.4e}, mean={mean_k.mean():.4e}", flush=True)
+                print(f"[BN-DEBUG] special_t[{k}]={self.special_t[k]:.2f}: var min={var_k.min():.4e}, max={var_k.max():.4e}, mean={var_k.mean():.4e}", flush=True)
+
+                num_negative_var = np.sum(var_k < 0)
+                num_zero_var = np.sum(np.abs(var_k) < 1e-10)
+                num_large_var = np.sum(var_k > 1e6)
+                print(f"[BN-DEBUG] special_t[{k}]: num_negative_var={num_negative_var}, num_zero_var={num_zero_var}, num_large_var={num_large_var}", flush=True)
+
+                if var_k.max() > 0:
+                    var_cond = var_k.max() / max(var_k.min(), 1e-10)
+                    print(f"[BN-DEBUG] special_t[{k}]: variance condition_number={var_cond:.4e}", flush=True)
+
         # Xác định sample nào rơi vào timestep đặc biệt nào
         t = t.astype(x.dtype)                      # (B,)
         diff = jnp.abs(t[:, None] - special_t[None, :])  # (B,K)
@@ -257,12 +282,49 @@ class ConditionalBatchNormSpecialT(nn.Module):
                     running_var.value[k] + self.momentum * var_batch,
                     running_var.value[k],
                 )
+
+                # Diagnostic: Log EMA updates
+                if jax.process_index() == 0 and has_sample:
+                    import numpy as np
+                    old_mean = np.array(running_mean.value[k])
+                    old_var = np.array(running_var.value[k])
+                    new_mean_cpu = np.array(new_mean_k)
+                    new_var_cpu = np.array(new_var_k)
+                    batch_mean_cpu = np.array(mean_batch)
+                    batch_var_cpu = np.array(var_batch)
+
+                    mean_change = np.abs(new_mean_cpu - old_mean).max()
+                    var_change = np.abs(new_var_cpu - old_var).max()
+
+                    print(f"[BN-DEBUG] EMA update k={k}, denom={float(denom):.1f}", flush=True)
+                    print(f"[BN-DEBUG]   batch_mean: min={batch_mean_cpu.min():.4e}, max={batch_mean_cpu.max():.4e}, has_nan={np.isnan(batch_mean_cpu).any()}", flush=True)
+                    print(f"[BN-DEBUG]   batch_var: min={batch_var_cpu.min():.4e}, max={batch_var_cpu.max():.4e}, has_nan={np.isnan(batch_var_cpu).any()}", flush=True)
+                    print(f"[BN-DEBUG]   mean_change={mean_change:.4e}, var_change={var_change:.4e}", flush=True)
+
+                    if np.isnan(new_mean_cpu).any() or np.isnan(new_var_cpu).any():
+                        print(f"[BN-DEBUG]   WARNING: NaN detected in new EMA stats!", flush=True)
+
                 running_mean.value = running_mean.value.at[k].set(new_mean_k)
                 running_var.value = running_var.value.at[k].set(new_var_k)
 
             # chuẩn hóa tất cả, rồi chỉ ghi đè lên sample thuộc τ_k
             mean_broadcast = mean_used[None, None, None, :]
             var_broadcast = var_used[None, None, None, :]
+
+            # Diagnostic: Check normalization stats being used
+            if jax.process_index() == 0 and jnp.sum(mask_b) > 0:
+                import numpy as np
+                mean_used_cpu = np.array(mean_used)
+                var_used_cpu = np.array(var_used)
+                print(f"[BN-DEBUG] Normalizing k={k}, num_samples={float(jnp.sum(mask_b)):.1f}", flush=True)
+                print(f"[BN-DEBUG]   mean_used: min={mean_used_cpu.min():.4e}, max={mean_used_cpu.max():.4e}, has_nan={np.isnan(mean_used_cpu).any()}", flush=True)
+                print(f"[BN-DEBUG]   var_used: min={var_used_cpu.min():.4e}, max={var_used_cpu.max():.4e}, has_nan={np.isnan(var_used_cpu).any()}", flush=True)
+
+                # Check if variance is too small (will cause issues with 1/sqrt(var))
+                num_small_var = np.sum(var_used_cpu < 1e-8)
+                if num_small_var > 0:
+                    print(f"[BN-DEBUG]   WARNING: {num_small_var} channels have var < 1e-8", flush=True)
+
             x_norm = (x_in - mean_broadcast) / \
                 jnp.sqrt(var_broadcast + self.eps)
 
@@ -282,5 +344,18 @@ class ConditionalBatchNormSpecialT(nn.Module):
         masked_norm_diff = jnp.mean(diff_masked ** 2)
 
         norm_percentage = jnp.mean(mask_any)
+
+        # Diagnostic: Check output for NaN/Inf
+        if jax.process_index() == 0:
+            import numpy as np
+            x_out_cpu = np.array(x_out)
+            print(f"[BN-DEBUG] Output check: has_nan={np.isnan(x_out_cpu).any()}, has_inf={np.isinf(x_out_cpu).any()}", flush=True)
+            print(f"[BN-DEBUG] Output stats: min={x_out_cpu.min():.4e}, max={x_out_cpu.max():.4e}, mean={x_out_cpu.mean():.4e}, std={x_out_cpu.std():.4e}", flush=True)
+
+            if np.isnan(x_out_cpu).any() or np.isinf(x_out_cpu).any():
+                print(f"[BN-DEBUG] WARNING: NaN/Inf in BatchNorm output!", flush=True)
+                # Find which samples have NaN
+                has_nan_per_sample = np.isnan(x_out_cpu).any(axis=(1,2,3))
+                print(f"[BN-DEBUG]   Samples with NaN: {np.where(has_nan_per_sample)[0]}", flush=True)
 
         return x_out, masked_norm_diff, norm_diff, norm_percentage
