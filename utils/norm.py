@@ -11,6 +11,7 @@ from einops import rearrange
 from typing import Sequence
 import jax.numpy as jnp
 import flax.linen as nn
+import numpy as np
 
 Array = Any
 PRNGKey = Any
@@ -205,7 +206,6 @@ class ConditionalBatchNormSpecialT(nn.Module):
         # Diagnostic: Check batch_stats for NaN/Inf/invalid values
         if jax.process_index() == 0:
             try:
-                import numpy as np
                 rm_cpu = np.array(running_mean.value)
                 rv_cpu = np.array(running_var.value)
                 print(f"[BN-DEBUG] BatchStats check: K={K}, C={C}, mode={'EVAL' if use_running_average else 'TRAIN'}", flush=True)
@@ -290,7 +290,6 @@ class ConditionalBatchNormSpecialT(nn.Module):
                 # Diagnostic: Log EMA updates
                 if jax.process_index() == 0:
                     try:
-                        import numpy as np
                         old_mean = np.array(running_mean.value[k])
                         old_var = np.array(running_var.value[k])
                         new_mean_cpu = np.array(new_mean_k)
@@ -322,7 +321,6 @@ class ConditionalBatchNormSpecialT(nn.Module):
             # Diagnostic: Check normalization stats being used
             if jax.process_index() == 0:
                 try:
-                    import numpy as np
                     mean_used_cpu = np.array(mean_used)
                     var_used_cpu = np.array(var_used)
                     print(f"[BN-DEBUG] Normalizing k={k}, num_samples={float(jnp.sum(mask_b)):.1f}", flush=True)
@@ -360,7 +358,6 @@ class ConditionalBatchNormSpecialT(nn.Module):
         # Diagnostic: Check output for NaN/Inf
         if jax.process_index() == 0:
             try:
-                import numpy as np
                 x_out_cpu = np.array(x_out)
                 print(f"[BN-DEBUG] Output check: has_nan={np.isnan(x_out_cpu).any()}, has_inf={np.isinf(x_out_cpu).any()}", flush=True)
                 print(f"[BN-DEBUG] Output stats: min={x_out_cpu.min():.4e}, max={x_out_cpu.max():.4e}, mean={x_out_cpu.mean():.4e}, std={x_out_cpu.std():.4e}", flush=True)

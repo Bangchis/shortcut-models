@@ -444,7 +444,6 @@ def eval_model(
                     if 'ConditionalBatchNormSpecialT_0' in batch_stats:
                         bn_stats = batch_stats['ConditionalBatchNormSpecialT_0']
                         if 'mean' in bn_stats and 'var' in bn_stats:
-                            import numpy as np
                             running_mean = np.array(bn_stats['mean'])
                             running_var = np.array(bn_stats['var'])
 
