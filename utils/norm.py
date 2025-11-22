@@ -288,7 +288,7 @@ class ConditionalBatchNormSpecialT(nn.Module):
                 )
 
                 # Diagnostic: Log EMA updates
-                if jax.process_index() == 0 and has_sample:
+                if jax.process_index() == 0:
                     try:
                         import numpy as np
                         old_mean = np.array(running_mean.value[k])
@@ -320,7 +320,7 @@ class ConditionalBatchNormSpecialT(nn.Module):
             var_broadcast = var_used[None, None, None, :]
 
             # Diagnostic: Check normalization stats being used
-            if jax.process_index() == 0 and jnp.sum(mask_b) > 0:
+            if jax.process_index() == 0:
                 try:
                     import numpy as np
                     mean_used_cpu = np.array(mean_used)
