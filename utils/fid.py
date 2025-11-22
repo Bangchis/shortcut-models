@@ -40,15 +40,15 @@ def fid_from_stats(mu1, sigma1, mu2, sigma2):
     print("[FID] Starting FID calculation...", flush=True)
 
     # Check mu1, mu2
-    print(f"[FID-DEBUG] mu1: shape={mu1.shape}, has_nan={np.isnan(mu1).any()}, has_inf={np.isinf(mu1).any()}, min={np.min(mu1):.4f}, max={np.max(mu1):.4f}, mean={np.mean(mu1):.4f}", flush=True)
-    print(f"[FID-DEBUG] mu2: shape={mu2.shape}, has_nan={np.isnan(mu2).any()}, has_inf={np.isinf(mu2).any()}, min={np.min(mu2):.4f}, max={np.max(mu2):.4f}, mean={np.mean(mu2):.4f}", flush=True)
+    print(f"[FID-DEBUG] mu1: shape={mu1.shape}, has_nan={np.isnan(mu1).any()}, has_inf={np.isinf(mu1).any()}, min={float(np.min(mu1)):.4f}, max={float(np.max(mu1)):.4f}, mean={float(np.mean(mu1)):.4f}", flush=True)
+    print(f"[FID-DEBUG] mu2: shape={mu2.shape}, has_nan={np.isnan(mu2).any()}, has_inf={np.isinf(mu2).any()}, min={float(np.min(mu2)):.4f}, max={float(np.max(mu2)):.4f}, mean={float(np.mean(mu2)):.4f}", flush=True)
 
     diff = mu1 - mu2
-    print(f"[FID-DEBUG] diff: has_nan={np.isnan(diff).any()}, has_inf={np.isinf(diff).any()}, min={np.min(diff):.4f}, max={np.max(diff):.4f}", flush=True)
+    print(f"[FID-DEBUG] diff: has_nan={np.isnan(diff).any()}, has_inf={np.isinf(diff).any()}, min={float(np.min(diff)):.4f}, max={float(np.max(diff)):.4f}", flush=True)
 
     # Check sigma1, sigma2
-    print(f"[FID-DEBUG] sigma1: shape={sigma1.shape}, has_nan={np.isnan(sigma1).any()}, has_inf={np.isinf(sigma1).any()}, min={np.min(sigma1):.4e}, max={np.max(sigma1):.4e}", flush=True)
-    print(f"[FID-DEBUG] sigma2: shape={sigma2.shape}, has_nan={np.isnan(sigma2).any()}, has_inf={np.isinf(sigma2).any()}, min={np.min(sigma2):.4e}, max={np.max(sigma2):.4e}", flush=True)
+    print(f"[FID-DEBUG] sigma1: shape={sigma1.shape}, has_nan={np.isnan(sigma1).any()}, has_inf={np.isinf(sigma1).any()}, min={float(np.min(sigma1)):.4e}, max={float(np.max(sigma1)):.4e}", flush=True)
+    print(f"[FID-DEBUG] sigma2: shape={sigma2.shape}, has_nan={np.isnan(sigma2).any()}, has_inf={np.isinf(sigma2).any()}, min={float(np.min(sigma2)):.4e}, max={float(np.max(sigma2)):.4e}", flush=True)
 
     # Check condition number of sigma1 and sigma2
     try:
@@ -56,8 +56,8 @@ def fid_from_stats(mu1, sigma1, mu2, sigma2):
         eigvals2 = np.linalg.eigvalsh(sigma2)
         cond1 = eigvals1.max() / max(eigvals1.min(), 1e-10)
         cond2 = eigvals2.max() / max(eigvals2.min(), 1e-10)
-        print(f"[FID-DEBUG] sigma1 eigenvalues: min={eigvals1.min():.4e}, max={eigvals1.max():.4e}, condition_number={cond1:.4e}", flush=True)
-        print(f"[FID-DEBUG] sigma2 eigenvalues: min={eigvals2.min():.4e}, max={eigvals2.max():.4e}, condition_number={cond2:.4e}", flush=True)
+        print(f"[FID-DEBUG] sigma1 eigenvalues: min={float(eigvals1.min()):.4e}, max={float(eigvals1.max()):.4e}, condition_number={float(cond1):.4e}", flush=True)
+        print(f"[FID-DEBUG] sigma2 eigenvalues: min={float(eigvals2.min()):.4e}, max={float(eigvals2.max()):.4e}, condition_number={float(cond2):.4e}", flush=True)
         print(f"[FID-DEBUG] sigma1: num_negative_eigvals={np.sum(eigvals1 < 0)}, num_near_zero={np.sum(np.abs(eigvals1) < 1e-8)}", flush=True)
         print(f"[FID-DEBUG] sigma2: num_negative_eigvals={np.sum(eigvals2 < 0)}, num_near_zero={np.sum(np.abs(eigvals2) < 1e-8)}", flush=True)
     except Exception as e:
@@ -73,7 +73,7 @@ def fid_from_stats(mu1, sigma1, mu2, sigma2):
     print("[FID] Computing matrix product...", flush=True)
     # Compute (sigma1 + offset) @ (sigma2 + offset)
     product = (sigma1_jax + offset) @ (sigma2_jax + offset)
-    print(f"[FID-DEBUG] product: has_nan={jnp.isnan(product).any()}, has_inf={jnp.isinf(product).any()}, min={jnp.min(product):.4e}, max={jnp.max(product):.4e}", flush=True)
+    print(f"[FID-DEBUG] product: has_nan={jnp.isnan(product).any()}, has_inf={jnp.isinf(product).any()}, min={float(jnp.min(product)):.4e}, max={float(jnp.max(product)):.4e}", flush=True)
 
     # Make sure it's symmetric (for numerical stability)
     product = (product + product.T) / 2
@@ -83,36 +83,36 @@ def fid_from_stats(mu1, sigma1, mu2, sigma2):
     # Compute sqrt via eigenvalue decomposition: sqrt(A) = V @ diag(sqrt(λ)) @ V.T
     eigenvalues, eigenvectors = jnp.linalg.eigh(product)
 
-    print(f"[FID-DEBUG] eigenvalues: min={jnp.min(eigenvalues):.4e}, max={jnp.max(eigenvalues):.4e}, num_negative={jnp.sum(eigenvalues < 0)}, num_near_zero={jnp.sum(jnp.abs(eigenvalues) < 1e-8)}", flush=True)
+    print(f"[FID-DEBUG] eigenvalues: min={float(jnp.min(eigenvalues)):.4e}, max={float(jnp.max(eigenvalues)):.4e}, num_negative={int(jnp.sum(eigenvalues < 0))}, num_near_zero={int(jnp.sum(jnp.abs(eigenvalues) < 1e-8))}", flush=True)
     print(f"[FID-DEBUG] eigenvalues: has_nan={jnp.isnan(eigenvalues).any()}, has_inf={jnp.isinf(eigenvalues).any()}", flush=True)
 
     if jnp.max(eigenvalues) > 0:
         condition_num = jnp.max(eigenvalues) / jnp.maximum(jnp.min(eigenvalues[eigenvalues > 0]), 1e-10)
-        print(f"[FID-DEBUG] product condition_number={condition_num:.4e}", flush=True)
+        print(f"[FID-DEBUG] product condition_number={float(condition_num):.4e}", flush=True)
 
     print("[FID] Computing matrix square root...", flush=True)
     # Clip negative eigenvalues for numerical stability
     eigenvalues = jnp.maximum(eigenvalues, 0)
     sqrt_eigenvalues = jnp.sqrt(eigenvalues)
-    print(f"[FID-DEBUG] sqrt_eigenvalues: min={jnp.min(sqrt_eigenvalues):.4e}, max={jnp.max(sqrt_eigenvalues):.4e}, has_nan={jnp.isnan(sqrt_eigenvalues).any()}", flush=True)
+    print(f"[FID-DEBUG] sqrt_eigenvalues: min={float(jnp.min(sqrt_eigenvalues)):.4e}, max={float(jnp.max(sqrt_eigenvalues)):.4e}, has_nan={jnp.isnan(sqrt_eigenvalues).any()}", flush=True)
 
     # Reconstruct sqrt(product) = V @ diag(sqrt(λ)) @ V.T
     covmean = eigenvectors @ jnp.diag(sqrt_eigenvalues) @ eigenvectors.T
     covmean = jnp.real(covmean)
-    print(f"[FID-DEBUG] covmean: has_nan={jnp.isnan(covmean).any()}, has_inf={jnp.isinf(covmean).any()}, min={jnp.min(covmean):.4e}, max={jnp.max(covmean):.4e}", flush=True)
+    print(f"[FID-DEBUG] covmean: has_nan={jnp.isnan(covmean).any()}, has_inf={jnp.isinf(covmean).any()}, min={float(jnp.min(covmean)):.4e}, max={float(jnp.max(covmean)):.4e}", flush=True)
 
     print("[FID] Computing final FID score...", flush=True)
     term1 = diff @ diff
     term2 = jnp.trace(sigma1_jax)
     term3 = jnp.trace(sigma2_jax)
     term4 = jnp.trace(covmean)
-    print(f"[FID-DEBUG] FID terms: diff@diff={term1:.4f}, trace(sigma1)={term2:.4f}, trace(sigma2)={term3:.4f}, trace(covmean)={term4:.4f}", flush=True)
+    print(f"[FID-DEBUG] FID terms: diff@diff={float(term1):.4f}, trace(sigma1)={float(term2):.4f}, trace(sigma2)={float(term3):.4f}, trace(covmean)={float(term4):.4f}", flush=True)
     print(f"[FID-DEBUG] FID terms has_nan: term1={jnp.isnan(term1)}, term2={jnp.isnan(term2)}, term3={jnp.isnan(term3)}, term4={jnp.isnan(term4)}", flush=True)
 
     fid = term1 + term2 + term3 - 2 * term4
-    print(f"[FID-DEBUG] Final FID value: {fid:.4f}, has_nan={jnp.isnan(fid)}, has_inf={jnp.isinf(fid)}", flush=True)
+    print(f"[FID-DEBUG] Final FID value: {float(fid):.4f}, has_nan={jnp.isnan(fid)}, has_inf={jnp.isinf(fid)}", flush=True)
 
-    print(f"[FID] Done! FID score = {fid:.2f}", flush=True)
+    print(f"[FID] Done! FID score = {float(fid):.2f}", flush=True)
     return float(fid)
 
 

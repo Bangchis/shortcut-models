@@ -402,13 +402,16 @@ def eval_model(
 
                     # Diagnostic: Check x_cin (BatchNorm output) and x for NaN/Inf at first iteration
                     if fid_it == 0 and ti == 0 and jax.process_index() == 0:
-                        x_cin_cpu = np.array(x_cin)
-                        v_cpu = np.array(v)
-                        x_cpu = np.array(x)
-                        print(f"[FID-DEBUG] First sample, first step (t={t:.3f}):", flush=True)
-                        print(f"[FID-DEBUG]   x_cin (BatchNorm output): has_nan={np.isnan(x_cin_cpu).any()}, has_inf={np.isinf(x_cin_cpu).any()}, min={np.min(x_cin_cpu):.4f}, max={np.max(x_cin_cpu):.4f}, mean={np.mean(x_cin_cpu):.4f}", flush=True)
-                        print(f"[FID-DEBUG]   v (velocity): has_nan={np.isnan(v_cpu).any()}, has_inf={np.isinf(v_cpu).any()}, min={np.min(v_cpu):.4f}, max={np.max(v_cpu):.4f}, mean={np.mean(v_cpu):.4f}", flush=True)
-                        print(f"[FID-DEBUG]   x (after step): has_nan={np.isnan(x_cpu).any()}, has_inf={np.isinf(x_cpu).any()}, min={np.min(x_cpu):.4f}, max={np.max(x_cpu):.4f}, mean={np.mean(x_cpu):.4f}", flush=True)
+                        try:
+                            x_cin_cpu = np.array(x_cin)
+                            v_cpu = np.array(v)
+                            x_cpu = np.array(x)
+                            print(f"[FID-DEBUG] First sample, first step (t={float(t):.3f}):", flush=True)
+                            print(f"[FID-DEBUG]   x_cin (BatchNorm output): has_nan={np.isnan(x_cin_cpu).any()}, has_inf={np.isinf(x_cin_cpu).any()}, min={float(np.min(x_cin_cpu)):.4f}, max={float(np.max(x_cin_cpu)):.4f}, mean={float(np.mean(x_cin_cpu)):.4f}", flush=True)
+                            print(f"[FID-DEBUG]   v (velocity): has_nan={np.isnan(v_cpu).any()}, has_inf={np.isinf(v_cpu).any()}, min={float(np.min(v_cpu)):.4f}, max={float(np.max(v_cpu)):.4f}, mean={float(np.mean(v_cpu)):.4f}", flush=True)
+                            print(f"[FID-DEBUG]   x (after step): has_nan={np.isnan(x_cpu).any()}, has_inf={np.isinf(x_cpu).any()}, min={float(np.min(x_cpu)):.4f}, max={float(np.max(x_cpu)):.4f}, mean={float(np.mean(x_cpu)):.4f}", flush=True)
+                        except Exception as e:
+                            print(f"[FID-DEBUG] Error logging x_cin/v/x diagnostics: {e}", flush=True)
 
                 if FLAGS.model.use_stable_vae:
                     x = vae_decode(x)  # Image is in [-1, 1] space.
@@ -418,8 +421,11 @@ def eval_model(
 
                 # Diagnostic: Check final x before FID network at first iteration
                 if fid_it == 0 and jax.process_index() == 0:
-                    x_final_cpu = np.array(x)
-                    print(f"[FID-DEBUG] First sample, final image (after resize & clip): has_nan={np.isnan(x_final_cpu).any()}, has_inf={np.isinf(x_final_cpu).any()}, min={np.min(x_final_cpu):.4f}, max={np.max(x_final_cpu):.4f}", flush=True)
+                    try:
+                        x_final_cpu = np.array(x)
+                        print(f"[FID-DEBUG] First sample, final image (after resize & clip): has_nan={np.isnan(x_final_cpu).any()}, has_inf={np.isinf(x_final_cpu).any()}, min={float(np.min(x_final_cpu)):.4f}, max={float(np.max(x_final_cpu)):.4f}", flush=True)
+                    except Exception as e:
+                        print(f"[FID-DEBUG] Error logging final image diagnostics: {e}", flush=True)
                 # [devices, batch//devices, 2048]
                 acts = get_fid_activations(x)[..., 0, 0, :]
                 acts = jax.experimental.multihost_utils.process_allgather(acts)
