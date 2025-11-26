@@ -379,8 +379,8 @@ class DiT(nn.Module):
             t_discrete) * 100
 
         if return_activations:
-            return x, logvars, activations
-        return x
+            return x_final, logvars, activations
+        return x_final
 
 
 class ConditionalOutputNorm(nn.Module):
