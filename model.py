@@ -383,33 +383,72 @@ class DiT(nn.Module):
         return x_final
 
 
+# class ConditionalOutputNorm(nn.Module):
+#     out_channels: int
+#     num_timesteps: int  # Đây sẽ là denoise_timesteps
+#     dtype: Any = jnp.bfloat16
+
+#     @nn.compact
+#     def __call__(self, x, k):
+#         # 1. Instance Norm: Normalize (x - mu) / sigma
+#         # Tắt affine mặc định để dùng Embedding bên dưới
+#         mean_sq = jnp.mean(jnp.square(x), axis=(1, 2), keepdims=True)
+
+#         # 2. Tính RMS (thêm epsilon chống chia 0)
+#         rms = jnp.sqrt(mean_sq + 1e-6)
+
+#         # 3. Normalize (Chỉ chia, KHÔNG trừ mean)
+#         x_norm = x / rms
+
+#         # 4. Học Gamma/Beta (vẫn cần thiết để khôi phục biên độ)
+#         vocab_size = self.num_timesteps + 1
+#         gamma = nn.Embed(vocab_size, self.out_channels,
+#                          embedding_init=nn.initializers.constant(1.0),
+#                          dtype=self.dtype)(k)
+#         beta = nn.Embed(vocab_size, self.out_channels,
+#                         embedding_init=nn.initializers.constant(0.0),
+#                         dtype=self.dtype)(k)  # Beta lúc này đóng vai trò bias vector thuần túy
+
+#         gamma_bc = gamma[:, None, None, :]
+#         beta_bc = beta[:, None, None, :]
+
+#         return x_norm * gamma_bc + beta_bc, gamma, beta
 class ConditionalOutputNorm(nn.Module):
     out_channels: int
-    num_timesteps: int  # Đây sẽ là denoise_timesteps
+    num_timesteps: int
     dtype: Any = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, k):
-        # 1. Instance Norm: Normalize (x - mu) / sigma
-        # Tắt affine mặc định để dùng Embedding bên dưới
+        # 1. RMS Norm (Giữ hướng, chuẩn hóa năng lượng)
         mean_sq = jnp.mean(jnp.square(x), axis=(1, 2), keepdims=True)
+        x_norm = x * jax.lax.rsqrt(mean_sq + 1e-6)
 
-        # 2. Tính RMS (thêm epsilon chống chia 0)
-        rms = jnp.sqrt(mean_sq + 1e-6)
-
-        # 3. Normalize (Chỉ chia, KHÔNG trừ mean)
-        x_norm = x / rms
-
-        # 4. Học Gamma/Beta (vẫn cần thiết để khôi phục biên độ)
-        vocab_size = self.num_timesteps + 1
-        gamma = nn.Embed(vocab_size, self.out_channels,
-                         embedding_init=nn.initializers.constant(1.0),
+        # 2. Embeddings (Adaptive Affine)
+        # Gamma init=0 (Zero-Init) để bắt đầu nhẹ nhàng
+        gamma = nn.Embed(self.num_timesteps + 1, self.out_channels,
+                         embedding_init=nn.initializers.constant(0.0),
                          dtype=self.dtype)(k)
-        beta = nn.Embed(vocab_size, self.out_channels,
+        beta = nn.Embed(self.num_timesteps + 1, self.out_channels,
                         embedding_init=nn.initializers.constant(0.0),
-                        dtype=self.dtype)(k)  # Beta lúc này đóng vai trò bias vector thuần túy
+                        dtype=self.dtype)(k)
 
-        gamma_bc = gamma[:, None, None, :]
-        beta_bc = beta[:, None, None, :]
+        # 3. Gating (Alpha)
+        # Gate control: Bao nhiêu % là tín hiệu đã Norm
+        gate = nn.Embed(self.num_timesteps + 1, 1,
+                        embedding_init=nn.initializers.constant(
+                            0.0),  # Sigmoid(0) = 0.5
+                        dtype=self.dtype)(k)
+        gate = nn.sigmoid(gate)[:, None, None, :]  # [B, 1, 1, 1] Range (0, 1)
 
-        return x_norm * gamma_bc + beta_bc, gamma, beta
+        # 4. Apply
+        # Affine transform
+        x_refined = x_norm * \
+            (1 + gamma[:, None, None, :]) + beta[:, None, None, :]
+
+        # RNN-like Update: Trộn cái cũ và cái đã tinh chỉnh
+        # Nếu gate ~ 0: Giữ nguyên x gốc.
+        # Nếu gate > 0: Pha trộn thêm tín hiệu đã chuẩn hóa.
+        out = (1 - gate) * x + gate * x_refined
+
+        return out, gamma, beta
