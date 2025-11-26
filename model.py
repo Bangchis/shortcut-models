@@ -368,11 +368,6 @@ class DiT(nn.Module):
             mse = jnp.mean((v_orig - v_new)**2, axis=(1, 2, 3))
             avg_mse = jnp.sum(mse * is_special) / mask_sum
 
-            jax.debug.print("NORM_DEBUG: SpecialPct={p} | Cos={c} | MagRatio={m}",
-                            p=jnp.mean(is_special),
-                            c=avg_cos,
-                            m=avg_mag)
-
             # Lưu vào activations
             activations['scalar_cos_sim'] = avg_cos
             activations['scalar_mag_ratio'] = avg_mag
