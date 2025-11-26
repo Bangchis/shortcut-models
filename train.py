@@ -69,7 +69,7 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut',  # or naive.
     # Special timesteps for shortcut learning.
-    'special_t': (1/128, 1/64, 1/32, 1/16, 1/8, 1/4, 1/2),
+    'special_t': (1/8, 1/4, 3/8, 1/2, 5/8, 3/4, 7/8),
 
 })
 
