@@ -392,27 +392,24 @@ class ConditionalOutputNorm(nn.Module):
     def __call__(self, x, k):
         # 1. Instance Norm: Normalize (x - mu) / sigma
         # Tắt affine mặc định để dùng Embedding bên dưới
-        x_norm = nn.GroupNorm(num_groups=self.out_channels,
-                              use_scale=False, use_bias=False,
-                              dtype=self.dtype)(x)
+        mean_sq = jnp.mean(jnp.square(x), axis=(1, 2), keepdims=True)
 
-        # 2. Embeddings cho Gamma và Beta
-        # Input k chạy từ 0 đến num_timesteps (ví dụ 0..128) => size phải là num_timesteps + 1
+        # 2. Tính RMS (thêm epsilon chống chia 0)
+        rms = jnp.sqrt(mean_sq + 1e-6)
+
+        # 3. Normalize (Chỉ chia, KHÔNG trừ mean)
+        x_norm = x / rms
+
+        # 4. Học Gamma/Beta (vẫn cần thiết để khôi phục biên độ)
         vocab_size = self.num_timesteps + 1
-
         gamma = nn.Embed(vocab_size, self.out_channels,
                          embedding_init=nn.initializers.constant(1.0),
-                         dtype=self.dtype, name='gamma_embed')(k)
-
+                         dtype=self.dtype)(k)
         beta = nn.Embed(vocab_size, self.out_channels,
                         embedding_init=nn.initializers.constant(0.0),
-                        dtype=self.dtype, name='beta_embed')(k)
+                        dtype=self.dtype)(k)  # Beta lúc này đóng vai trò bias vector thuần túy
 
-        # 3. Broadcast [B, C] -> [B, 1, 1, C]
         gamma_bc = gamma[:, None, None, :]
         beta_bc = beta[:, None, None, :]
 
-        # 4. Apply Affine
-        out = x_norm * gamma_bc + beta_bc
-
-        return out, gamma, beta
+        return x_norm * gamma_bc + beta_bc, gamma, beta
