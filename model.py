@@ -369,7 +369,7 @@ class DiT(nn.Module):
             avg_mse = jnp.sum(mse * is_special) / mask_sum
 
             # Console Print gọn
-            jax.debug.print("NORM_DEBUG: Special%={p:.1%} | Cos={c:.3f} | MagRatio={m:.3f}",
+            jax.debug.print("NORM_DEBUG: Special%={} | Cos={} | MagRatio={}",
                             p=jnp.mean(is_special), c=avg_cos, m=avg_mag)
 
             # Lưu vào activations
