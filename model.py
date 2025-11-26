@@ -342,20 +342,25 @@ class DiT(nn.Module):
 
         # === DEBUG / LOGGING METRICS ===
         if return_activations:
-            # Dùng stop_gradient để tính toán metric mà không ảnh hưởng backward pass
+            # Dùng stop_gradient để an toàn
             v_orig = jax.lax.stop_gradient(x)
             v_new = jax.lax.stop_gradient(x_final)
+            mask_sum = jnp.sum(is_special) + 1e-6
 
-            mask_sum = jnp.sum(is_special) + 1e-6  # Tránh chia 0
+            # Helper tính norm thủ công (L2 norm trên các trục H, W, C)
+            def compute_norm(v):
+                return jnp.sqrt(jnp.sum(v ** 2, axis=(1, 2, 3)))
 
-            # Metric 1: Thay đổi hướng (Cosine Similarity)
+            norm_orig = compute_norm(v_orig)
+            norm_new = compute_norm(v_new)
+
+            # Metric 1: Cosine Similarity
+            # dot product giữa 2 vector phẳng
             dot = jnp.sum(v_orig * v_new, axis=(1, 2, 3))
-            norm_orig = jnp.linalg.norm(v_orig, axis=(1, 2, 3))
-            norm_new = jnp.linalg.norm(v_new, axis=(1, 2, 3))
             cos_sim = dot / (norm_orig * norm_new + 1e-6)
             avg_cos = jnp.sum(cos_sim * is_special) / mask_sum
 
-            # Metric 2: Thay đổi độ lớn (Magnitude Ratio)
+            # Metric 2: Magnitude Ratio
             mag_ratio = norm_new / (norm_orig + 1e-6)
             avg_mag = jnp.sum(mag_ratio * is_special) / mask_sum
 
@@ -363,17 +368,11 @@ class DiT(nn.Module):
             mse = jnp.mean((v_orig - v_new)**2, axis=(1, 2, 3))
             avg_mse = jnp.sum(mse * is_special) / mask_sum
 
-            # # Metric 4: Gamma/Beta trung bình (trên kênh)
-            # g_mean = jnp.sum(jnp.mean(jnp.abs(gamma_vals), axis=1) * is_special) / mask_sum
-            # b_mean = jnp.sum(jnp.mean(jnp.abs(beta_vals), axis=1) * is_special) / mask_sum
+            # Console Print gọn
+            jax.debug.print("NORM_DEBUG: Special%={p:.1%} | Cos={c:.3f} | MagRatio={m:.3f}",
+                            p=jnp.mean(is_special), c=avg_cos, m=avg_mag)
 
-            # Console Print (Chỉ in ở host 0)
-            # Dùng jax.debug.print để in runtime values
-            jax.debug.print("NORM_DEBUG: Special%={p:.1%} | Cos={c:.3f} | MagRatio={m:.3f} | Gamma={g:.3f}",
-                            p=jnp.mean(is_special), c=avg_cos, m=avg_mag, g=g_mean)
-
-            # Lưu vào activations để train.py log lên WandB
-            # Prefix 'scalar_' để filter
+            # Lưu vào activations
             activations['scalar_cos_sim'] = avg_cos
             activations['scalar_mag_ratio'] = avg_mag
             activations['scalar_mse_diff'] = avg_mse
