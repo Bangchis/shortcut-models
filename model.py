@@ -400,8 +400,13 @@ class ConditionalOutputNorm(nn.Module):
     def __call__(self, x, k):
         # 1. Instance Norm: Normalize (x - mu) / sigma
         # Tắt affine mặc định để dùng Embedding bên dưới
-        x_norm = nn.GroupNorm(num_groups=self.out_channels,
-                              use_scale=False, use_bias=False,
+        # x_norm = nn.GroupNorm(num_groups=self.out_channels,
+        #                       use_scale=False, use_bias=False,
+        #                       dtype=self.dtype)(x)
+
+        # thử nghiệm với LayerNorm
+        x_norm = nn.LayerNorm(use_scale=False,
+                              use_bias=False,
                               dtype=self.dtype)(x)
 
         # 2. Embeddings cho Gamma và Beta
