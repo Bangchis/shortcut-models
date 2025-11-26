@@ -67,7 +67,9 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 4,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
-    'train_type': 'shortcut'  # or naive.
+    'train_type': 'shortcut',  # or naive.
+    'special_t': (0.25, 0.5, 0.75),
+
 })
 
 
@@ -131,6 +133,25 @@ def main(_):
         get_fid_activations = None
         truth_fid_stats = None
 
+    #########################################
+    # --- CHUYỂN ĐỔI special_t (float) -> special_t_indices (int) --- (tạm thời)
+    # Lấy giá trị denoise_timesteps
+    d_steps = FLAGS.model['denoise_timesteps']
+
+    # Logic chuyển đổi: k = round(t * steps)
+    # Ví dụ: t=0.25, steps=128 -> k=32
+    # Dùng set() để loại bỏ trùng lặp nếu có, sau đó sort lại
+    special_t_float = FLAGS.model['special_t']
+    special_k_indices = sorted(list(set(
+        [int(round(t * d_steps)) for t in special_t_float]
+    )))
+
+    # Lọc đảm bảo k nằm trong khoảng hợp lệ [0, d_steps]
+    special_k_indices = [k for k in special_k_indices if 0 <= k <= d_steps]
+
+    print(f"Configured Special T: {special_t_float}")
+    print(
+        f"Converted to Indices (k): {special_k_indices} (Total steps: {d_steps})")
     ###################################
     # Creating Model and put on devices.
     ###################################
@@ -147,7 +168,10 @@ def main(_):
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
         'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow')) else True,
+        'denoise_timesteps': FLAGS.model['denoise_timesteps'],
+        'special_t_indices': tuple(special_k_indices),
     }
+
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)),
@@ -273,8 +297,18 @@ def main(_):
             info = {
                 'loss': loss,
                 'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
-                **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
             }
+
+            # Tách Scalar (metric của Norm) và Tensor (feature map)
+            for k, v in activations.items():
+                if k.startswith('scalar_'):
+                    # Log trực tiếp giá trị scalar, đổi tên cho gọn
+                    # Ví dụ: scalar_cos_sim -> norm_debug/cos_sim
+                    info[k.replace('scalar_', 'norm_debug/')] = v
+                else:
+                    # Logic cũ cho feature map (RMS)
+                    info['activations/' +
+                         k] = jnp.sqrt(jnp.mean(jnp.square(v)))
 
             if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
                 bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
