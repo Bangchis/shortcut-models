@@ -1,4 +1,4 @@
-from utils.norm import ConditionalInstanceNorm2dNHWC
+from utils.norm import ConditionalLayerNorm2dNHWC
 from jax._src.nn.initializers import _compute_fans
 from jax._src import dtypes
 from jax._src import core
@@ -327,7 +327,7 @@ class DiT(nn.Module):
         return x
 
 
-class ConditionalInstanceNormDiT(nn.Module):
+class ConditionalLayerNormDiT(nn.Module):
     # copy hết config của DiT
     patch_size: int
     hidden_size: int
@@ -351,7 +351,8 @@ class ConditionalInstanceNormDiT(nn.Module):
         labels = y
 
         # 1) norm theo t đặc biệt: x_cin là state sau CIN
-        x_cin, masked_norm_diff, norm_diff, norm_percentage = ConditionalInstanceNorm2dNHWC(
+        # 3. Gọi class Norm mới
+        x_cin, masked_norm_diff, norm_diff, norm_percentage = ConditionalLayerNorm2dNHWC(
             num_channels=x.shape[-1],
             special_t=self.special_t,
             use_affine=self.use_affine,

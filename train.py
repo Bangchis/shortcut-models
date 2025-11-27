@@ -19,7 +19,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
-from model import DiT, ConditionalInstanceNormDiT
+from model import DiT, ConditionalLayerNormDiT
 from helper_eval import eval_model
 from helper_inference import do_inference
 
@@ -160,7 +160,7 @@ def main(_):
         'use_affine': bool(FLAGS.model['use_affine_norm']),
 
     }
-    model_def = ConditionalInstanceNormDiT(**dit_args)
+    model_def = ConditionalLayerNormDiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)),
           jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))

@@ -15,7 +15,7 @@ Shape = Tuple[int]
 Dtype = Any
 
 
-class ConditionalInstanceNorm2dNHWC(nn.Module):
+class ConditionalLayerNorm2dNHWC(nn.Module):
     num_channels: int
     special_t: Sequence[float]      # ví dụ [0.0, 0.25, 0.5, 0.75, 1.0]
     eps: float = 1e-5
@@ -23,16 +23,12 @@ class ConditionalInstanceNorm2dNHWC(nn.Module):
 
     @nn.compact
     def __call__(self, x, t):
-        """
-        x: [B, H, W, C]
-        t: [B] chứa các giá trị timestep (float)
-        """
         B, H, W, C = x.shape
 
-        # 1) Instance norm cơ bản (Tính Mean/Var trên từng sample)
-        # axis=(1, 2) vì input là NHWC -> H, W là trục không gian
-        mean = jnp.mean(x, axis=(1, 2), keepdims=True)
-        var = jnp.mean((x - mean) ** 2, axis=(1, 2), keepdims=True)
+        # 2. QUAN TRỌNG: Sửa axis từ (1, 2) thành (1, 2, 3)
+        # Để tính Mean/Var trên toàn bộ bức ảnh (H, W) VÀ cả kênh màu (C)
+        mean = jnp.mean(x, axis=(1, 2, 3), keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=(1, 2, 3), keepdims=True)
         x_norm = (x - mean) / jnp.sqrt(var + self.eps)
 
         # 2) Affine phụ thuộc t sử dụng nn.Embed
