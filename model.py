@@ -342,36 +342,54 @@ class DiT(nn.Module):
 
         # === DEBUG / LOGGING METRICS ===
         if return_activations:
-            # Dùng stop_gradient để an toàn
+            # Dùng stop_gradient
             v_orig = jax.lax.stop_gradient(x)
             v_new = jax.lax.stop_gradient(x_final)
             mask_sum = jnp.sum(is_special) + 1e-6
 
-            # Helper tính norm thủ công (L2 norm trên các trục H, W, C)
+            # --- Các Metrics Tổng Hợp (Giữ nguyên) ---
             def compute_norm(v):
                 return jnp.sqrt(jnp.sum(v ** 2, axis=(1, 2, 3)))
 
             norm_orig = compute_norm(v_orig)
             norm_new = compute_norm(v_new)
 
-            # Metric 1: Cosine Similarity
-            # dot product giữa 2 vector phẳng
             dot = jnp.sum(v_orig * v_new, axis=(1, 2, 3))
             cos_sim = dot / (norm_orig * norm_new + 1e-6)
             avg_cos = jnp.sum(cos_sim * is_special) / mask_sum
 
-            # Metric 2: Magnitude Ratio
             mag_ratio = norm_new / (norm_orig + 1e-6)
             avg_mag = jnp.sum(mag_ratio * is_special) / mask_sum
 
-            # Metric 3: MSE Diff
             mse = jnp.mean((v_orig - v_new)**2, axis=(1, 2, 3))
             avg_mse = jnp.sum(mse * is_special) / mask_sum
 
-            # Lưu vào activations
             activations['scalar_cos_sim'] = avg_cos
             activations['scalar_mag_ratio'] = avg_mag
             activations['scalar_mse_diff'] = avg_mse
+
+            # === PHẦN THÊM MỚI: TRACKING GAMMA/BETA THEO TỪNG T ===
+
+            # Tính độ lớn trung bình của Gamma/Beta cho từng sample trong batch trước
+            # shape: [Batch]
+            g_mag_batch = jnp.mean(jnp.abs(gamma_vals), axis=1)
+            b_mag_batch = jnp.mean(jnp.abs(beta_vals), axis=1)
+
+            # Duyệt qua từng index k đặc biệt
+            for k_idx in self.special_t_indices:
+                sub_mask = (k == k_idx)
+                sub_count = jnp.sum(sub_mask) + 1e-6
+
+                g_mean_t = jnp.sum(g_mag_batch * sub_mask) / sub_count
+                b_mean_t = jnp.sum(b_mag_batch * sub_mask) / sub_count
+
+                # === SỬA Ở ĐÂY ===
+                # Tính lại t float: ví dụ 32 / 128 = 0.25
+                t_float = k_idx / self.denoise_timesteps
+
+                # Format chuỗi: :.2g cho gọn (0.25) hoặc :.2f (0.25)
+                activations[f'scalar_gamma_t{t_float:.2g}'] = g_mean_t
+                activations[f'scalar_beta_t{t_float:.2g}'] = b_mean_t
         #################################################
 
         t_discrete = jnp.floor(t * 256).astype(jnp.int32)
@@ -413,42 +431,34 @@ class DiT(nn.Module):
 #         beta_bc = beta[:, None, None, :]
 
 #         return x_norm * gamma_bc + beta_bc, gamma, beta
+
 class ConditionalOutputNorm(nn.Module):
     out_channels: int
-    num_timesteps: int
+    num_timesteps: int  # Đây sẽ là denoise_timesteps
     dtype: Any = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, k):
-        # 1. RMS Norm (Giữ hướng, chuẩn hóa năng lượng)
+        # 1. Instance Norm: Normalize (x - mu) / sigma
+        # Tắt affine mặc định để dùng Embedding bên dưới
         mean_sq = jnp.mean(jnp.square(x), axis=(1, 2), keepdims=True)
-        x_norm = x * jax.lax.rsqrt(mean_sq + 1e-6)
 
-        # 2. Embeddings (Adaptive Affine)
-        # Gamma init=0 (Zero-Init) để bắt đầu nhẹ nhàng
-        gamma = nn.Embed(self.num_timesteps + 1, self.out_channels,
-                         embedding_init=nn.initializers.constant(0.0),
+        # 2. Tính RMS (thêm epsilon chống chia 0)
+        rms = jnp.sqrt(mean_sq + 1e-6)
+
+        # 3. Normalize (Chỉ chia, KHÔNG trừ mean)
+        x_norm = x / rms
+
+        # 4. Học Gamma/Beta (vẫn cần thiết để khôi phục biên độ)
+        vocab_size = self.num_timesteps + 1
+        gamma = nn.Embed(vocab_size, self.out_channels,
+                         embedding_init=nn.initializers.constant(1.0),
                          dtype=self.dtype)(k)
-        beta = nn.Embed(self.num_timesteps + 1, self.out_channels,
+        beta = nn.Embed(vocab_size, self.out_channels,
                         embedding_init=nn.initializers.constant(0.0),
-                        dtype=self.dtype)(k)
+                        dtype=self.dtype)(k)  # Beta lúc này đóng vai trò bias vector thuần túy
 
-        # 3. Gating (Alpha)
-        # Gate control: Bao nhiêu % là tín hiệu đã Norm
-        gate = nn.Embed(self.num_timesteps + 1, 1,
-                        embedding_init=nn.initializers.constant(
-                            0.0),  # Sigmoid(0) = 0.5
-                        dtype=self.dtype)(k)
-        gate = nn.sigmoid(gate)[:, None, None, :]  # [B, 1, 1, 1] Range (0, 1)
+        gamma_bc = gamma[:, None, None, :]
+        beta_bc = beta[:, None, None, :]
 
-        # 4. Apply
-        # Affine transform
-        x_refined = x_norm * \
-            (1 + gamma[:, None, None, :]) + beta[:, None, None, :]
-
-        # RNN-like Update: Trộn cái cũ và cái đã tinh chỉnh
-        # Nếu gate ~ 0: Giữ nguyên x gốc.
-        # Nếu gate > 0: Pha trộn thêm tín hiệu đã chuẩn hóa.
-        out = (1 - gate) * x + gate * x_refined
-
-        return out, gamma, beta
+        return x_norm * gamma_bc + beta_bc, gamma, beta
