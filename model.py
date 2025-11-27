@@ -340,44 +340,26 @@ class DiT(nn.Module):
         cond = is_special[:, None, None, None]
         x_final = jnp.where(cond, x_norm, x)
 
-        # === DEBUG / LOGGING METRICS ===
-        if return_activations:
-            # Dùng stop_gradient để an toàn
-            v_orig = jax.lax.stop_gradient(x)
-            v_new = jax.lax.stop_gradient(x_final)
-            mask_sum = jnp.sum(is_special) + 1e-6
+        # TRACKING GAMMA/BETA THEO TỪNG T ===
 
-            # Helper tính norm thủ công (L2 norm trên các trục H, W, C)
-            def compute_norm(v):
-                return jnp.sqrt(jnp.sum(v ** 2, axis=(1, 2, 3)))
+        # Tính độ lớn trung bình của Gamma/Beta cho từng sample trong batch trước
+        # shape: [Batch]
+        g_mag_batch = jnp.mean(jnp.abs(gamma_vals), axis=1)
+        b_mag_batch = jnp.mean(jnp.abs(beta_vals), axis=1)
 
-            norm_orig = compute_norm(v_orig)
-            norm_new = compute_norm(v_new)
+        # Duyệt qua từng index k đặc biệt
+        for k_idx in self.special_t_indices:
+            sub_mask = (k == k_idx)
+            sub_count = jnp.sum(sub_mask) + 1e-6
 
-            # Metric 1: Cosine Similarity
-            # dot product giữa 2 vector phẳng
-            dot = jnp.sum(v_orig * v_new, axis=(1, 2, 3))
-            cos_sim = dot / (norm_orig * norm_new + 1e-6)
-            avg_cos = jnp.sum(cos_sim * is_special) / mask_sum
+            g_mean_t = jnp.sum(g_mag_batch * sub_mask) / sub_count
+            b_mean_t = jnp.sum(b_mag_batch * sub_mask) / sub_count
 
-            # Metric 2: Magnitude Ratio
-            mag_ratio = norm_new / (norm_orig + 1e-6)
-            avg_mag = jnp.sum(mag_ratio * is_special) / mask_sum
+            t_float = k_idx / self.denoise_timesteps
 
-            # Metric 3: MSE Diff
-            mse = jnp.mean((v_orig - v_new)**2, axis=(1, 2, 3))
-            avg_mse = jnp.sum(mse * is_special) / mask_sum
-
-            # Console Print gọn
-
-            # Lưu vào activations
-            activations['scalar_cos_sim'] = avg_cos
-            activations['scalar_mag_ratio'] = avg_mag
-            activations['scalar_mse_diff'] = avg_mse
-            # activations['scalar_gamma'] = g_mean
-            # activations['scalar_beta'] = b_mean
-
-        #################################################
+            # Format chuỗi: :.2g cho gọn (0.25) hoặc :.2f (0.25)
+            activations[f'scalar_gamma_t{t_float:.3g}'] = g_mean_t
+            activations[f'scalar_beta_t{t_float:.3g}'] = b_mean_t
 
         t_discrete = jnp.floor(t * 256).astype(jnp.int32)
         logvars = nn.Embed(256, 1, embedding_init=nn.initializers.constant(0))(
