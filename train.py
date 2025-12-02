@@ -39,6 +39,7 @@ flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
+flags.DEFINE_string('special_t', None, 'Special timesteps for shortcut learning (comma-separated, e.g., "1/128,1/64,1/32,1/16,1/8"). Accepts fractions or decimals. If not provided, uses model config default.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -91,6 +92,29 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 def main(_):
 
     np.random.seed(FLAGS.seed)
+
+    # Parse and override special_t if provided via command line
+    if FLAGS.special_t is not None:
+        try:
+            # Parse comma-separated values (can be fractions like "1/128" or decimals like "0.0078125")
+            special_t_values = []
+            for val in FLAGS.special_t.split(','):
+                val = val.strip()
+                if '/' in val:
+                    # Parse fraction
+                    numerator, denominator = val.split('/')
+                    special_t_values.append(
+                        float(numerator) / float(denominator))
+                else:
+                    # Parse decimal
+                    special_t_values.append(float(val))
+            FLAGS.model['special_t'] = tuple(special_t_values)
+            print(
+                f"Overriding special_t from command line: {FLAGS.model['special_t']}")
+        except Exception as e:
+            print(f"Error parsing special_t flag: {e}")
+            print(f"Using default from config: {FLAGS.model['special_t']}")
+
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
     global_device_count = jax.device_count()
