@@ -225,48 +225,105 @@ def eval_model(
             if denoise_timesteps == 'cfg':
                 denoise_timesteps = denoise_timesteps_list[-2]
                 do_cfg = True
+
             all_x = []
+
+            # [NEW] List để lưu giá trị Cosine Similarity qua từng bước t
+            cosim_trajectory = []
+            # [NEW] Biến lưu vector vận tốc bước trước đó
+            v_prev = None
+
             delta_t = 1.0 / denoise_timesteps
-            # x = eps # [local_batch, ...]
-            # x = shard_data(x) # [batch, ...] (on all devices)
 
             # BẮT ĐẦU TỪ CÙNG 1 BATCH NHIỄU CỐ ĐỊNH
-            x = eps_eval                      # (thay vì: x = eps)
-            B_local = eps_eval.shape[0]       # size trước khi shard
+            x = eps_eval
+            B_local = eps_eval.shape[0]
             x = shard_data(x)
 
             for ti in range(denoise_timesteps):
-                t = ti / denoise_timesteps  # From x_0 (noise) to x_1 (data)
-                t_vector = jnp.full((B_local,), t)  # (thay vì eps.shape[0])
+                t = ti / denoise_timesteps
+                t_vector = jnp.full((B_local,), t)
                 dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
                 if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                     dt_base = jnp.zeros_like(t_vector)
+
                 t_vector, dt_base = shard_data(t_vector, dt_base)
+
+                # --- CALL MODEL ---
                 if not do_cfg:
-                    v, x_cin = call_model(
-                        train_state, x, t_vector, dt_base,
-                        visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond
-                    )
+                    v = call_model(train_state, x, t_vector, dt_base,
+                                   visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond)
                 else:
-                    v_cond, x_cin_cond = call_model(
-                        train_state, x, t_vector, dt_base, visualize_labels
-                    )
-                    v_uncond, x_cin_uncond = call_model(
-                        train_state, x, t_vector, dt_base, labels_uncond
-                    )
+                    v_cond = call_model(
+                        train_state, x, t_vector, dt_base, visualize_labels)
+                    v_uncond = call_model(
+                        train_state, x, t_vector, dt_base, labels_uncond)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
-                    # về lý thuyết x_cin_cond == x_cin_uncond vì cùng (x,t) → dùng 1 cái
-                    x_cin = x_cin_cond
 
-                # Version A: bước từ state đã norm
-                x = x_cin + v * delta_t
+                # ==============================================================================
+                # [NEW] TÍNH TOÁN TRAJECTORY STRAIGHTNESS (Cosine Sim v_t vs v_{t-1})
+                # ==============================================================================
+                if v_prev is not None:
+                    # Flatten spatial dimensions: [Batch, H, W, C] -> [Batch, H*W*C]
+                    flat_curr = v.reshape(v.shape[0], -1)
+                    flat_prev = v_prev.reshape(v_prev.shape[0], -1)
 
+                    # Tính Cosine Similarity
+                    dot_prod = jnp.sum(flat_curr * flat_prev, axis=1)
+                    norm_curr = jnp.linalg.norm(flat_curr, axis=1)
+                    norm_prev = jnp.linalg.norm(flat_prev, axis=1)
+
+                    # Thêm 1e-6 để tránh chia cho 0
+                    cosim = dot_prod / (norm_curr * norm_prev + 1e-6)
+
+                    # Lấy trung bình cộng của cả batch
+                    mean_cosim = jnp.mean(cosim)
+
+                    # Chuyển từ JAX array về CPU numpy float để vẽ đồ thị
+                    cosim_trajectory.append(float(jax.device_get(mean_cosim)))
+
+                # Cập nhật v_prev cho bước tiếp theo
+                v_prev = v
+                # ==============================================================================
+
+                # Euler Update
+                x = x + v * delta_t
+
+                # Lưu ảnh để visualize (giữ nguyên logic cũ)
                 if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
                     np_x = jax.experimental.multihost_utils.process_allgather(
                         x)
                     all_x.append(np.array(np_x))
+
             all_x = np.stack(all_x, axis=1)  # (batch, timesteps, H, W, C)
-            all_x = all_x[:, -8:]  # Last 8 timesteps
+            all_x = all_x[:, -8:]            # Last 8 timesteps
+
+            # ==============================================================================
+            # [NEW] VẼ & LOG ĐỒ THỊ COSINE SIMILARITY LÊN WANDB
+            # ==============================================================================
+            # Chỉ vẽ ở Host 0 và chỉ vẽ khi có dữ liệu (denoise_timesteps >= 2)
+            if jax.process_index() == 0 and len(cosim_trajectory) > 0:
+                fig_traj, ax_traj = plt.subplots(figsize=(8, 4))
+
+                # Trục X: Index của bước chuyển (từ bước 0->1, 1->2, ...)
+                steps_axis = np.arange(len(cosim_trajectory))
+
+                ax_traj.plot(steps_axis, cosim_trajectory, marker='o',
+                             markersize=4, linestyle='-', linewidth=1.5)
+
+                # Thêm Step vào Title để dễ phân biệt khi nhìn lại ảnh
+                ax_traj.set_title(
+                    f'Trajectory Straightness (CosSim) @ Step {step}\nN={denoise_timesteps}, CFG={do_cfg}')
+                ax_traj.set_xlabel('Step Index')
+                ax_traj.set_ylabel('Cosine Similarity (v_t, v_{t+1})')
+                ax_traj.set_ylim(0.0, 1.05)  # Cosim max là 1
+                ax_traj.grid(True, which='both', linestyle='--', alpha=0.5)
+
+                d_label = 'cfg' if do_cfg else denoise_timesteps
+                wandb.log(
+                    {f'trajectory/cosim_{d_label}': wandb.Image(fig_traj)}, step=step)
+                plt.close(fig_traj)
+            # ==============================================================================
 
             if jax.process_index() == 0:
                 num_viz_samples = min(8, all_x.shape[0])  # Limit samples
@@ -276,25 +333,22 @@ def eval_model(
 
                 # Fix reshape: Xử lý single Axes (1x1 subplot)
                 if num_viz_timesteps == 1 and num_viz_samples == 1:
-                    # Single subplot: axs là Axes object, không cần reshape
                     pass
                 elif num_viz_timesteps == 1:
-                    # 1 row, multiple cols: axs là 1D array, reshape thành 2D (1, N)
                     axs = np.array(axs).reshape(1, -1)
                 elif num_viz_samples == 1:
-                    # Multiple rows, 1 col: axs là 2D với shape (M, 1), transpose nếu cần
                     axs = axs.reshape(-1, 1)
 
                 for t in range(num_viz_timesteps):
                     for j in range(num_viz_samples):
                         sample_img = process_img(all_x[j, t])  # Single latent
                         if num_viz_timesteps == 1 and num_viz_samples == 1:
-                            # Direct call cho single Axes
                             axs.imshow(sample_img, vmin=0, vmax=1)
                         else:
                             axs[t, j].imshow(sample_img, vmin=0, vmax=1)
                             axs[t, j].axis('off')
                             axs[t, j].set_title(f't={t}, sample={j}')
+
                 d_label = 'cfg' if do_cfg else denoise_timesteps
                 wandb.log({f'sample_N/{d_label}': wandb.Image(fig)}, step=step)
                 plt.close(fig)
