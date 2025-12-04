@@ -45,7 +45,6 @@ flags.DEFINE_string('name', ' ', 'optional name')
 flags.DEFINE_string('special_t', None, 'Special timesteps for shortcut learning (comma-separated, e.g., "1/128,1/64,1/32,1/16,1/8"). Accepts fractions or decimals. If not provided, uses model config default.')
 
 
-
 model_config = ml_collections.ConfigDict({
 
     'lr': 0.0001,
@@ -75,7 +74,7 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut',  # or naive.
-    'special_t': (1/128,2/128,3/128), # or -1 for even spacing.
+    'special_t': (1/4, 2/4, 3/4),  # or -1 for even spacing.
     'n_even_special_t': -1,
     'use_affine_norm': 1
 })
@@ -97,9 +96,7 @@ def main(_):
         'project': 'shortcut',
         'name': 'shortcut_{dataset_name}'+f'_{FLAGS.git_branch}_{FLAGS.machine}'+run_name,
     })
-    
-    
-    
+
     # Parse and override special_t if provided via command line
     if FLAGS.special_t is not None:
         try:
@@ -313,6 +310,25 @@ def main(_):
                 'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                 **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
             }
+
+            # Log CIN embedding magnitudes
+            cin_params = grad_params.get('ConditionalInstanceNorm2dNHWC_0', None)
+            if cin_params is not None and 'gamma_embed' in cin_params:
+                gamma_embed = cin_params['gamma_embed']['embedding']  # [K, C]
+                beta_embed = cin_params['beta_embed']['embedding']    # [K, C]
+
+                # Compute L2 norm per special_t: [K]
+                gamma_norms = jnp.sqrt(jnp.sum(gamma_embed ** 2, axis=1))
+                beta_norms = jnp.sqrt(jnp.sum(beta_embed ** 2, axis=1))
+
+                # Normalize by sqrt(num_channels) to get values < 1
+                num_channels = gamma_embed.shape[1]
+                gamma_norms_normalized = gamma_norms / jnp.sqrt(num_channels)
+                beta_norms_normalized = beta_norms / jnp.sqrt(num_channels)
+
+                # Log mean only
+                info['cin_params/gamma_norm_mean'] = jnp.mean(gamma_norms_normalized)
+                info['cin_params/beta_norm_mean'] = jnp.mean(beta_norms_normalized)
 
             if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
                 bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
