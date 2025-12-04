@@ -73,7 +73,7 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
     'train_type': 'shortcut',  # or naive.
-    'special_t': (1/4, 1/2, 3/4),  # or -1 for even spacing.
+    'special_t': (1/128,2/128,3/128), # or -1 for even spacing.
     'n_even_special_t': -1,
     'use_affine_norm': 1
 })
