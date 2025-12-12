@@ -80,6 +80,7 @@ def do_inference(
         denoise_timesteps = FLAGS.inference_timesteps
         num_generations = FLAGS.inference_generations
         cfg_scale = FLAGS.inference_cfg_scale
+        alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
         x0 = []
         x1 = []
         lab = []
@@ -95,6 +96,7 @@ def do_inference(
             x = jax.random.normal(eps_key, images_shape)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)
+            x0_initial = x  # initial noise for ti==0 special-case
             x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             delta_t = 1.0 / denoise_timesteps
             for ti in range(denoise_timesteps):
@@ -117,7 +119,15 @@ def do_inference(
                     v_pred_label = call_model(train_state, x, t_vector, dt_base, labels)
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
-                if FLAGS.model.train_type == 'consistency':
+                if FLAGS.model.train_type == 'khoat-fm':
+                    # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
+                    if ti == 0:
+                        # x_d <- (1-alpha) x0 + alpha * d * v(x0, 0, d)
+                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                    else:
+                        # x_{t+d} <- x_t + alpha * d * v(x_t, t, d)
+                        x = x + alpha * (delta_t * v)
+                elif FLAGS.model.train_type == 'consistency':
                     eps = shard_data(jax.random.normal(jax.random.fold_in(eps_key, ti), images_shape))
                     x1pred = x + v * (1-t)
                     x = x1pred * (t+delta_t) + eps * (1-t-delta_t)

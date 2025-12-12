@@ -63,7 +63,16 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 4, # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
-    'train_type': 'shortcut' # or naive.
+    'train_type': 'shortcut', # or naive, khoat-fm.
+
+    # ===== Khoat Flow Matching defaults =====
+    'kfm_p_min': 0.75,          # P_min = 75%
+    'kfm_alpha': 0.9,           # alpha = 0.9
+    'kfm_dt_min_exp': 0,        # default
+    'kfm_dt_max_exp': -1,       # default: -1 => auto = log2(denoise_timesteps)
+    'kfm_schedule_type': 'linear',  # default
+    'kfm_schedule': '',         # default unused for now
+    'kfm_eps': 1e-5,            # keep same epsilon style as current codebase
 })
 
 
@@ -137,7 +146,7 @@ def main(_):
         'class_dropout_prob': FLAGS.model['class_dropout_prob'],
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
-        'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow')) else True,
+        'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow', 'khoat-fm')) else True,
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
@@ -231,6 +240,9 @@ def main(_):
             x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
         elif FLAGS.model['train_type'] == 'livereflow':
             from baselines.targets_livereflow import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'khoat-fm':
+            from targets_khoat_fm import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
 
         def loss_fn(grad_params):

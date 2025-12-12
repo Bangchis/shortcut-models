@@ -39,6 +39,7 @@ def eval_model(
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
         eps = jax.random.normal(key, batch_images.shape)
+        alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
 
         def process_img(img):
             if FLAGS.model.use_stable_vae:
@@ -66,20 +67,30 @@ def eval_model(
             d_list = [0, 1, 2, 3, 4, 5]
         for d in d_list:
             infos = None
-            for t in np.arange(0, 32):
-                t = t * (1.0 / 32)
 
+            # For KFM: sweep aligned t values on the grid of size 2^d
+            if FLAGS.model['train_type'] == 'khoat-fm':
+                grid_n = 2 ** int(d)
+                if grid_n <= 32:
+                    t_values = (np.arange(0, grid_n) / grid_n).tolist()
+                else:
+                    idx = np.linspace(0, grid_n - 1, 32, dtype=np.int32)
+                    t_values = (idx / grid_n).tolist()
+            else:
+                t_values = (np.arange(0, 32) / 32).tolist()
+
+            for t in t_values:
                 batch_images_n, batch_labels_n = next(dataset)
                 if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                     batch_images_n = vae_encode(key, batch_images_n)
                 batch_images_sharded, batch_labels_sharded = shard_data(batch_images_n, batch_labels_n)
-                _, info = update(train_state, train_state_teacher, batch_images_sharded, batch_labels_sharded, force_t=t, force_dt=d)
+                _, info = update(train_state, train_state_teacher, batch_images_sharded, batch_labels_sharded, force_t=float(t), force_dt=int(d))
                 info = jax.experimental.multihost_utils.process_allgather(info)
                 if infos is None:
                     infos = jax.tree_map(lambda x: [x], info)
                 else:
                     infos = jax.tree_map(lambda x, y: y + [x], info, infos)
-            time_axis = np.arange(0, 32) / 32
+            time_axis = np.array(t_values)
             axs[0, d].plot(time_axis, infos['loss'])
             axs[0, d].set_title(f"All {d}")
             if FLAGS.model['train_type'] == 'shortcut':
@@ -149,6 +160,7 @@ def eval_model(
             delta_t = 1.0 / denoise_timesteps
             x = eps # [local_batch, ...]
             x = shard_data(x) # [batch, ...] (on all devices)
+            x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
                 t_vector = jnp.full((eps.shape[0],), t)
@@ -162,7 +174,14 @@ def eval_model(
                     v_cond = call_model(train_state, x, t_vector, dt_base, visualize_labels)
                     v_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
-                x = x + v * delta_t
+
+                if FLAGS.model['train_type'] == 'khoat-fm':
+                    if ti == 0:
+                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                    else:
+                        x = x + alpha * (delta_t * v)
+                else:
+                    x = x + v * delta_t
                 if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
                     np_x = jax.experimental.multihost_utils.process_allgather(x)
                     all_x.append(np.array(np_x))
@@ -192,6 +211,7 @@ def eval_model(
                 x = jax.random.normal(eps_key, images_shape)
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 x, labels = shard_data(x, labels)
+                x0_initial = x  # initial noise for ti==0 special-case
                 delta_t = 1.0 / denoise_timesteps
                 for ti in range(denoise_timesteps):
                     t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
@@ -208,7 +228,14 @@ def eval_model(
                         v_pred_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
                         v_pred_label = call_model(train_state, x, t_vector, dt_base, labels)
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
-                    x = x + v * delta_t # Euler sampling.
+
+                    if FLAGS.model['train_type'] == 'khoat-fm':
+                        if ti == 0:
+                            x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                        else:
+                            x = x + alpha * (delta_t * v)
+                    else:
+                        x = x + v * delta_t # Euler sampling.
                 if FLAGS.model.use_stable_vae:
                     x = vae_decode(x) # Image is in [-1, 1] space.
                 x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
