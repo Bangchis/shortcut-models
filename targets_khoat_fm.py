@@ -13,14 +13,15 @@ def _log2_int(n: int) -> int:
 
 def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1):
     """
-    Khoat Flow Matching (training phase):
+    Khoat Flow Matching (training phase with output scaling):
       - sample dt_base -> d = 2^{-dt_base} with P_min selecting d_min
       - sample aligned t on grid: t = m / 2^{dt_base}
       - stratified t=0: kfm_t0_ratio of batch forced to t=0
       - x_t = (1 - (1-eps)*t)*x0 + t*x1
-      - v_t: t=0 -> (1/α)x1 + ((α-d)/(α·d))x0
-             t>0 -> (1/α)(x1 - (1-eps)*x0)
-      - return (x_t, v_t, t, dt_base, labels_dropped, info)
+      - u_t = d*v_t (output scaling for numerical stability):
+          t=0 -> d·[(1/α)x1 + ((α-d)/(α·d))x0] = (d/α)x1 + (1-(1-ε)d/α)x0
+          t>0 -> d·(1/α)(x1 - (1-eps)*x0) = (d/α)(x1 - (1-eps)x0)
+      - return (x_t, u_t, t, dt_base, labels_dropped, info)
     """
     # RNG
 
@@ -87,18 +88,19 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     x1 = images
     x_t = (1.0 - (1.0 - eps) * t_full) * x0 + t_full * x1
 
-    # v_target with t=0 special case
+    # u_target = d * v_target (output scaling for numerical stability)
     alpha = float(FLAGS.model.get('kfm_alpha', 0.9))
     d = jnp.power(2.0, -dt_base.astype(jnp.float32))[:, None, None, None]  # (B,1,1,1)
 
-    # Base velocity (for t>0)
+    # Base velocity (for t>0): v = (1/α)(x₁ - (1-ε)x₀)
     v_base = (1.0/alpha) * (x1 - (1.0 - eps) * x0)
 
     # Correction for t=0 only
     correction_coeff = 1.0/d - 1.0/alpha + (1.0 - eps)/alpha
     correction = jnp.where(t_full < 1e-6, correction_coeff * x0, 0.0)
 
-    v_t = v_base + correction
+    # Output scaling: u = d*v to keep targets bounded
+    v_t = d * (v_base + correction)
 
     # ===== 4) CFG label dropout (reuse shortcut behavior) =====
     drop_p = float(FLAGS.model['class_dropout_prob'])

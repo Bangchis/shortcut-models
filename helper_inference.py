@@ -121,12 +121,13 @@ def do_inference(
 
                 if FLAGS.model.train_type == 'khoat-fm':
                     # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
+                    # Note: model outputs u = d*v, so no need to multiply by delta_t
                     if ti == 0:
-                        # x_d <- (1-alpha) x0 + alpha * d * v(x0, 0, d)
-                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                        # x_d <- (1-alpha) x0 + alpha * u(x0, 0, d)
+                        x = (1.0 - alpha) * x0_initial + alpha * v
                     else:
-                        # x_{t+d} <- x_t + alpha * d * v(x_t, t, d)
-                        x = x + alpha * (delta_t * v)
+                        # x_{t+d} <- x_t + alpha * u(x_t, t, d)
+                        x = x + alpha * v
                 elif FLAGS.model.train_type == 'consistency':
                     eps = shard_data(jax.random.normal(jax.random.fold_in(eps_key, ti), images_shape))
                     x1pred = x + v * (1-t)

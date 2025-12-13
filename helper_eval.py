@@ -176,10 +176,11 @@ def eval_model(
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
+                    # Model outputs u = d*v, so no need to multiply by delta_t
                     if ti == 0:
-                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                        x = (1.0 - alpha) * x0_initial + alpha * v
                     else:
-                        x = x + alpha * (delta_t * v)
+                        x = x + alpha * v
                 else:
                     x = x + v * delta_t
                 if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
@@ -230,10 +231,11 @@ def eval_model(
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                     if FLAGS.model['train_type'] == 'khoat-fm':
+                        # Model outputs u = d*v, so no need to multiply by delta_t
                         if ti == 0:
-                            x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                            x = (1.0 - alpha) * x0_initial + alpha * v
                         else:
-                            x = x + alpha * (delta_t * v)
+                            x = x + alpha * v
                     else:
                         x = x + v * delta_t # Euler sampling.
                 if FLAGS.model.use_stable_vae:
