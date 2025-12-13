@@ -71,6 +71,7 @@ model_config = ml_collections.ConfigDict({
     # ===== Khoat Flow Matching defaults =====
     'kfm_p_min': 0.75,          # P_min = 75%
     'kfm_alpha': 0.9,           # alpha = 0.9
+    'kfm_t0_ratio': 0.125,      # 12.5% of batch forced to t=0 (stratified sampling)
     'kfm_dt_min_exp': 0,        # default
     'kfm_dt_max_exp': -1,       # default: -1 => auto = log2(denoise_timesteps)
     'kfm_schedule_type': 'linear',  # default
