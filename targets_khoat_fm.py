@@ -11,10 +11,57 @@ def _log2_int(n: int) -> int:
     return k
 
 
-def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1):
+def sample_dt_base_curriculum(dt_key, B, K, stage, rho):
     """
-    Khoat Flow Matching (training phase):
-      - sample dt_base -> d = 2^{-dt_base} with P_min selecting d_min
+    Sample dt_base with curriculum learning (mass transfer).
+
+    Args:
+        dt_key: JAX random key
+        B: batch size
+        K: maximum dt_base (log2(denoise_timesteps))
+        stage: current curriculum stage (0 to K)
+        rho: mass transfer parameter (0 to 1)
+
+    Returns:
+        dt_base: sampled dt values [B,] in range [K-stage, K]
+
+    Strategy:
+        - Allowed set S = {K, K-1, ..., K-stage}
+        - p(K) = 1 - rho (most mass at K initially)
+        - p(others in S) = rho / stage (distributed uniformly)
+    """
+    # Minimum allowed dt_base
+    allowed_min = K - stage
+
+    # Create probability distribution over all possible dt values [0..K]
+    idx = jnp.arange(K + 1, dtype=jnp.int32)
+
+    # Mask for "other dts" in allowed range: [allowed_min .. K-1]
+    mask_other = (idx >= allowed_min) & (idx <= (K - 1))
+
+    # Avoid division by zero when stage=0
+    stage_f = jnp.maximum(stage.astype(jnp.float32), 1.0)
+    rho = jnp.where(stage == 0, 0.0, rho)
+
+    # Build probability vector
+    p = jnp.zeros((K + 1,), dtype=jnp.float32)
+    p = p.at[K].set(1.0 - rho)  # Mass at K
+    p = p + mask_other.astype(jnp.float32) * (rho / stage_f)  # Distribute rho to others
+
+    # Convert to logits for categorical sampling (avoid log(0))
+    logits = jnp.where(p > 0, jnp.log(p), -1e9)
+
+    # Sample B independent samples
+    dt_base = jax.random.categorical(dt_key, logits, shape=(B,))
+
+    return dt_base.astype(jnp.int32)
+
+
+def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1,
+                kfm_stage=jnp.array(0, jnp.int32), kfm_rho=jnp.array(0.0, jnp.float32)):
+    """
+    Khoat Flow Matching (training phase) with curriculum learning:
+      - sample dt_base with curriculum (mass transfer strategy)
       - sample aligned t on grid: t = m / 2^{dt_base}
       - x_t = (1 - (1-eps)*t)*x0 + t*x1
       - v_t = x1 - (1-eps)*x0
@@ -28,25 +75,10 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     N = int(FLAGS.model['denoise_timesteps'])
     K = _log2_int(N)
 
-    # Defaults (you asked: default only)
-    dt_min = int(FLAGS.model.get('kfm_dt_min_exp', 0))
-    dt_max_cfg = int(FLAGS.model.get('kfm_dt_max_exp', -1))
-    dt_max = K if dt_max_cfg == -1 else int(dt_max_cfg)
-    dt_min = max(0, min(dt_min, dt_max))
-    dt_max = max(dt_min, min(dt_max, K))
-
-    P_min = float(FLAGS.model.get('kfm_p_min', 0.75))
     eps = float(FLAGS.model.get('kfm_eps', 1e-5))
 
-    # ===== 1) Sample dt_base =====
-    # With prob P_min: dt_base = dt_max (=> d_min), else uniform from [dt_min .. dt_max-1]
-    choose_min = jax.random.bernoulli(dt_key, p=P_min, shape=(B,))
-    dt_base = jnp.full((B,), dt_max, dtype=jnp.int32)
-
-    if dt_max > dt_min:
-        other_key = jax.random.fold_in(dt_key, 123)  # decorrelate
-        other_dt = jax.random.randint(other_key, (B,), minval=dt_min, maxval=dt_max, dtype=jnp.int32)
-        dt_base = jnp.where(choose_min, dt_base, other_dt)
+    # ===== 1) Sample dt_base with curriculum learning =====
+    dt_base = sample_dt_base_curriculum(dt_key, B, K, kfm_stage, kfm_rho)
 
     # force_dt override (used in eval sweeps)
     force_dt_i = jnp.asarray(force_dt, dtype=jnp.int32)
@@ -76,10 +108,15 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     labels_dropped = jnp.where(labels_dropout, jnp.int32(FLAGS.model['num_classes']), labels)
     info['dropped_ratio'] = jnp.mean(labels_dropped == jnp.int32(FLAGS.model['num_classes']))
 
-    # ===== 5) useful logs / sanity =====
+    # ===== 5) useful logs / sanity + curriculum monitoring =====
     info['dt_base_mean'] = jnp.mean(dt_base.astype(jnp.float32))
-    info['pmin_hit_ratio'] = jnp.mean(dt_base == jnp.int32(dt_max))
+    info['dt_base_std'] = jnp.std(dt_base.astype(jnp.float32))
+    info['dt_base_max_ratio'] = jnp.mean(dt_base == K)  # Fraction at maximum dt
     k_grid = t * jnp.power(2.0, dt_base.astype(jnp.float32))
     info['grid_abs_err'] = jnp.mean(jnp.abs(k_grid - jnp.round(k_grid)))
+
+    # Curriculum tracking
+    info['kfm_stage'] = kfm_stage.astype(jnp.float32)
+    info['kfm_rho'] = kfm_rho
 
     return x_t, v_t, t, dt_base, labels_dropped, info

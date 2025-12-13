@@ -121,12 +121,10 @@ def do_inference(
 
                 if FLAGS.model.train_type == 'khoat-fm':
                     # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
-                    if ti == 0:
-                        # x_d <- (1-alpha) x0 + alpha * d * v(x0, 0, d)
-                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
-                    else:
-                        # x_{t+d} <- x_t + alpha * d * v(x_t, t, d)
-                        x = x + alpha * (delta_t * v)
+                    # Use jnp.where to avoid Python branching for JAX optimization
+                    x_step_0 = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                    x_step_i = x + alpha * (delta_t * v)
+                    x = jnp.where(ti == 0, x_step_0, x_step_i)
                 elif FLAGS.model.train_type == 'consistency':
                     eps = shard_data(jax.random.normal(jax.random.fold_in(eps_key, ti), images_shape))
                     x1pred = x + v * (1-t)

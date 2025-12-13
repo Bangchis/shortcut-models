@@ -176,10 +176,10 @@ def eval_model(
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
-                    if ti == 0:
-                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
-                    else:
-                        x = x + alpha * (delta_t * v)
+                    # Use jnp.where to avoid Python branching for JAX optimization
+                    x_step_0 = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                    x_step_i = x + alpha * (delta_t * v)
+                    x = jnp.where(ti == 0, x_step_0, x_step_i)
                 else:
                     x = x + v * delta_t
                 if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
@@ -230,10 +230,10 @@ def eval_model(
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                     if FLAGS.model['train_type'] == 'khoat-fm':
-                        if ti == 0:
-                            x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
-                        else:
-                            x = x + alpha * (delta_t * v)
+                        # Use jnp.where to avoid Python branching for JAX optimization
+                        x_step_0 = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                        x_step_i = x + alpha * (delta_t * v)
+                        x = jnp.where(ti == 0, x_step_0, x_step_i)
                     else:
                         x = x + v * delta_t # Euler sampling.
                 if FLAGS.model.use_stable_vae:

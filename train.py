@@ -76,6 +76,11 @@ model_config = ml_collections.ConfigDict({
     'kfm_schedule_type': 'linear',  # default
     'kfm_schedule': '',         # default unused for now
     'kfm_eps': 1e-5,            # keep same epsilon style as current codebase
+
+    # ===== Khoat Flow Matching curriculum (mass transfer) =====
+    'kfm_curr_warmup_steps': 100_000,   # Learn dt=K only during warmup
+    'kfm_curr_stage_steps': 25_000,     # Steps per curriculum stage
+    'kfm_curr_gamma': 2.0,              # rho(s) = (s/K)^gamma for mass transfer
 })
 
 
@@ -232,7 +237,8 @@ def main(_):
     ###################################
 
     @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
-    def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1):
+    def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1,
+               kfm_stage=jnp.array(0, jnp.int32), kfm_rho=jnp.array(0.0, jnp.float32)):
         new_rng, targets_key, dropout_key, perm_key = jax.random.split(
             train_state.rng, 4)
         info = {}
@@ -274,7 +280,7 @@ def main(_):
         elif FLAGS.model['train_type'] == 'khoat-fm':
             from targets_khoat_fm import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+                FLAGS, targets_key, train_state, images, labels, force_t, force_dt, kfm_stage, kfm_rho)
 
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
@@ -332,9 +338,30 @@ def main(_):
                 vae_rng, vae_key = jax.random.split(vae_rng)
                 batch_images = vae_encode(vae_key, batch_images)
 
+        # Curriculum for Khoat FM
+        kfm_stage = jnp.array(0, dtype=jnp.int32)
+        kfm_rho = jnp.array(0.0, dtype=jnp.float32)
+
+        if FLAGS.model['train_type'] == 'khoat-fm':
+            K = int(np.log2(FLAGS.model['denoise_timesteps']))
+            warm = int(FLAGS.model['kfm_curr_warmup_steps'])
+            per = int(FLAGS.model['kfm_curr_stage_steps'])
+            gamma = float(FLAGS.model['kfm_curr_gamma'])
+
+            if i <= warm:
+                s = 0
+            else:
+                s = int((i - warm) // max(per, 1))
+                s = max(0, min(K, s))
+
+            rho = (s / max(K, 1)) ** gamma
+            kfm_stage = jnp.array(s, dtype=jnp.int32)
+            kfm_rho = jnp.array(rho, dtype=jnp.float32)
+
         # Train update.
         train_state, update_info = update(
-            train_state, train_state_teacher, batch_images, batch_labels)
+            train_state, train_state_teacher, batch_images, batch_labels,
+            kfm_stage=kfm_stage, kfm_rho=kfm_rho)
 
         if i % FLAGS.log_interval == 0 or i == 1:
             update_info = jax.device_get(update_info)
