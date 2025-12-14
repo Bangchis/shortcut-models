@@ -127,6 +127,13 @@ def eval_model(
                 x_t = (1 - (1 - 1e-5) * t_full) * eps_tile + t_full * valid_images_tile
                 x_t, t, dt_base = shard_data(x_t, t, dt_base)
                 v_pred = call_model(train_state, x_t, t, dt_base, valid_labels_sharded if FLAGS.model.cfg_scale != 0 else labels_uncond)
+
+                # For khoat-fm: model outputs normalized O, convert to physical u
+                if FLAGS.model['train_type'] == 'khoat-fm':
+                    d = jnp.power(2.0, -dt_base.astype(jnp.float32))
+                    scale_factor = jnp.where(t < 1e-6, 1.0, d)
+                    v_pred = v_pred * scale_factor[..., None, None, None]  # Now v_pred is physical u
+
                 x_1_pred = x_t + v_pred * (1-t[..., None, None, None])
                 x_t = jax.experimental.multihost_utils.process_allgather(x_t) # [devices, batch, H, W, C]
                 x_1_pred = jax.experimental.multihost_utils.process_allgather(x_1_pred) # [devices, batch, H, W, C]
@@ -176,7 +183,11 @@ def eval_model(
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
-                    # Model outputs u = d*v, so no need to multiply by delta_t
+                    # Model outputs normalized O, convert to physical u
+                    scale_factor = 1.0 if ti == 0 else delta_t
+                    v = v * scale_factor  # Now v is physical u
+
+                    # Algorithm 1 Sampling Phase
                     if ti == 0:
                         x = (1.0 - alpha) * x0_initial + alpha * v
                     else:
@@ -231,7 +242,11 @@ def eval_model(
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                     if FLAGS.model['train_type'] == 'khoat-fm':
-                        # Model outputs u = d*v, so no need to multiply by delta_t
+                        # Model outputs normalized O, convert to physical u
+                        scale_factor = 1.0 if ti == 0 else delta_t
+                        v = v * scale_factor  # Now v is physical u
+
+                        # Algorithm 1 Sampling Phase
                         if ti == 0:
                             x = (1.0 - alpha) * x0_initial + alpha * v
                         else:

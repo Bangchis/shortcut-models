@@ -275,23 +275,42 @@ def main(_):
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
         elif FLAGS.model['train_type'] == 'khoat-fm':
             from targets_khoat_fm import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
+            x_t, v_t, t, dt_base, labels, info, scale_factor = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+
+            # Preconditioning: normalize v_t (physical u) to O for training
+            # This avoids gradient conflict between t=0 (mag~1) and t>0 (mag~0.01)
+            u_target = v_t  # Keep physical u for logging
+            v_t = v_t / scale_factor  # Now v_t is normalized O (not physical u)
 
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
                                                                    'dropout': dropout_key}, params=grad_params, return_activations=True)
+            # For khoat-fm: v_prime and v_t are both normalized O (not physical u)
             mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
             loss = jnp.mean(mse_v)
 
+            # Logging: convert back to physical u for monitoring
+            if FLAGS.model['train_type'] == 'khoat-fm':
+                u_pred = v_prime * scale_factor  # Physical u prediction
+                # u_target already computed above (line 283)
+                O_mag_pred = jnp.sqrt(jnp.mean(jnp.square(v_prime)))
+                O_mag_target = jnp.sqrt(jnp.mean(jnp.square(v_t)))
+            else:
+                u_pred = v_prime
+                u_target_local = v_t
+                O_mag_pred = 0.0
+                O_mag_target = 0.0
+
             info = {
                 'loss': loss,
-                # Model prediction (u = d*v, output-scaled velocity)
-                'u_magnitude_pred': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
-                # Target (u = d*v, output-scaled velocity)
-                'u_magnitude_target': jnp.sqrt(jnp.mean(jnp.square(v_t))),
-                # Ratio to monitor convergence (ideal: ~1.0)
-                'u_pred_target_ratio': jnp.sqrt(jnp.mean(jnp.square(v_prime))) / (jnp.sqrt(jnp.mean(jnp.square(v_t))) + 1e-8),
+                # Physical u magnitude (varies 0.01-1.0)
+                'u_magnitude_pred': jnp.sqrt(jnp.mean(jnp.square(u_pred))),
+                'u_magnitude_target': jnp.sqrt(jnp.mean(jnp.square(u_target if FLAGS.model['train_type'] == 'khoat-fm' else u_target_local))),
+                'u_pred_target_ratio': jnp.sqrt(jnp.mean(jnp.square(u_pred))) / (jnp.sqrt(jnp.mean(jnp.square(u_target if FLAGS.model['train_type'] == 'khoat-fm' else u_target_local))) + 1e-8),
+                # Normalized O magnitude (should be ~1.0 for khoat-fm)
+                'O_magnitude_pred': O_mag_pred,
+                'O_magnitude_target': O_mag_target,
                 **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
             }
 

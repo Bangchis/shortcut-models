@@ -21,7 +21,7 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
       - u_t = d*v_t (output scaling for numerical stability):
           t=0 -> d·[(1/α)x1 + ((α-d)/(α·d))x0] = (d/α)x1 + (1-(1-ε)d/α)x0
           t>0 -> d·(1/α)(x1 - (1-eps)*x0) = (d/α)(x1 - (1-eps)x0)
-      - return (x_t, u_t, t, dt_base, labels_dropped, info)
+      - return (x_t, u_t, t, dt_base, labels_dropped, info, scale_factor)
     """
     # RNG
 
@@ -100,7 +100,11 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     correction = jnp.where(t_full < 1e-6, correction_coeff * x0, 0.0)
 
     # Output scaling: u = d*v to keep targets bounded
-    v_t = d * (v_base + correction)
+    v_t = d * (v_base + correction)  # v_t is physical u_target
+
+    # Preconditioning: scale_factor for normalized training
+    # scale_factor = 1.0 at t=0, d at t>0 (to avoid gradient conflict)
+    scale_factor = jnp.where(t_full < 1e-6, 1.0, d)  # (B,1,1,1)
 
     # ===== 4) CFG label dropout (reuse shortcut behavior) =====
     drop_p = float(FLAGS.model['class_dropout_prob'])
@@ -117,4 +121,4 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     k_grid = t * jnp.power(2.0, dt_base.astype(jnp.float32))
     info['grid_abs_err'] = jnp.mean(jnp.abs(k_grid - jnp.round(k_grid)))
 
-    return x_t, v_t, t, dt_base, labels_dropped, info
+    return x_t, v_t, t, dt_base, labels_dropped, info, scale_factor

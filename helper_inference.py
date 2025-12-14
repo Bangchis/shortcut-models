@@ -120,8 +120,12 @@ def do_inference(
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                 if FLAGS.model.train_type == 'khoat-fm':
+                    # Model outputs normalized O, convert to physical u
+                    # scale_factor = 1.0 at t=0, delta_t at t>0
+                    scale_factor = 1.0 if ti == 0 else delta_t
+                    v = v * scale_factor  # Now v is physical u
+
                     # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
-                    # Note: model outputs u = d*v, so no need to multiply by delta_t
                     if ti == 0:
                         # x_d <- (1-alpha) x0 + alpha * u(x0, 0, d)
                         x = (1.0 - alpha) * x0_initial + alpha * v
