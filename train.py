@@ -286,7 +286,12 @@ def main(_):
 
             info = {
                 'loss': loss,
-                'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                # Model prediction (u = d*v, output-scaled velocity)
+                'u_magnitude_pred': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                # Target (u = d*v, output-scaled velocity)
+                'u_magnitude_target': jnp.sqrt(jnp.mean(jnp.square(v_t))),
+                # Ratio to monitor convergence (ideal: ~1.0)
+                'u_pred_target_ratio': jnp.sqrt(jnp.mean(jnp.square(v_prime))) / (jnp.sqrt(jnp.mean(jnp.square(v_t))) + 1e-8),
                 **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
             }
 

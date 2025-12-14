@@ -42,7 +42,8 @@ class TrainConfig:
     def kern_init(self, name='default', zero=False):
         if zero or 'bias' in name:
             return nn.initializers.constant(0)
-        return xavier_uniform_pytorchlike()
+        # Use Normal(0.02) as per DiT paper instead of Xavier
+        return nn.initializers.normal(stddev=0.02)
     def default_config(self):
         return {
             'kernel_init': self.kern_init(),
@@ -165,7 +166,11 @@ class DiTBlock(nn.Module):
     def __call__(self, x, c):
         # Calculate adaLn modulation parameters.
         c = nn.silu(c)
-        c = nn.Dense(6 * self.hidden_size, **self.tc.default_config())(c)
+        # Zero-init for gates to start as identity function (adaLN-Zero)
+        c = nn.Dense(6 * self.hidden_size,
+                     kernel_init=self.tc.kern_init(zero=True),
+                     bias_init=self.tc.kern_init('bias', zero=True),
+                     dtype=self.tc.dtype)(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
         
         # Attention Residual.
