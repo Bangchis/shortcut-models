@@ -24,7 +24,7 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     """
     # RNG
 
-    dt_key, t_key, x0_key, label_key = jax.random.split(key, 4)
+    dt_key, t_key, x0_key, label_key, cat_key = jax.random.split(key, 5)
     info = {}
 
     B = images.shape[0]
@@ -38,19 +38,33 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     dt_min = max(0, min(dt_min, dt_max))
     dt_max = max(dt_min, min(dt_max, K))
 
-    P_min = float(FLAGS.model.get('kfm_p_min', 0.75))
+    P_min = float(FLAGS.model.get('kfm_p_min', 0.5))
     eps = float(FLAGS.model.get('kfm_eps', 1e-5))
 
-    # ===== 1) Sample dt_base =====
-    # With prob P_min: dt_base = dt_max (=> d_min), else uniform from [dt_min .. dt_max-1]
+    # ===== 1) Sample dt_base (Linear Distribution) =====
+    # 50% (P_min): dt_base = dt_max (d_min = 1/128)
+    # 50% remaining: Linear distribution favoring smaller steps
+    # P(dt_base=k) ∝ weight(k) = k - dt_min + 1
     choose_min = jax.random.bernoulli(dt_key, p=P_min, shape=(B,))
     dt_base = jnp.full((B,), dt_max, dtype=jnp.int32)
 
     if dt_max > dt_min:
-        other_key = jax.random.fold_in(dt_key, 123)  # decorrelate
-        other_dt = jax.random.randint(
-            other_key, (B,), minval=dt_min, maxval=dt_max, dtype=jnp.int32)
-        dt_base = jnp.where(choose_min, dt_base, other_dt)
+        # Number of other levels: [dt_min, dt_min+1, ..., dt_max-1]
+        num_others = dt_max - dt_min
+        other_values = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
+
+        # Linear weights: dt_base small (d large) -> low weight
+        #                 dt_base large (d small) -> high weight
+        # weights = [1, 2, 3, ..., num_others]
+        weights = jnp.arange(1, num_others + 1, dtype=jnp.float32)
+        logits = jnp.log(weights)
+
+        # Sample indices [0, 1, ..., num_others-1]
+        sampled_indices = jax.random.categorical(cat_key, logits, shape=(B,))
+        sampled_others = other_values[sampled_indices]
+
+        # Merge: if choose_min, use dt_max; else use sampled value
+        dt_base = jnp.where(choose_min, dt_base, sampled_others)
 
     # force_dt override (used in eval sweeps)
     force_dt_i = jnp.asarray(force_dt, dtype=jnp.int32)
@@ -114,7 +128,10 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
 
     # ===== 5) useful logs / sanity =====
     info['dt_base_mean'] = jnp.mean(dt_base.astype(jnp.float32))
-    info['pmin_hit_ratio'] = jnp.mean(dt_base == jnp.int32(dt_max))
+    info['pmin_hit_ratio'] = jnp.mean(dt_base == jnp.int32(dt_max))  # Should ≈ 0.5
+    # Log ratio of largest step (dt_base=0, d=1) if applicable
+    if dt_min == 0:
+        info['dt_max_step_ratio'] = jnp.mean(dt_base == 0)  # Largest step d=1
     info['t0_ratio_actual'] = jnp.mean(t < 1e-6)
     k_grid = t * jnp.power(2.0, dt_base.astype(jnp.float32))
     info['grid_abs_err'] = jnp.mean(jnp.abs(k_grid - jnp.round(k_grid)))
