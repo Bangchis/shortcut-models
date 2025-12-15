@@ -122,8 +122,8 @@ def do_inference(
                 if FLAGS.model.train_type == 'khoat-fm':
                     # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
                     if ti == 0:
-                        # x_d <- (1-alpha) x0 + alpha * d * v(x0, 0, d)
-                        x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
+                        # x_d <- (1 - alpha*d) x0 + alpha * d * v(x0, 0, d)
+                        x = (1.0 - alpha * delta_t) * x0_initial + alpha * (delta_t * v)
                     else:
                         # x_{t+d} <- x_t + alpha * d * v(x_t, t, d)
                         x = x + alpha * (delta_t * v)

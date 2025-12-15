@@ -89,16 +89,20 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
 
     # v_target with t=0 special case
     alpha = float(FLAGS.model.get('kfm_alpha', 0.9))
-    d = jnp.power(2.0, -dt_base.astype(jnp.float32))[:, None, None, None]  # (B,1,1,1)
+    d = jnp.power(2.0, -dt_base.astype(jnp.float32)
+                  )[:, None, None, None]  # (B,1,1,1)
 
-    # Base velocity (for t>0)
-    v_base = (1.0/alpha) * (x1 - (1.0 - eps) * x0)
+    # Velocity formulas (different for t=0 and t>0)
+    # For t>0: v_t = (x1 - (1-eps)*x0) / alpha
+    # For t=0: v_t = (alpha - 1)/alpha * (1-eps)*x0 + (1/alpha) * x1
+    v_t_regular = (1.0/alpha) * (x1 - (1.0 - eps) * x0)
 
-    # Correction for t=0 only
-    correction_coeff = 1.0/d - 1.0/alpha + (1.0 - eps)/alpha
-    correction = jnp.where(t_full < 1e-6, correction_coeff * x0, 0.0)
+    # Special formula for t=0
+    v_t_at_zero = ((alpha - 1.0) / alpha) * \
+        (1.0 - eps) * x0 + (1.0 / alpha) * x1
 
-    v_t = v_base + correction
+    # Use different formulas based on whether t=0 or t>0
+    v_t = jnp.where(t_full < 1e-6, v_t_at_zero, v_t_regular)
 
     # ===== 4) CFG label dropout (reuse shortcut behavior) =====
     drop_p = float(FLAGS.model['class_dropout_prob'])
