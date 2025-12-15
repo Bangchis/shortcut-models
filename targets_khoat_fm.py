@@ -40,31 +40,74 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
 
     P_min = float(FLAGS.model.get('kfm_p_min', 0.5))
     eps = float(FLAGS.model.get('kfm_eps', 1e-5))
+    deterministic = bool(FLAGS.model.get('kfm_deterministic_for_d', 0))
 
-    # ===== 1) Sample dt_base (Linear Distribution) =====
-    # 50% (P_min): dt_base = dt_max (d_min = 1/128)
-    # 50% remaining: Linear distribution favoring smaller steps
-    # P(dt_base=k) ∝ weight(k) = k - dt_min + 1
-    choose_min = jax.random.bernoulli(dt_key, p=P_min, shape=(B,))
-    dt_base = jnp.full((B,), dt_max, dtype=jnp.int32)
+    # ===== 1) Sample dt_base =====
+    if deterministic:
+        # DETERMINISTIC MODE: Stratified sampling with fixed slot allocation
+        # 50% (P_min): dt_base = dt_max (d_min = 1/128)
+        # 50% remaining: Exact counts based on linear weights
+        n_flow = int(B * P_min)
+        n_shortcut = B - n_flow
 
-    if dt_max > dt_min:
-        # Number of other levels: [dt_min, dt_min+1, ..., dt_max-1]
-        num_others = dt_max - dt_min
-        other_values = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
+        # Create flow matching slots (all dt_max)
+        dt_flow = jnp.full((n_flow,), dt_max, dtype=jnp.int32)
 
-        # Linear weights: dt_base small (d large) -> low weight
-        #                 dt_base large (d small) -> high weight
-        # weights = [1, 2, 3, ..., num_others]
-        weights = jnp.arange(1, num_others + 1, dtype=jnp.float32)
-        logits = jnp.log(weights)
+        if dt_max > dt_min and n_shortcut > 0:
+            # Shortcut levels: [dt_min, dt_min+1, ..., dt_max-1]
+            num_levels = dt_max - dt_min
+            shortcut_bases = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
 
-        # Sample indices [0, 1, ..., num_others-1]
-        sampled_indices = jax.random.categorical(cat_key, logits, shape=(B,))
-        sampled_others = other_values[sampled_indices]
+            # Linear weights: [1, 2, 3, ..., num_levels]
+            weights = jnp.arange(1, num_levels + 1, dtype=jnp.float32)
+            total_weight = jnp.sum(weights)
 
-        # Merge: if choose_min, use dt_max; else use sampled value
-        dt_base = jnp.where(choose_min, dt_base, sampled_others)
+            # Calculate exact slot counts
+            base_counts = (weights / total_weight * n_shortcut).astype(jnp.int32)
+            base_counts = jnp.maximum(base_counts, 1)  # At least 1 each
+
+            # Adjust last element to match exact n_shortcut
+            current_sum = jnp.sum(base_counts)
+            diff = n_shortcut - current_sum
+            base_counts = base_counts.at[-1].add(diff)
+
+            # Create shortcut slots via repeat
+            dt_shortcut = jnp.repeat(shortcut_bases, base_counts, total_repeat_length=n_shortcut)
+
+            # Concatenate and shuffle
+            dt_base_combined = jnp.concatenate([dt_flow, dt_shortcut])
+        else:
+            dt_base_combined = dt_flow
+
+        # Shuffle positions randomly
+        perm = jax.random.permutation(dt_key, B)
+        dt_base = dt_base_combined[perm]
+
+    else:
+        # STOCHASTIC MODE: Random categorical sampling (original)
+        # 50% (P_min): dt_base = dt_max (d_min = 1/128)
+        # 50% remaining: Linear distribution favoring smaller steps
+        # P(dt_base=k) ∝ weight(k) = k - dt_min + 1
+        choose_min = jax.random.bernoulli(dt_key, p=P_min, shape=(B,))
+        dt_base = jnp.full((B,), dt_max, dtype=jnp.int32)
+
+        if dt_max > dt_min:
+            # Number of other levels: [dt_min, dt_min+1, ..., dt_max-1]
+            num_others = dt_max - dt_min
+            other_values = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
+
+            # Linear weights: dt_base small (d large) -> low weight
+            #                 dt_base large (d small) -> high weight
+            # weights = [1, 2, 3, ..., num_others]
+            weights = jnp.arange(1, num_others + 1, dtype=jnp.float32)
+            logits = jnp.log(weights)
+
+            # Sample indices [0, 1, ..., num_others-1]
+            sampled_indices = jax.random.categorical(cat_key, logits, shape=(B,))
+            sampled_others = other_values[sampled_indices]
+
+            # Merge: if choose_min, use dt_max; else use sampled value
+            dt_base = jnp.where(choose_min, dt_base, sampled_others)
 
     # force_dt override (used in eval sweeps)
     force_dt_i = jnp.asarray(force_dt, dtype=jnp.int32)
@@ -127,6 +170,7 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
         labels_dropped == jnp.int32(FLAGS.model['num_classes']))
 
     # ===== 5) useful logs / sanity =====
+    info['sampling_mode'] = 1.0 if deterministic else 0.0  # 1=Deterministic, 0=Stochastic
     info['dt_base_mean'] = jnp.mean(dt_base.astype(jnp.float32))
     info['pmin_hit_ratio'] = jnp.mean(dt_base == jnp.int32(dt_max))  # Should ≈ 0.5
     # Log ratio of largest step (dt_base=0, d=1) if applicable

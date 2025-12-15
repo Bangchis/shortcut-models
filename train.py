@@ -78,6 +78,7 @@ model_config = ml_collections.ConfigDict({
     'kfm_schedule_type': 'linear',  # default
     'kfm_schedule': '',         # default unused for now
     'kfm_eps': 1e-5,            # keep same epsilon style as current codebase
+    'kfm_deterministic_for_d': 0,  # 0=Stochastic (random, default), 1=Deterministic (stratified)
 })
 
 
