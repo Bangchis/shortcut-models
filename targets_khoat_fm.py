@@ -13,16 +13,8 @@ def _log2_int(n: int) -> int:
 
 def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1):
     """
-    Khoat Flow Matching (training phase):
-      - sample dt_base -> d = 2^{-dt_base} with P_min selecting d_min
-      - sample aligned t on grid: t = m / 2^{dt_base}
-      - stratified t=0: kfm_t0_ratio of batch forced to t=0
-      - x_t = (1 - (1-eps)*t)*x0 + t*x1
-      - v_t: t=0 -> (1/α)x1 + ((α-d)/(α·d))x0
-             t>0 -> (1/α)(x1 - (1-eps)*x0)
-      - return (x_t, v_t, t, dt_base, labels_dropped, info)
+    Khoat Flow Matching (training phase) with UNIFORM Deterministic Stratified Sampling.
     """
-    # RNG
     dt_key, t_key, x0_key, label_key, cat_key = jax.random.split(key, 5)
     info = {}
 
@@ -40,14 +32,14 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     P_min = float(FLAGS.model.get('kfm_p_min', 0.5))
     eps = float(FLAGS.model.get('kfm_eps', 1e-5))
     
-    # Bật flag này trong config để dùng logic chia slot cố định
+    # Flag bật chế độ chia slot cố định
     deterministic = bool(FLAGS.model.get('kfm_deterministic_for_d', 0))
 
     # ===== 1) Sample dt_base =====
     if deterministic:
-        # --- DETERMINISTIC MODE: Fixed Slot Allocation ---
+        # --- DETERMINISTIC MODE: Uniform Slot Allocation ---
         
-        # 1. Chia phe 50/50 chuẩn xác (Integer division)
+        # 1. Chia phe 50/50
         n_flow = B // 2
         n_shortcut = B - n_flow
 
@@ -55,42 +47,37 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
         dt_flow = jnp.full((n_flow,), dt_max, dtype=jnp.int32)
 
         if dt_max > dt_min:
-            # 3. Tạo slot cho Shortcut (Custom Distribution)
+            # 3. Tạo slot cho Shortcut
             shortcut_bases = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
             num_levels = shortcut_bases.shape[0]
 
-            # --- CUSTOM WEIGHTS: [3, 4, 4, 5, 5, 5, 6] ---
-            # Weights này ưu tiên bước nhỏ (6) nhưng giữ đủ bước lớn (3)
-            custom_weights = jnp.array([3., 4., 4., 5., 5., 5., 6.], dtype=jnp.float32)
-
-            # Fallback: Nếu số level không phải 7 (ví dụ đổi timesteps), dùng Linear
-            weights = jnp.where(num_levels == 7,
-                                custom_weights,
-                                jnp.arange(1, num_levels + 1, dtype=jnp.float32))
+            # --- UNIFORM WEIGHTS (Chia đều) ---
+            # Tất cả trọng số bằng 1.0 -> Xác suất ngang nhau
+            weights = jnp.ones(num_levels, dtype=jnp.float32)
 
             total_weight = jnp.sum(weights)
 
             # Tính số lượng slot cơ bản (Floor)
+            # Ví dụ: (1/7 * 32) = 4.57 -> lấy 4
             base_counts = jnp.floor((weights / total_weight) * n_shortcut).astype(jnp.int32)
-            base_counts = jnp.maximum(base_counts, 1)  # Safety: Tối thiểu 1
+            base_counts = jnp.maximum(base_counts, 1)  # Safety
 
             # Xử lý phần dư: Cộng vào đầu mảng (Bước lớn)
+            # Với Batch 64: Dư 4 slot. Sẽ cộng vào index 0, 1, 2, 3.
+            # Tức là d=1, d=0.5, d=0.25, d=0.125 sẽ được ưu tiên có 5 mẫu.
             current_sum = jnp.sum(base_counts)
             diff = n_shortcut - current_sum
             
-            # Tạo mask cộng vào các index đầu tiên [0, 1, 2...] nếu thừa
             indices = jnp.arange(num_levels)
             extra_mask = (indices < diff).astype(jnp.int32)
             
             final_counts = base_counts + extra_mask
 
-            # Tạo mảng dt_shortcut thông qua repeat
+            # Tạo mảng dt_shortcut
             dt_shortcut = jnp.repeat(shortcut_bases, final_counts, total_repeat_length=n_shortcut)
 
-            # Ghép lại
             dt_base_combined = jnp.concatenate([dt_flow, dt_shortcut])
         else:
-            # Trường hợp dt_min == dt_max (hiếm gặp)
             dt_shortcut = jnp.full((n_shortcut,), dt_min, dtype=jnp.int32)
             dt_base_combined = jnp.concatenate([dt_flow, dt_shortcut])
 
@@ -100,14 +87,14 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
 
     else:
         # --- STOCHASTIC MODE (Original logic) ---
-        # (Giữ lại làm fallback hoặc so sánh)
         choose_min = jax.random.bernoulli(dt_key, p=P_min, shape=(B,))
         dt_base = jnp.full((B,), dt_max, dtype=jnp.int32)
 
         if dt_max > dt_min:
             num_others = dt_max - dt_min
             other_values = jnp.arange(dt_min, dt_max, dtype=jnp.int32)
-            weights = jnp.arange(1, num_others + 1, dtype=jnp.float32)
+            # Fallback uniform stochastic
+            weights = jnp.ones(num_others, dtype=jnp.float32)
             logits = jnp.log(weights)
             sampled_indices = jax.random.categorical(cat_key, logits, shape=(B,))
             sampled_others = other_values[sampled_indices]
@@ -163,9 +150,9 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     info['dt_base_mean'] = jnp.mean(dt_base.astype(jnp.float32))
     info['pmin_hit_ratio'] = jnp.mean(dt_base == jnp.int32(dt_max))
     
-    # Log check số lượng d=1 (index 0) và d=1/64 (index 6)
     if dt_min == 0:
-        info['count_dt_1'] = jnp.sum(dt_base == 0)      # Kỳ vọng: 3 (với Batch 64)
-        info['count_dt_1_64'] = jnp.sum(dt_base == 6)   # Kỳ vọng: 6 (với Batch 64)
+        # Uniform: Kỳ vọng ~4.5 mẫu. 
+        # Thực tế Batch 64: d=1 (base=0) sẽ có 5 mẫu.
+        info['count_dt_1'] = jnp.sum(dt_base == 0)
 
     return x_t, v_t, t, dt_base, labels_dropped, info
