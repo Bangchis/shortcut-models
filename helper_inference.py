@@ -99,16 +99,46 @@ def do_inference(
             x0_initial = x  # initial noise for ti==0 special-case
             x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             delta_t = 1.0 / denoise_timesteps
+
+            # Bang-FM: Pre-calculate Integer Partition schedule
+            if FLAGS.model['train_type'] == 'bang-fm' and isinstance(denoise_timesteps, int):
+                M = FLAGS.model.get('bfm_grid_resolution', 128)
+                N = denoise_timesteps
+                # Euclidean division: M = N*q + r
+                base_k = M // N
+                remainder = M % N
+                # Schedule: 'remainder' steps of size (base_k+1), rest of size (base_k)
+                k_schedule = [base_k + 1] * remainder + [base_k] * (N - remainder)
+                # dt_base = log2(128/k) for each step
+                dt_base_schedule = [np.log2(M / k) for k in k_schedule]
+                # Actual float dt for integration
+                dt_float_schedule = [k / M for k in k_schedule]
+                current_t = 0.0  # Track continuous time
+            else:
+                k_schedule = None
+                dt_base_schedule = None
+                dt_float_schedule = None
+                current_t = None
+
             for ti in range(denoise_timesteps):
-                t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
-                t_vector = jnp.full((images_shape[0], ), t)
-                if FLAGS.model.train_type == 'naive':
-                    dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
-                    dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow # Smallest dt.
-                else: # shortcut
-                    dt_flow = np.log2(denoise_timesteps).astype(jnp.int32)
-                    dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
-                    # print(dt_base)
+                # Calculate t and dt_base based on train_type
+                if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                    t = current_t
+                    t_vector = jnp.full((images_shape[0],), t)
+                    dt_base = jnp.full((images_shape[0],), dt_base_schedule[ti], dtype=jnp.float32)
+                    step_dt = dt_float_schedule[ti]
+                else:
+                    t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
+                    t_vector = jnp.full((images_shape[0], ), t)
+                    if FLAGS.model.train_type == 'naive':
+                        dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
+                        dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow # Smallest dt.
+                    else: # shortcut
+                        dt_flow = np.log2(denoise_timesteps).astype(jnp.int32)
+                        dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
+                        # print(dt_base)
+                    step_dt = delta_t
+
                 t_vector, dt_base = shard_data(t_vector, dt_base)
                 if cfg_scale == 1:
                     v = call_model(train_state, x, t_vector, dt_base, labels)
@@ -132,7 +162,11 @@ def do_inference(
                     x1pred = x + v * (1-t)
                     x = x1pred * (t+delta_t) + eps * (1-t-delta_t)
                 else:
-                    x = x + v * delta_t # Euler sampling.
+                    x = x + v * step_dt # Euler sampling.
+
+                # Update current_t for bang-fm
+                if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                    current_t += step_dt
             x1.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             lab.append(np.array(jax.experimental.multihost_utils.process_allgather(labels)))
             if FLAGS.model.use_stable_vae:

@@ -161,10 +161,40 @@ def eval_model(
             x = eps # [local_batch, ...]
             x = shard_data(x) # [batch, ...] (on all devices)
             x0_initial = x  # initial noise for ti==0 special-case
+
+            # Bang-FM: Pre-calculate Integer Partition schedule
+            if FLAGS.model['train_type'] == 'bang-fm' and isinstance(denoise_timesteps, int):
+                M = FLAGS.model.get('bfm_grid_resolution', 128)
+                N = denoise_timesteps
+                # Euclidean division: M = N*q + r
+                base_k = M // N
+                remainder = M % N
+                # Schedule: 'remainder' steps of size (base_k+1), rest of size (base_k)
+                k_schedule = [base_k + 1] * remainder + [base_k] * (N - remainder)
+                # dt_base = log2(128/k) for each step
+                dt_base_schedule = [np.log2(M / k) for k in k_schedule]
+                # Actual float dt for integration
+                dt_float_schedule = [k / M for k in k_schedule]
+                current_t = 0.0  # Track continuous time
+            else:
+                k_schedule = None
+                dt_base_schedule = None
+                dt_float_schedule = None
+                current_t = None
+
             for ti in range(denoise_timesteps):
-                t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
-                t_vector = jnp.full((eps.shape[0],), t)
-                dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                # Calculate t and dt_base based on train_type
+                if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                    t = current_t
+                    t_vector = jnp.full((eps.shape[0],), t)
+                    dt_base = jnp.full((eps.shape[0],), dt_base_schedule[ti], dtype=jnp.float32)
+                    step_dt = dt_float_schedule[ti]
+                else:
+                    t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
+                    t_vector = jnp.full((eps.shape[0],), t)
+                    dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                    step_dt = delta_t
+
                 if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                     dt_base = jnp.zeros_like(t_vector)
                 t_vector, dt_base = shard_data(t_vector, dt_base)
@@ -181,7 +211,11 @@ def eval_model(
                     else:
                         x = x + alpha * (delta_t * v)
                 else:
-                    x = x + v * delta_t
+                    x = x + v * step_dt
+
+                # Update current_t for bang-fm
+                if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                    current_t += step_dt
                 if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
                     np_x = jax.experimental.multihost_utils.process_allgather(x)
                     all_x.append(np.array(np_x))
@@ -213,10 +247,40 @@ def eval_model(
                 x, labels = shard_data(x, labels)
                 x0_initial = x  # initial noise for ti==0 special-case
                 delta_t = 1.0 / denoise_timesteps
+
+                # Bang-FM: Pre-calculate Integer Partition schedule
+                if FLAGS.model['train_type'] == 'bang-fm' and isinstance(denoise_timesteps, int):
+                    M = FLAGS.model.get('bfm_grid_resolution', 128)
+                    N = denoise_timesteps
+                    # Euclidean division: M = N*q + r
+                    base_k = M // N
+                    remainder = M % N
+                    # Schedule: 'remainder' steps of size (base_k+1), rest of size (base_k)
+                    k_schedule = [base_k + 1] * remainder + [base_k] * (N - remainder)
+                    # dt_base = log2(128/k) for each step
+                    dt_base_schedule = [np.log2(M / k) for k in k_schedule]
+                    # Actual float dt for integration
+                    dt_float_schedule = [k / M for k in k_schedule]
+                    current_t = 0.0  # Track continuous time
+                else:
+                    k_schedule = None
+                    dt_base_schedule = None
+                    dt_float_schedule = None
+                    current_t = None
+
                 for ti in range(denoise_timesteps):
-                    t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
-                    t_vector = jnp.full((images_shape[0], ), t)
-                    dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                    # Calculate t and dt_base based on train_type
+                    if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                        t = current_t
+                        t_vector = jnp.full((images_shape[0],), t)
+                        dt_base = jnp.full((images_shape[0],), dt_base_schedule[ti], dtype=jnp.float32)
+                        step_dt = dt_float_schedule[ti]
+                    else:
+                        t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
+                        t_vector = jnp.full((images_shape[0], ), t)
+                        dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                        step_dt = delta_t
+
                     if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                         dt_base = jnp.zeros_like(t_vector)
                     t_vector, dt_base = shard_data(t_vector, dt_base)
@@ -235,7 +299,11 @@ def eval_model(
                         else:
                             x = x + alpha * (delta_t * v)
                     else:
-                        x = x + v * delta_t # Euler sampling.
+                        x = x + v * step_dt # Euler sampling.
+
+                    # Update current_t for bang-fm
+                    if FLAGS.model['train_type'] == 'bang-fm' and k_schedule is not None:
+                        current_t += step_dt
                 if FLAGS.model.use_stable_vae:
                     x = vae_decode(x) # Image is in [-1, 1] space.
                 x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
