@@ -35,11 +35,13 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     # ==========================================
     if num_bootstrap > 0:
         # 1. Sample K uniformly from [K_min, K_max]
-        if force_dt != -1:
-            # For evaluation sweeps: interpret force_dt as K value
-            K_bst = jnp.ones(num_bootstrap, dtype=jnp.int32) * force_dt
-        else:
-            K_bst = jax.random.randint(k_key, (num_bootstrap,), minval=K_min, maxval=K_max + 1)
+        # Sample K normally first
+        K_random = jax.random.randint(k_key, (num_bootstrap,), minval=K_min, maxval=K_max + 1)
+        # Override if force_dt is set (JAX-safe using jnp.where)
+        force_dt_i = jnp.asarray(force_dt, dtype=jnp.int32)
+        K_bst = jnp.where(force_dt_i != -1,
+                          jnp.full((num_bootstrap,), force_dt_i, dtype=jnp.int32),
+                          K_random)
 
         # dt_base = log2(128/K) - FLOAT value
         dt_base_bst = jnp.log2(M / K_bst.astype(jnp.float32))
@@ -51,8 +53,11 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
         t_idx_bst = jnp.floor(rand_t * (max_t_idx + 1)).astype(jnp.int32)
         t_bst = t_idx_bst.astype(jnp.float32) / M
 
-        if force_t != -1:
-            t_bst = jnp.ones_like(t_bst) * force_t
+        # Override if force_t is set (JAX-safe using jnp.where)
+        force_t_f = jnp.asarray(force_t, dtype=jnp.float32)
+        t_bst = jnp.where(force_t_f != -1.0,
+                          jnp.full_like(t_bst, force_t_f),
+                          t_bst)
 
         t_bst_expanded = t_bst[:, None, None, None]
 
@@ -127,9 +132,11 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
     t_idx_flow = jax.random.randint(jax.random.fold_in(t_key, 1), (num_flow,), minval=0, maxval=M)
     t_flow = t_idx_flow.astype(jnp.float32) / M
 
-    # Handle force_t logic for visualization/debugging
-    if force_t != -1:
-        t_flow = jnp.ones_like(t_flow) * force_t
+    # Override if force_t is set (JAX-safe using jnp.where)
+    force_t_f = jnp.asarray(force_t, dtype=jnp.float32)
+    t_flow = jnp.where(force_t_f != -1.0,
+                       jnp.full_like(t_flow, force_t_f),
+                       t_flow)
 
     t_flow_expanded = t_flow[:, None, None, None]
 
