@@ -86,6 +86,7 @@ def fit_gmm_em_streaming(
     rng: jax.Array,
     init_points: Optional[jnp.ndarray] = None,
     on_iter_end=None,
+    verbose: bool = True,
 ) -> Tuple[GMMPrior, Dict[str, jnp.ndarray]]:
     """
     Streaming EM over an iterator that yields (B,D) jnp arrays.
@@ -94,6 +95,7 @@ def fit_gmm_em_streaming(
     - Uses diagonal covariance.
     - Supports early stopping.
     - on_iter_end: optional callback(iter_idx, logs_dict) executed on host.
+    - verbose: if True, show tqdm progress bars (only on process 0)
 
     Returns: (prior, logs)
     logs contains arrays of per-iter values (loglik, etc.)
@@ -119,68 +121,107 @@ def fit_gmm_em_streaming(
     prev_loglik = None
     bad_iters = 0
 
-    for it in range(cfg.max_iters):
-        Nk_acc = jnp.zeros((K,), dtype=jnp.float32)
-        sum_acc = jnp.zeros((K, D), dtype=jnp.float32)
-        sum2_acc = jnp.zeros((K, D), dtype=jnp.float32)
-        loglik_acc = jnp.array(0.0, dtype=jnp.float32)
-        n_seen = 0
+    # Setup progress bar for EM iterations
+    pbar_outer = None
+    if verbose and jax.process_index() == 0:
+        try:
+            import tqdm
+            pbar_outer = tqdm.tqdm(total=cfg.max_iters, desc="EM iterations", position=0)
+        except ImportError:
+            pass  # tqdm not available, continue without progress bar
 
-        for _ in range(num_batches):
-            x = next(batch_iterator)  # (B,D)
-            Nk_b, sum_b, sum2_b, ll_b = em_batch_stats(x, pi, mu, var)
-            Nk_acc = Nk_acc + Nk_b
-            sum_acc = sum_acc + sum_b
-            sum2_acc = sum2_acc + sum2_b
-            loglik_acc = loglik_acc + ll_b
-            n_seen += int(x.shape[0])
+    try:
+        for it in range(cfg.max_iters):
+            Nk_acc = jnp.zeros((K,), dtype=jnp.float32)
+            sum_acc = jnp.zeros((K, D), dtype=jnp.float32)
+            sum2_acc = jnp.zeros((K, D), dtype=jnp.float32)
+            loglik_acc = jnp.array(0.0, dtype=jnp.float32)
+            n_seen = 0
 
-        # M-step
-        Nk = jnp.maximum(Nk_acc, cfg.reinit_min_Nk)
-        pi_new = Nk / jnp.sum(Nk)
-        # Avoid degenerate components
-        pi_new = jnp.maximum(pi_new, cfg.min_weight)
-        pi_new = pi_new / jnp.sum(pi_new)
+            # Setup progress bar for E-step batches
+            pbar_inner = None
+            if verbose and jax.process_index() == 0 and pbar_outer is not None:
+                try:
+                    import tqdm
+                    pbar_inner = tqdm.tqdm(total=num_batches, desc=f"  E-step",
+                                          position=1, leave=False)
+                except ImportError:
+                    pass
 
-        mu_new = sum_acc / Nk[:, None]
-        ex2 = sum2_acc / Nk[:, None]
-        var_new = jnp.maximum(ex2 - mu_new * mu_new, cfg.var_floor)
+            try:
+                for _ in range(num_batches):
+                    x = next(batch_iterator)  # (B,D)
+                    Nk_b, sum_b, sum2_b, ll_b = em_batch_stats(x, pi, mu, var)
+                    Nk_acc = Nk_acc + Nk_b
+                    sum_acc = sum_acc + sum_b
+                    sum2_acc = sum2_acc + sum2_b
+                    loglik_acc = loglik_acc + ll_b
+                    n_seen += int(x.shape[0])
 
-        # Re-init components that were effectively empty BEFORE clamping
-        empty = Nk_acc < cfg.reinit_min_Nk
-        if bool(jnp.any(empty)):
-            # Use init_points to re-seed means deterministically
-            repl = init_points
-            repl = jnp.pad(repl, ((0, max(0, K - repl.shape[0])), (0, 0)), mode="wrap")
-            mu_new = jnp.where(empty[:, None], repl[:K], mu_new)
-            var_new = jnp.where(empty[:, None], jnp.ones_like(var_new) * cfg.var_floor, var_new)
-            # keep pi_new as-is (already normalized)
+                    if pbar_inner is not None:
+                        pbar_inner.update(1)
+            finally:
+                if pbar_inner is not None:
+                    pbar_inner.close()
 
-        pi, mu, var = pi_new.astype(jnp.float32), mu_new.astype(jnp.float32), var_new.astype(jnp.float32)
+            # M-step
+            Nk = jnp.maximum(Nk_acc, cfg.reinit_min_Nk)
+            pi_new = Nk / jnp.sum(Nk)
+            # Avoid degenerate components
+            pi_new = jnp.maximum(pi_new, cfg.min_weight)
+            pi_new = pi_new / jnp.sum(pi_new)
 
-        loglik_mean = loglik_acc / max(n_seen, 1)
-        logs["loglik"].append(loglik_mean)
-        logs["min_Nk"].append(jnp.min(Nk_acc))
-        logs["max_Nk"].append(jnp.max(Nk_acc))
+            mu_new = sum_acc / Nk[:, None]
+            ex2 = sum2_acc / Nk[:, None]
+            var_new = jnp.maximum(ex2 - mu_new * mu_new, cfg.var_floor)
 
-        logs_iter = {
-            "loglik": loglik_mean,
-            "min_Nk": logs["min_Nk"][-1],
-            "max_Nk": logs["max_Nk"][-1],
-        }
-        if on_iter_end is not None:
-            on_iter_end(it, logs_iter)
+            # Re-init components that were effectively empty BEFORE clamping
+            empty = Nk_acc < cfg.reinit_min_Nk
+            if bool(jnp.any(empty)):
+                # Use init_points to re-seed means deterministically
+                repl = init_points
+                repl = jnp.pad(repl, ((0, max(0, K - repl.shape[0])), (0, 0)), mode="wrap")
+                mu_new = jnp.where(empty[:, None], repl[:K], mu_new)
+                var_new = jnp.where(empty[:, None], jnp.ones_like(var_new) * cfg.var_floor, var_new)
+                # keep pi_new as-is (already normalized)
 
-        # Early stop
-        if prev_loglik is not None:
-            improve = loglik_mean - prev_loglik
-            if float(improve) < cfg.tol:
-                bad_iters += 1
-            else:
-                bad_iters = 0
-            if bad_iters >= cfg.patience:
-                break
-        prev_loglik = loglik_mean
+            pi, mu, var = pi_new.astype(jnp.float32), mu_new.astype(jnp.float32), var_new.astype(jnp.float32)
+
+            loglik_mean = loglik_acc / max(n_seen, 1)
+            logs["loglik"].append(loglik_mean)
+            logs["min_Nk"].append(jnp.min(Nk_acc))
+            logs["max_Nk"].append(jnp.max(Nk_acc))
+
+            # Update outer progress bar with metrics
+            if pbar_outer is not None:
+                pbar_outer.set_postfix({
+                    'loglik': f'{float(loglik_mean):.4f}',
+                    'min_Nk': f'{float(logs["min_Nk"][-1]):.1f}',
+                    'max_Nk': f'{float(logs["max_Nk"][-1]):.1f}'
+                })
+                pbar_outer.update(1)
+
+            logs_iter = {
+                "loglik": loglik_mean,
+                "min_Nk": logs["min_Nk"][-1],
+                "max_Nk": logs["max_Nk"][-1],
+            }
+            if on_iter_end is not None:
+                on_iter_end(it, logs_iter)
+
+            # Early stop
+            if prev_loglik is not None:
+                improve = loglik_mean - prev_loglik
+                if float(improve) < cfg.tol:
+                    bad_iters += 1
+                else:
+                    bad_iters = 0
+                if bad_iters >= cfg.patience:
+                    break
+            prev_loglik = loglik_mean
+    finally:
+        if pbar_outer is not None:
+            pbar_outer.close()
 
     # Stack logs
     logs = {k: jnp.stack(v) if len(v) else jnp.array([]) for k, v in logs.items()}

@@ -23,6 +23,7 @@ from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.gmm_em import EMConfig, fit_gmm_em_streaming
 from utils.gmm_prior import load_prior_npz, save_prior_npz
+from utils.gmm_preprocessing import GMMPreprocessConfig, preprocess_gmm_prior
 from utils.datasets import get_dataset
 from model import DiT
 from helper_eval import eval_model
@@ -127,31 +128,6 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 
 
 def main(_):
-    def _get_num_examples(dataset_name: str, is_train: bool = True) -> int:
-        """Best-effort dataset size lookup for EM_subset."""
-        # Map common aliases used in this repo to TFDS builder names.
-        if 'imagenet' in dataset_name:
-            tfds_name = 'imagenet2012'
-            split = 'train' if is_train else 'validation'
-        elif 'celebahq256' in dataset_name:
-            tfds_name = 'celebahq256'
-            split = 'train'  # TFDS celebA-HQ typically uses only train split
-        else:
-            tfds_name = dataset_name
-            split = 'train' if is_train else 'validation'
-        try:
-            builder = tfds.builder(tfds_name)
-            splits = builder.info.splits
-            if split in splits:
-                return int(splits[split].num_examples)
-            # fallback: first available split
-            return int(next(iter(splits.values())).num_examples)
-        except Exception as e:
-            if jax.process_index() == 0:
-                print(
-                    f"[GMM-FM] WARNING: could not read TFDS num_examples for {tfds_name} ({e}). Using 100000 as fallback.")
-            return 100000
-
     np.random.seed(FLAGS.seed)
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
@@ -197,185 +173,24 @@ def main(_):
             raise ValueError(
                 "gmm-fm requires model.use_stable_vae=True (we fit GMM in StableVAE latent space).")
 
-        cache_path = str(FLAGS.model.get('gmm_cache_path', '') or '')
-        if cache_path == '':
-            base_dir = FLAGS.save_dir if FLAGS.save_dir is not None else os.getcwd()
-            cache_path = os.path.join(
-                base_dir, f"gmm_prior_{FLAGS.dataset_name}_K{int(FLAGS.model['gmm_K'])}.npz")
-        # store back to config for reproducibility
-        FLAGS.model.gmm_cache_path = cache_path
+        # Define encoding function that matches training behavior
+        def _encode_to_latent(batch_images, key):
+            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                batch_images = vae_encode(key, batch_images)
+            if 'latent' in FLAGS.dataset_name and batch_images.shape[-1] > 4:
+                batch_images = batch_images[..., batch_images.shape[-1] // 2:]
+            return batch_images
 
-        if (not bool(FLAGS.model.get('gmm_force_refit', False))) and os.path.exists(cache_path):
-            if jax.process_index() == 0:
-                print("[GMM-FM] Loading GMM prior from:", cache_path)
-            gmm_prior = load_prior_npz(cache_path)
-        else:
-            if jax.process_index() == 0:
-                print("[GMM-FM] Fitting GMM prior with EM...")
-                print("[GMM-FM] cache_path:", cache_path)
-
-            # Determine how many examples to use for EM.
-            em_subset = float(FLAGS.model.get('gmm_em_subset', 0.1))
-            em_subset = max(0.0, min(1.0, em_subset))
-            num_examples = int(_get_num_examples(
-                FLAGS.dataset_name, is_train=True))
-            target_examples = max(
-                int(num_examples * em_subset), int(FLAGS.model['gmm_K']) * 4)
-            num_batches = int(np.ceil(target_examples / local_batch_size))
-            if jax.process_index() == 0:
-                print(f"[GMM-FM] Train split examples: {num_examples}")
-                print(
-                    f"[GMM-FM] EM_subset={em_subset} => target_examples={target_examples} (~{num_batches} batches)")
-
-            # Fresh iterator for EM (so we don't disturb training RNG/iterator)
-            dataset_em = get_dataset(
-                FLAGS.dataset_name, local_batch_size, True, FLAGS.debug_overfit)
-
-            gmm_rng = jax.random.PRNGKey(int(FLAGS.seed) + 12345)
-
-            def _encode_to_latent(batch_images, key):
-                # Match training behavior: if dataset isn't already latent, encode with StableVAE.
-                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                    batch_images = vae_encode(key, batch_images)
-                # If latent dataset contains concatenated tensors, keep the "x1 half" convention.
-                if 'latent' in FLAGS.dataset_name and batch_images.shape[-1] > 4:
-                    batch_images = batch_images[...,
-                                                batch_images.shape[-1] // 2:]
-                return batch_images
-
-            # Build init points for mu initialization
-            init_buf = []
-            need = int(FLAGS.model['gmm_K'])
-            while need > 0:
-                batch_images, _ = next(dataset_em)
-                gmm_rng, k = jax.random.split(gmm_rng)
-                lat = _encode_to_latent(batch_images, k)
-                x = jnp.asarray(lat).reshape(
-                    (lat.shape[0], -1)).astype(jnp.float32)
-                take = min(int(x.shape[0]), need)
-                init_buf.append(x[:take])
-                need -= take
-            init_points = jnp.concatenate(init_buf, axis=0)
-
-            D = int(init_points.shape[1])
-
-            def batch_iterator():
-                nonlocal gmm_rng
-                while True:
-                    batch_images, _ = next(dataset_em)
-                    gmm_rng, k = jax.random.split(gmm_rng)
-                    lat = _encode_to_latent(batch_images, k)
-                    x = jnp.asarray(lat).reshape(
-                        (lat.shape[0], -1)).astype(jnp.float32)
-                    yield x
-
-            it = batch_iterator()
-
-            em_cfg = EMConfig(
-                K=int(FLAGS.model['gmm_K']),
-                max_iters=int(FLAGS.model.get('gmm_em_max_iters', 50)),
-                var_floor=float(FLAGS.model.get('gmm_var_floor', 1e-5)),
-                tol=float(FLAGS.model.get('gmm_em_tol', 1e-4)),
-                patience=int(FLAGS.model.get('gmm_em_patience', 3)),
-            )
-
-            def on_iter_end(iter_idx, logs):
-                if jax.process_index() == 0 and wandb.run is not None:
-                    wandb.log({
-                        "gmm_em/iter": int(iter_idx),
-                        "gmm_em/loglik": float(logs["loglik"]),
-                        "gmm_em/min_Nk": float(logs["min_Nk"]),
-                        "gmm_em/max_Nk": float(logs["max_Nk"]),
-                    })
-
-            gmm_prior, em_logs = fit_gmm_em_streaming(
-                it,
-                num_batches=num_batches,
-                D=D,
-                cfg=em_cfg,
-                rng=gmm_rng,
-                init_points=init_points,
-                on_iter_end=on_iter_end,
-            )
-
-            # Save + log artifacts only on process 0
-            if jax.process_index() == 0:
-                cache_dir = os.path.dirname(cache_path)
-                if cache_dir:
-                    os.makedirs(cache_dir, exist_ok=True)
-                save_prior_npz(cache_path, gmm_prior)
-                print("[GMM-FM] Saved GMM prior to:", cache_path)
-
-                if wandb.run is not None and bool(FLAGS.model.get("gmm_log_artifact", True)):
-                    try:
-                        art = wandb.Artifact(
-                            name=f"gmm_prior_{FLAGS.dataset_name}_K{int(FLAGS.model['gmm_K'])}", type="gmm_prior")
-                        art.add_file(cache_path)
-                        wandb.log_artifact(art)
-                    except Exception as e:
-                        print("[GMM-FM] W&B artifact logging failed:", e)
-
-                # PCA 2D visualization (debug/insight)
-                if wandb.run is not None:
-                    try:
-                        max_pts = int(FLAGS.model.get(
-                            "gmm_pca_max_points", 2000))
-                        max_pts = max(200, max_pts)
-                        # New iterator for PCA sampling
-                        dataset_pca = get_dataset(
-                            FLAGS.dataset_name, local_batch_size, True, FLAGS.debug_overfit)
-                        pts = []
-                        while sum([p.shape[0] for p in pts]) < max_pts:
-                            batch_images, _ = next(dataset_pca)
-                            gmm_rng, k = jax.random.split(gmm_rng)
-                            lat = _encode_to_latent(batch_images, k)
-                            x = np.array(jax.device_get(jnp.asarray(lat).reshape(
-                                (lat.shape[0], -1)).astype(jnp.float32)))
-                            pts.append(x)
-                        X = np.concatenate(pts, axis=0)[:max_pts]  # (N,D)
-                        mean = X.mean(axis=0, keepdims=True)
-                        Xc = X - mean
-
-                        # PCA via Gram matrix (N <= D is typical here)
-                        G = (Xc @ Xc.T) / max(Xc.shape[0] - 1, 1)  # (N,N)
-                        evals, evecs = np.linalg.eigh(G)
-                        idx2 = np.argsort(evals)[-2:]
-                        evals2 = evals[idx2]
-                        U2 = evecs[:, idx2]
-                        Z = U2 * np.sqrt(np.maximum(evals2, 1e-12))  # (N,2)
-
-                        # Component centers projected
-                        mu = np.array(jax.device_get(gmm_prior.mu))
-                        mu_c = mu - mean
-                        # components in feature space: V = Xc^T U / sqrt(evals)
-                        V2 = (Xc.T @ U2) / \
-                            np.sqrt(np.maximum(evals2, 1e-12))[None, :]
-                        centers_2d = mu_c @ V2  # (K,2)
-
-                        # Color points by hard assignment under the fitted GMM
-                        from utils.gmm_prior import posterior_logp
-                        log_r = np.array(jax.device_get(
-                            posterior_logp(gmm_prior, jnp.asarray(X))))
-                        mode = log_r.argmax(axis=-1)
-
-                        fig = plt.figure()
-                        ax = fig.add_subplot(111)
-                        sc = ax.scatter(Z[:, 0], Z[:, 1],
-                                        c=mode, s=6, alpha=0.6)
-                        ax.scatter(
-                            centers_2d[:, 0], centers_2d[:, 1], marker='x', s=80)
-                        ax.set_title("GMM-FM: PCA 2D of latents + centers")
-                        ax.set_xlabel("PC1")
-                        ax.set_ylabel("PC2")
-                        fig.tight_layout()
-
-                        tmp_path = os.path.join(os.path.dirname(cache_path) if os.path.dirname(
-                            cache_path) else ".", "gmm_pca2d.png")
-                        fig.savefig(tmp_path, dpi=150)
-                        plt.close(fig)
-                        wandb.log({"gmm_em/pca2d": wandb.Image(tmp_path)})
-                    except Exception as e:
-                        print("[GMM-FM] PCA viz failed:", e)
+        # Run preprocessing pipeline
+        cfg = GMMPreprocessConfig.from_flags(FLAGS)
+        gmm_prior = preprocess_gmm_prior(
+            cfg=cfg,
+            get_dataset_fn=get_dataset,
+            encode_fn=_encode_to_latent,
+            local_batch_size=local_batch_size,
+            debug_overfit=FLAGS.debug_overfit,
+            verbose=True
+        )
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats

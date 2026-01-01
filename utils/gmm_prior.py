@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Literal, Tuple
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -80,7 +81,7 @@ def posterior_logp(prior: GMMPrior, x: jnp.ndarray) -> jnp.ndarray:
     return log_joint - log_px
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=['temperature'])
 def responsibilities(prior: GMMPrior, x: jnp.ndarray, temperature: float = 1.0) -> jnp.ndarray:
     """
     r = softmax(log p(k|x) / T)
@@ -93,7 +94,7 @@ def responsibilities(prior: GMMPrior, x: jnp.ndarray, temperature: float = 1.0) 
     return jnp.exp(log_r)
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=['assign_mode', 'temperature'])
 def sample_x0_conditional(
     prior: GMMPrior,
     key: jax.Array,
@@ -140,7 +141,7 @@ def sample_x0_conditional(
     return x0, k
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=['B'])
 def sample_x0_uncond(prior: GMMPrior, key: jax.Array, B: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Unconditional x0 sampling: k ~ Cat(pi), x0 ~ N(mu_k, var_k)
@@ -170,3 +171,37 @@ def load_prior_npz(path: str) -> GMMPrior:
     mu = jnp.asarray(data["mu"])
     var = jnp.asarray(data["var"])
     return GMMPrior(pi=pi, mu=mu, var=var)
+
+
+# ============================================================================
+# PyTree Registration for GMMPrior
+# ============================================================================
+
+def _gmm_prior_flatten(prior: GMMPrior):
+    """
+    Flatten GMMPrior into (children, aux_data) for JAX PyTree.
+
+    children: tuple of arrays that should be traced/differentiated
+    aux_data: static metadata (in this case, None since we have no static fields)
+    """
+    children = (prior.pi, prior.mu, prior.var)
+    aux_data = None
+    return children, aux_data
+
+
+def _gmm_prior_unflatten(aux_data, children):
+    """
+    Reconstruct GMMPrior from (children, aux_data).
+
+    This is the inverse of _gmm_prior_flatten.
+    """
+    pi, mu, var = children
+    return GMMPrior(pi=pi, mu=mu, var=var)
+
+
+# Register GMMPrior as a JAX PyTree
+jax.tree_util.register_pytree_node(
+    GMMPrior,
+    _gmm_prior_flatten,
+    _gmm_prior_unflatten
+)
