@@ -78,6 +78,24 @@ model_config = ml_collections.ConfigDict({
     'kfm_schedule_type': 'linear',  # default
     'kfm_schedule': '',         # default unused for now
     'kfm_eps': 1e-5,            # keep same epsilon style as current codebase
+
+    # ===== GMM-Prior Flow Matching defaults =====
+    'gmm_K': 50,                        # Number of GMM components
+    'gmm_em_subset': 0.1,               # Fraction of train data for EM (0.1 = 10%)
+    'gmm_em_iters_max': 100,            # Maximum EM iterations
+    'gmm_em_early_stop': True,          # Enable early stopping
+    'gmm_em_patience': 5,               # Stop if no improvement for N iters
+    'gmm_em_tol': 1e-4,                 # Log-likelihood improvement threshold
+    'gmm_var_floor': 1e-6,              # Minimum variance (numerical stability)
+    'gmm_cache_path': 'gmm_cache/prior.npz',  # Cache file path
+    'gmm_assign_mode': 'soft_sample',   # Assignment mode: 'soft_sample', 'moment', 'hard'
+    'gmm_resp_temperature': 1.0,        # Softmax temperature for responsibilities
+    'gmm_log_wandb': True,              # Enable W&B logging for EM
+    'gmm_log_every_iter': 1,            # Log every N EM iterations
+    'gmm_pca_2d': True,                 # Enable PCA 2D visualization
+    'gmm_pca_max_points': 10000,        # Max points for PCA plot
+    'gmm_save_artifact': True,          # Save prior.npz as W&B artifact
+    'gmm_verbose': False,               # Verbose debug logging
 })
 
 
@@ -132,6 +150,128 @@ def main(_):
         vae_rng = jax.random.PRNGKey(42)
         vae_encode = jax.jit(vae.encode)
         vae_decode = jax.jit(vae.decode)
+
+    # ===== GMM-Prior Preprocessing (only for gmm-fm) =====
+    if FLAGS.model['train_type'] == 'gmm-fm':
+        import os
+        import matplotlib.pyplot as plt
+        from utils.gmm_prior import load_gmm_prior, save_gmm_prior, plot_gmm_pca_2d
+        from utils.gmm_em import fit_gmm_em
+
+        gmm_cache_path = FLAGS.model['gmm_cache_path']
+
+        if os.path.exists(gmm_cache_path):
+            # Load cached GMM prior
+            if jax.process_index() == 0:
+                prior = load_gmm_prior(gmm_cache_path, verbose=True)
+                print(f"[GMM-FM] ✓ Loaded cached GMM prior from {gmm_cache_path}")
+
+                if FLAGS.model['gmm_log_wandb']:
+                    wandb.log({
+                        'gmm/loaded_from_cache': 1,
+                        'gmm/K': prior.pi.shape[0],
+                        'gmm/D': prior.mu.shape[1],
+                        'gmm/pi_entropy': float(-np.sum(prior.pi * np.log(prior.pi + 1e-10))),
+                    }, step=0)
+
+        else:
+            # Fit GMM prior from scratch
+            if jax.process_index() == 0:
+                print(f"\n{'='*70}")
+                print(f"[GMM-FM] Fitting GMM Prior (K={FLAGS.model['gmm_K']})")
+                print(f"{'='*70}")
+
+                # Estimate number of samples
+                total_train_size = 1281167 if 'imagenet' in FLAGS.dataset_name else 50000
+                n_subset = int(FLAGS.model['gmm_em_subset'] * total_train_size)
+                n_batches = n_subset // local_batch_size
+
+                print(f"  Dataset: {FLAGS.dataset_name}")
+                print(f"  Subset: {FLAGS.model['gmm_em_subset']*100:.1f}% ({n_subset} samples)")
+                print(f"  Batches to collect: {n_batches}")
+                print(f"  EM max iters: {FLAGS.model['gmm_em_iters_max']}")
+                print(f"  Early stop: {FLAGS.model['gmm_em_early_stop']} (patience={FLAGS.model['gmm_em_patience']}, tol={FLAGS.model['gmm_em_tol']})")
+                print(f"{'='*70}\n")
+
+                # Collect latents for EM
+                latents_list = []
+                print("[GMM-FM] Collecting latents from training data...")
+
+                for i in tqdm.tqdm(range(n_batches), desc="Collecting latents"):
+                    batch_images, _ = next(dataset)
+
+                    # Encode to latent space
+                    if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                        batch_latents = vae_encode(vae_rng, batch_images)
+                    else:
+                        batch_latents = batch_images
+
+                    # Flatten [B, H, W, C] -> [B, D]
+                    batch_latents_flat = batch_latents.reshape(batch_latents.shape[0], -1)
+                    latents_list.append(jax.device_get(batch_latents_flat))
+
+                all_latents = np.concatenate(latents_list, axis=0)
+                print(f"[GMM-FM] ✓ Collected {all_latents.shape[0]} latents, shape: {all_latents.shape}\n")
+
+                # W&B logging callback
+                def log_em_callback(em_iter, metrics):
+                    if FLAGS.model['gmm_log_wandb'] and em_iter % FLAGS.model['gmm_log_every_iter'] == 0:
+                        log_dict = {f'gmm/{k}': v for k, v in metrics.items()}
+                        wandb.log(log_dict, step=em_iter)
+
+                # Fit GMM using EM
+                prior, logs = fit_gmm_em(
+                    x=all_latents,
+                    K=FLAGS.model['gmm_K'],
+                    iters_max=FLAGS.model['gmm_em_iters_max'],
+                    var_floor=FLAGS.model['gmm_var_floor'],
+                    early_stop=FLAGS.model['gmm_em_early_stop'],
+                    patience=FLAGS.model['gmm_em_patience'],
+                    tol=FLAGS.model['gmm_em_tol'],
+                    log_callback=log_em_callback if FLAGS.model['gmm_log_wandb'] else None,
+                    verbose=True
+                )
+
+                # Save cache
+                os.makedirs(os.path.dirname(gmm_cache_path) if os.path.dirname(gmm_cache_path) else '.', exist_ok=True)
+                save_gmm_prior(prior, gmm_cache_path, verbose=True)
+
+                # PCA 2D visualization
+                if FLAGS.model['gmm_pca_2d']:
+                    print("[GMM-FM] Creating PCA 2D visualization...")
+                    fig = plot_gmm_pca_2d(
+                        all_latents[:FLAGS.model['gmm_pca_max_points']],
+                        prior,
+                        max_points=FLAGS.model['gmm_pca_max_points']
+                    )
+
+                    if fig is not None and FLAGS.model['gmm_log_wandb']:
+                        wandb.log({'gmm/pca_2d': wandb.Image(fig)}, step=0)
+                        plt.close(fig)
+
+                # Save as W&B artifact
+                if FLAGS.model['gmm_save_artifact']:
+                    print("[GMM-FM] Saving GMM prior as W&B artifact...")
+                    artifact = wandb.Artifact('gmm_prior', type='model')
+                    artifact.add_file(gmm_cache_path)
+                    wandb.log_artifact(artifact)
+
+                # Final summary
+                print(f"\n{'='*70}")
+                print(f"[GMM-FM] ✓ GMM Preprocessing Complete")
+                print(f"  Final LogLik: {logs['final_loglik']:.4f}")
+                print(f"  EM iterations: {logs['em_iters']}")
+                print(f"  Empty components: {logs['final_metrics']['empty_components']}/{FLAGS.model['gmm_K']}")
+                print(f"{'='*70}\n")
+
+            # Synchronize across processes (wait for process 0 to finish)
+            if jax.process_count() > 1:
+                import time
+                print(f"[GMM-FM] Process {jax.process_index()} waiting for GMM cache...")
+                while not os.path.exists(gmm_cache_path):
+                    time.sleep(1)
+                print(f"[GMM-FM] Process {jax.process_index()} detected cache, loading...")
+                prior = load_gmm_prior(gmm_cache_path, verbose=False)
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats
@@ -275,6 +415,10 @@ def main(_):
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
         elif FLAGS.model['train_type'] == 'khoat-fm':
             from targets_khoat_fm import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(
+                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'gmm-fm':
+            from targets_gmm_fm import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
 

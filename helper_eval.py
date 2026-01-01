@@ -208,7 +208,29 @@ def eval_model(
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
-                x = jax.random.normal(eps_key, images_shape)
+
+                # Sample initial noise: GMM for gmm-fm, Gaussian for others
+                if FLAGS.model['train_type'] == 'gmm-fm':
+                    from utils.gmm_prior import load_gmm_prior, sample_gmm_unconditional
+                    import os
+
+                    gmm_cache_path = FLAGS.model.get('gmm_cache_path', 'gmm_cache/prior.npz')
+                    if not os.path.exists(gmm_cache_path):
+                        raise FileNotFoundError(
+                            f"[GMM-FM Eval] GMM cache not found at: {gmm_cache_path}"
+                        )
+
+                    prior = load_gmm_prior(gmm_cache_path, verbose=(fid_it == 0))
+                    x = sample_gmm_unconditional(
+                        prior,
+                        eps_key,
+                        batch_size=images_shape[0],
+                        shape=images_shape[1:],
+                        debug=(fid_it == 0)
+                    )
+                else:
+                    x = jax.random.normal(eps_key, images_shape)
+
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 x, labels = shard_data(x, labels)
                 x0_initial = x  # initial noise for ti==0 special-case
