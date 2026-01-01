@@ -24,6 +24,7 @@ def eval_model(
     visualize_labels,
     fid_from_stats,
     truth_fid_stats,
+    gmm_prior=None,
 ):
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()

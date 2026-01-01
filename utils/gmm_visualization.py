@@ -37,9 +37,10 @@ def compute_pca_2d(
     """
     mean = X.mean(axis=0, keepdims=True)
     Xc = X - mean
+    N = Xc.shape[0]
 
     # Gram matrix PCA (efficient when N << D)
-    G = (Xc @ Xc.T) / max(Xc.shape[0] - 1, 1)  # (N, N)
+    G = (Xc @ Xc.T) / max(N - 1, 1)  # (N, N)
     evals, evecs = np.linalg.eigh(G)
 
     # Select top 2 components
@@ -47,12 +48,16 @@ def compute_pca_2d(
     evals2 = evals[idx2]
     U2 = evecs[:, idx2]  # (N, 2)
 
-    # Project data
-    Z = U2 * np.sqrt(np.maximum(evals2, 1e-12))  # (N, 2)
+    # Scale factor to correct for normalized Gram matrix
+    scale = np.sqrt(max(N - 1, 1))
+
+    # Project data: Z = Xc @ V = U @ sqrt((N-1) * evals)
+    Z = U2 * np.sqrt(np.maximum(evals2, 1e-12)) * scale  # (N, 2)
 
     if return_components:
         # Compute basis vectors in feature space
-        V2 = (Xc.T @ U2) / np.sqrt(np.maximum(evals2, 1e-12))[None, :]  # (D, 2)
+        # V = Xc.T @ U / sqrt((N-1) * evals)
+        V2 = (Xc.T @ U2) / (np.sqrt(np.maximum(evals2, 1e-12))[None, :] * scale)  # (D, 2)
         return Z, mean, evals2, V2
     else:
         return Z, mean, evals2, None
