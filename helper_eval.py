@@ -178,7 +178,12 @@ def eval_model(
                 do_cfg = True
             all_x = []
             delta_t = 1.0 / denoise_timesteps
-            x = eps  # [local_batch, ...]
+            # Sample initial noise: GMM prior for gmm-fm, Gaussian for others
+            if FLAGS.model.train_type == 'gmm-fm' and gmm_prior is not None:
+                x_flat, _ = sample_x0_uncond(gmm_prior, key, eps.shape[0])
+                x = x_flat.reshape(eps.shape)
+            else:
+                x = eps  # [local_batch, ...]
             x = shard_data(x)  # [batch, ...] (on all devices)
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
