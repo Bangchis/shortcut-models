@@ -6,6 +6,7 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
+from utils.gmm_prior import sample_x0_uncond
 
 
 def eval_model(
