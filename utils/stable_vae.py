@@ -30,14 +30,22 @@ class StableVAE:
             module=module,
         )
 
-    @partial(jax.jit, static_argnames="scale")
+    @partial(jax.jit, static_argnames=("scale", "epsilon_scale"))
     def encode(
-        self, key: Key[Array, ""], images: Float[Array, "b h w 3"], scale: bool = True
+        self, key: Key[Array, ""], images: Float[Array, "b h w 3"], scale: bool = True, epsilon_scale: float = 1.0
     ) -> Float[Array, "b lh lw 4"]:
         images = rearrange(images, "b h w c -> b c h w")
-        latents = self.module.apply(
+        latent_dist = self.module.apply(
             {"params": self.params}, images, method=self.module.encode
-        ).latent_dist.sample(key)
+        ).latent_dist
+
+        # Apply epsilon scaling
+        if epsilon_scale == 0.0:
+            latents = latent_dist.mean  # Deterministic mode
+        else:
+            eps = jax.random.normal(key, latent_dist.mean.shape)
+            latents = latent_dist.mean + epsilon_scale * latent_dist.std * eps
+
         if scale:
             latents *= self.module.config.scaling_factor
         return latents

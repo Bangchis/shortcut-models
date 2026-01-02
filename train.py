@@ -109,6 +109,8 @@ model_config = ml_collections.ConfigDict({
     # PCA debug plot
     'gmm_pca_max_points': 2000,
     'gmm_log_artifact': True,
+    # VAE encoding epsilon scale: 1.0 = normal stochastic, 0.0 = deterministic
+    'vae_epsilon_scale': 1.0,
 
 })
 
@@ -154,14 +156,20 @@ def main(_):
 
     if FLAGS.model.use_stable_vae:
         vae = StableVAE.create()
+        epsilon_scale = float(FLAGS.model.get('vae_epsilon_scale', 1.0))
+
         if 'latent' in FLAGS.dataset_name:
             example_obs = example_obs[:, :, :, example_obs.shape[-1] // 2:]
             example_obs_shape = example_obs.shape
         else:
-            example_obs = vae.encode(jax.random.PRNGKey(0), example_obs)
+            example_obs = vae.encode(jax.random.PRNGKey(0), example_obs, epsilon_scale=epsilon_scale)
         example_obs_shape = example_obs.shape
         vae_rng = jax.random.PRNGKey(42)
-        vae_encode = jax.jit(vae.encode)
+
+        # Create wrapper with epsilon_scale baked in for consistency
+        def vae_encode(key, images):
+            return vae.encode(key, images, epsilon_scale=epsilon_scale)
+        vae_encode = jax.jit(vae_encode)
         vae_decode = jax.jit(vae.decode)
 
     # ------------------------------------------------------------
