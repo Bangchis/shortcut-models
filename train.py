@@ -162,7 +162,8 @@ def main(_):
             example_obs = example_obs[:, :, :, example_obs.shape[-1] // 2:]
             example_obs_shape = example_obs.shape
         else:
-            example_obs = vae.encode(jax.random.PRNGKey(0), example_obs, epsilon_scale=epsilon_scale)
+            example_obs = vae.encode(jax.random.PRNGKey(
+                0), example_obs, epsilon_scale=epsilon_scale)
         example_obs_shape = example_obs.shape
         vae_rng = jax.random.PRNGKey(42)
 
