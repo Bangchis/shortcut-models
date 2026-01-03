@@ -114,7 +114,7 @@ model_config = ml_collections.ConfigDict({
     # Normalized residual loss (for GMM-FM to handle varying v magnitudes)
     'loss_vnorm': False,  # Enable normalized residual loss
     'loss_vnorm_eps': 1e-4,  # Epsilon for numerical stability
-    'loss_vnorm_smin': 0.3,  # Minimum scale clamp (max weight ~11.1)
+    'loss_vnorm_smin': 0.3,  # Minimum scale clamp
 
 })
 
@@ -181,10 +181,10 @@ def main(_):
     # (GMM-FM) Preprocess: fit/load a diagonal GMM prior in latent space.
     # ------------------------------------------------------------
     gmm_prior = None
-    if FLAGS.model['train_type'] == 'gmm-fm':
+    if FLAGS.model['train_type'] in ['gmm-fm', 'gmm-shortcut']:
         if not FLAGS.model.use_stable_vae:
             raise ValueError(
-                "gmm-fm requires model.use_stable_vae=True (we fit GMM in StableVAE latent space).")
+                f"{FLAGS.model['train_type']} requires model.use_stable_vae=True (we fit GMM in StableVAE latent space).")
 
         # Define encoding function that matches training behavior
         def _encode_to_latent(batch_images, key):
@@ -355,6 +355,11 @@ def main(_):
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt, gmm_prior=gmm_prior)
 
+        elif FLAGS.model['train_type'] == 'gmm-shortcut':
+            from targets_gmm_shortcut import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(
+                FLAGS, targets_key, train_state, images, labels, force_t, force_dt, gmm_prior=gmm_prior)
+
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
                                                                    'dropout': dropout_key}, params=grad_params, return_activations=True)
@@ -367,7 +372,8 @@ def main(_):
                 from utils.losses import normalized_residual_mse
                 vnorm_eps = float(FLAGS.model.get("loss_vnorm_eps", 1e-4))
                 vnorm_smin = float(FLAGS.model.get("loss_vnorm_smin", 0.3))
-                loss, vnorm_info = normalized_residual_mse(v_prime, v_t, eps=vnorm_eps, s_min=vnorm_smin)
+                loss, vnorm_info = normalized_residual_mse(
+                    v_prime, v_t, eps=vnorm_eps, s_min=vnorm_smin)
                 # Still compute mse_v for potential shortcut/livereflow metrics
                 mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
             else:
