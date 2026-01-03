@@ -111,6 +111,10 @@ model_config = ml_collections.ConfigDict({
     'gmm_log_artifact': True,
     # VAE encoding epsilon scale: 1.0 = normal stochastic, 0.0 = deterministic
     'vae_epsilon_scale': 1.0,
+    # Normalized residual loss (for GMM-FM to handle varying v magnitudes)
+    'loss_vnorm': False,  # Enable normalized residual loss
+    'loss_vnorm_eps': 1e-4,  # Epsilon for numerical stability
+    'loss_vnorm_smin': 0.3,  # Minimum scale clamp (max weight ~11.1)
 
 })
 
@@ -354,13 +358,29 @@ def main(_):
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
                                                                    'dropout': dropout_key}, params=grad_params, return_activations=True)
-            mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
-            loss = jnp.mean(mse_v)
+
+            # Compute loss (conditional on FLAGS)
+            use_vnorm = bool(FLAGS.model.get("loss_vnorm", False))
+
+            if use_vnorm:
+                # Normalized residual loss
+                from utils.losses import normalized_residual_mse
+                vnorm_eps = float(FLAGS.model.get("loss_vnorm_eps", 1e-4))
+                vnorm_smin = float(FLAGS.model.get("loss_vnorm_smin", 0.3))
+                loss, vnorm_info = normalized_residual_mse(v_prime, v_t, eps=vnorm_eps, s_min=vnorm_smin)
+                # Still compute mse_v for potential shortcut/livereflow metrics
+                mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+            else:
+                # Standard MSE loss
+                mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+                loss = jnp.mean(mse_v)
+                vnorm_info = {}
 
             info = {
                 'loss': loss,
                 'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                 **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
+                **vnorm_info,  # Add vnorm metrics if available
             }
 
             if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
