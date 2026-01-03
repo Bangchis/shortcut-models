@@ -205,3 +205,25 @@ jax.tree_util.register_pytree_node(
     _gmm_prior_flatten,
     _gmm_prior_unflatten
 )
+
+
+# ============================================================================
+# Hard Assignment (for gmm-fm-paper clustering)
+# ============================================================================
+
+@jax.jit
+def hard_assignment(prior: GMMPrior, x: jnp.ndarray) -> jnp.ndarray:
+    """
+    Hard cluster assignment: k = argmax p(k|x)
+
+    Used by gmm-fm-paper for creating cluster cache.
+
+    Args:
+        prior: GMMPrior object
+        x: (B, D) data points
+
+    Returns:
+        cluster_id: (B,) int32 - assigned cluster for each point
+    """
+    log_r = posterior_logp(prior, x)  # (B, K)
+    return jnp.argmax(log_r, axis=-1).astype(jnp.int32)

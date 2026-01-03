@@ -112,6 +112,11 @@ model_config = ml_collections.ConfigDict({
     # VAE encoding epsilon scale: 1.0 = normal stochastic, 0.0 = deterministic
     'vae_epsilon_scale': 1.0,
 
+    # ===== GMM-FM Paper (latent caching) =====
+    'gmm_paper_cache_dir': '',  # Cache directory (default: save_dir/caches/)
+    'gmm_paper_force_recache': False,  # Force recreate caches
+    'gmm_paper_cache_dtype': 'float16',  # Storage dtype for latents
+
 })
 
 
@@ -200,6 +205,49 @@ def main(_):
             debug_overfit=FLAGS.debug_overfit,
             verbose=True
         )
+
+    # ------------------------------------------------------------
+    # (GMM-FM Paper) Preprocess: latent cache + cluster cache
+    # ------------------------------------------------------------
+    cache_dataset_iter = None
+    if FLAGS.model['train_type'] == 'gmm-fm-paper':
+        if not FLAGS.model.use_stable_vae:
+            raise ValueError(
+                "gmm-fm-paper requires model.use_stable_vae=True (we cache latents in StableVAE space).")
+
+        from utils.gmm_fm_paper_preprocessing import run_gmm_fm_paper_preprocessing
+        from utils.latent_cache import load_latent_cache
+        from utils.cluster_cache import load_cluster_cache
+        from utils.cache_dataset import CacheDatasetIterator
+
+        # Run preprocessing (creates or loads caches)
+        latent_cache_path, prior_path, cluster_cache_path = run_gmm_fm_paper_preprocessing(
+            FLAGS=FLAGS,
+            get_dataset_fn=get_dataset,
+            encode_fn=vae_encode,
+            local_batch_size=local_batch_size,
+            verbose=True
+        )
+
+        # Load GMM prior
+        gmm_prior = load_prior_npz(prior_path)
+
+        # Load caches
+        latent_cache = load_latent_cache(latent_cache_path, mode='r')
+        cluster_cache = load_cluster_cache(cluster_cache_path)
+
+        # Create cache dataset iterator
+        cache_dataset_iter = CacheDatasetIterator(
+            latent_cache=latent_cache,
+            cluster_cache=cluster_cache,
+            batch_size=local_batch_size,
+            rng_seed=FLAGS.seed + jax.process_index(),
+        )
+        cache_dataset_iter = iter(cache_dataset_iter)
+
+        print(f"[GMM-FM Paper] Cache dataset initialized")
+        print(f"  Latent cache: {latent_cache.shape}")
+        print(f"  Cluster cache: K={cluster_cache.K}, N={cluster_cache.N}")
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats
@@ -386,6 +434,59 @@ def main(_):
         train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
         return train_state, info
 
+    # Separate update function for gmm-fm-paper (different input signature)
+    @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
+    def update_gmm_paper(train_state, images_latent, k_vec, force_t=-1, force_dt=-1):
+        """Update function for gmm-fm-paper mode (uses cached latents + cluster IDs)."""
+        new_rng, targets_key, dropout_key = jax.random.split(train_state.rng, 3)
+        info = {}
+
+        images_latent = jax.lax.with_sharding_constraint(images_latent, data_sharding)
+        k_vec = jax.lax.with_sharding_constraint(k_vec, data_sharding)
+
+        # Get targets (no VAE encoding, no posterior computation!)
+        from targets_gmm_fm_paper import get_targets
+        x_t, v_t, t, dt_base, labels, target_info = get_targets(
+            FLAGS, targets_key, train_state, images_latent, k_vec, gmm_prior, force_t, force_dt)
+
+        info.update(target_info)
+
+        def loss_fn(grad_params):
+            v_prime, logvars, activations = train_state.call_model(
+                x_t, t, dt_base, labels, train=True,
+                rngs={'dropout': dropout_key},
+                params=grad_params,
+                return_activations=True
+            )
+            mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+            loss = jnp.mean(mse_v)
+
+            info = {
+                'loss': loss,
+                'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
+            }
+            return loss, info
+
+        grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
+        info = {**info, **new_info}
+
+        updates, new_opt_state = train_state.tx.update(
+            grads, train_state.opt_state, train_state.params)
+        new_params = optax.apply_updates(train_state.params, updates)
+
+        info['grad_norm'] = optax.global_norm(grads)
+        info['update_norm'] = optax.global_norm(updates)
+        info['param_norm'] = optax.global_norm(new_params)
+        info['lr'] = lr_schedule(train_state.step)
+
+        train_state = train_state.replace(
+            rng=new_rng, step=train_state.step + 1,
+            params=new_params, opt_state=new_opt_state)
+        train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
+
+        return train_state, info
+
     if FLAGS.mode != 'train':
         do_inference(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
                      get_fid_activations, imagenet_labels, visualize_labels,
@@ -401,15 +502,27 @@ def main(_):
                        dynamic_ncols=True):
 
         # Sample data.
-        if not FLAGS.debug_overfit or i == 1:
-            batch_images, batch_labels = shard_data(*next(dataset))
-            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                vae_rng, vae_key = jax.random.split(vae_rng)
-                batch_images = vae_encode(vae_key, batch_images)
+        if FLAGS.model['train_type'] == 'gmm-fm-paper':
+            # Sample from cache (no VAE encoding needed!)
+            if not FLAGS.debug_overfit or i == 1:
+                batch_latents, batch_k_vec = next(cache_dataset_iter)
+                batch_latents = shard_data(batch_latents)
+                batch_k_vec = shard_data(batch_k_vec)
 
-        # Train update.
-        train_state, update_info = update(
-            train_state, train_state_teacher, batch_images, batch_labels)
+            # Train update (gmm-fm-paper)
+            train_state, update_info = update_gmm_paper(
+                train_state, batch_latents, batch_k_vec)
+        else:
+            # Standard path (existing modes)
+            if not FLAGS.debug_overfit or i == 1:
+                batch_images, batch_labels = shard_data(*next(dataset))
+                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                    vae_rng, vae_key = jax.random.split(vae_rng)
+                    batch_images = vae_encode(vae_key, batch_images)
+
+            # Train update.
+            train_state, update_info = update(
+                train_state, train_state_teacher, batch_images, batch_labels)
 
         if i % FLAGS.log_interval == 0 or i == 1:
             update_info = jax.device_get(update_info)
@@ -418,15 +531,17 @@ def main(_):
             train_metrics = {f'training/{k}': v for k,
                              v in update_info.items()}
 
-            valid_images, valid_labels = shard_data(*next(dataset_valid))
-            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                valid_images = vae_encode(vae_rng, valid_images)
-            _, valid_update_info = update(
-                train_state, train_state_teacher, valid_images, valid_labels)
-            valid_update_info = jax.device_get(valid_update_info)
-            valid_update_info = jax.tree_map(
-                lambda x: x.mean(), valid_update_info)
-            train_metrics['training/loss_valid'] = valid_update_info['loss']
+            # Validation (skip for gmm-fm-paper as we don't have validation cache)
+            if FLAGS.model['train_type'] != 'gmm-fm-paper':
+                valid_images, valid_labels = shard_data(*next(dataset_valid))
+                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                    valid_images = vae_encode(vae_rng, valid_images)
+                _, valid_update_info = update(
+                    train_state, train_state_teacher, valid_images, valid_labels)
+                valid_update_info = jax.device_get(valid_update_info)
+                valid_update_info = jax.tree_map(
+                    lambda x: x.mean(), valid_update_info)
+                train_metrics['training/loss_valid'] = valid_update_info['loss']
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
