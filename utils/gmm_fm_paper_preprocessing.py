@@ -8,6 +8,7 @@ Coordinates the complete pipeline:
 4. Validation and logging
 """
 
+import os
 from pathlib import Path
 from typing import Callable, Tuple
 import jax
@@ -64,13 +65,11 @@ def run_gmm_fm_paper_preprocessing(
         print("GMM-FM Paper Preprocessing Pipeline")
         print("="*80)
 
-    # 1. Determine cache directory
-    cache_dir = FLAGS.model.get('gmm_paper_cache_dir', '')
-    if not cache_dir:
-        # Default to save_dir/caches/
-        cache_dir = str(Path(FLAGS.save_dir) / 'caches')
-
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    # 1. Determine cache directory (align with LatentCacheConfig pattern)
+    base_dir = FLAGS.save_dir if FLAGS.save_dir else os.getcwd()
+    cache_dir = Path(base_dir) / 'caches'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = str(cache_dir)
 
     if verbose and jax.process_index() == 0:
         print(f"Cache directory: {cache_dir}")
@@ -147,13 +146,6 @@ def run_gmm_fm_paper_preprocessing(
 
         # For GMM fitting, we can use latent cache directly
         latent_cache = load_latent_cache(latent_cache_path, mode='r')
-
-        # Create iterator from cache
-        def cache_encode_fn(batch_images, key):
-            # batch_images is actually batch indices for cached latents
-            # This is a workaround to reuse preprocess_gmm_prior
-            # TODO: refactor to directly use latent cache
-            return batch_images
 
         # Use existing GMM preprocessing (will load from cache)
         # For now, re-encode subset (not ideal but works)

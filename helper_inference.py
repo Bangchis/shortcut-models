@@ -67,7 +67,7 @@ def do_inference(
 
         if FLAGS.mode == 'interpolate':
             seed = 5
-            if FLAGS.model.train_type == 'gmm-fm' and gmm_prior is not None:
+            if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
                 eps0_flat, _ = sample_x0_uncond(
                     gmm_prior, jax.random.PRNGKey(seed), 1)
                 eps1_flat, _ = sample_x0_uncond(
@@ -114,7 +114,7 @@ def do_inference(
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
-            if FLAGS.model.train_type == 'gmm-fm' and gmm_prior is not None:
+            if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
                 x_flat, _ = sample_x0_uncond(
                     gmm_prior, eps_key, images_shape[0])
                 x = x_flat.reshape(images_shape)

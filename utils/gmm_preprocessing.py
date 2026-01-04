@@ -70,6 +70,22 @@ class GMMPreprocessConfig:
             seed=FLAGS.seed,
         )
 
+    def get_prior_path(self) -> str:
+        """
+        Get path to GMM prior cache file.
+
+        Returns:
+            Absolute path to prior .npz file
+        """
+        if self.cache_path:
+            return self.cache_path
+
+        base_dir = self.save_dir if self.save_dir is not None else os.getcwd()
+        return os.path.join(
+            base_dir,
+            f"gmm_prior_{self.dataset_name}_K{self.K}.npz"
+        )
+
 
 def get_dataset_size(dataset_name: str, is_train: bool = True) -> int:
     """
