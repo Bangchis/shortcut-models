@@ -178,8 +178,8 @@ def eval_model(
                 do_cfg = True
             all_x = []
             delta_t = 1.0 / denoise_timesteps
-            # Sample initial noise: GMM prior for gmm-fm, Gaussian for others
-            if FLAGS.model.train_type == 'gmm-fm' and gmm_prior is not None:
+            # Sample initial noise: GMM prior for gmm-fm/gmm-shortcut, Gaussian for others
+            if FLAGS.model.train_type in ['gmm-fm', 'gmm-shortcut'] and gmm_prior is not None:
                 x_flat, _ = sample_x0_uncond(gmm_prior, key, eps.shape[0])
                 x = x_flat.reshape(eps.shape)
             else:
@@ -241,7 +241,7 @@ def eval_model(
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
-                if FLAGS.model.train_type == 'gmm-fm' and gmm_prior is not None:
+                if FLAGS.model.train_type in ['gmm-fm', 'gmm-shortcut'] and gmm_prior is not None:
                     x_flat, _ = sample_x0_uncond(
                         gmm_prior, eps_key, images_shape[0])
                     x = x_flat.reshape(images_shape)
