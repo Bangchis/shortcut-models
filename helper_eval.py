@@ -64,52 +64,54 @@ def eval_model(
             output = call_fn(images, t, dt, labels, train=False)
             return output
 
-        print("Training Loss per T.")
-        if FLAGS.model.denoise_timesteps == 128:
-            fig, axs = plt.subplots(5, 8, figsize=(15, 12))
-            d_list = [0, 1, 2, 3, 4, 5, 6, 7]
-        else:
-            fig, axs = plt.subplots(3, 6, figsize=(15, 8))
-            d_list = [0, 1, 2, 3, 4, 5]
-        for d in d_list:
-            infos = None
-
-            # For KFM: sweep aligned t values on the grid of size 2^d
-            if FLAGS.model['train_type'] == 'khoat-fm':
-                grid_n = 2 ** int(d)
-                if grid_n <= 32:
-                    t_values = (np.arange(0, grid_n) / grid_n).tolist()
-                else:
-                    idx = np.linspace(0, grid_n - 1, 32, dtype=np.int32)
-                    t_values = (idx / grid_n).tolist()
+        # Skip "Training Loss per T" for gmm-fm-paper (requires cache, not standard dataset)
+        if FLAGS.model.train_type != 'gmm-fm-paper':
+            print("Training Loss per T.")
+            if FLAGS.model.denoise_timesteps == 128:
+                fig, axs = plt.subplots(5, 8, figsize=(15, 12))
+                d_list = [0, 1, 2, 3, 4, 5, 6, 7]
             else:
-                t_values = (np.arange(0, 32) / 32).tolist()
+                fig, axs = plt.subplots(3, 6, figsize=(15, 8))
+                d_list = [0, 1, 2, 3, 4, 5]
+            for d in d_list:
+                infos = None
 
-            for t in t_values:
-                batch_images_n, batch_labels_n = next(dataset)
-                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                    batch_images_n = vae_encode(key, batch_images_n)
-                batch_images_sharded, batch_labels_sharded = shard_data(
-                    batch_images_n, batch_labels_n)
-                _, info = update(train_state, train_state_teacher, batch_images_sharded,
-                                 batch_labels_sharded, force_t=float(t), force_dt=int(d))
-                info = jax.experimental.multihost_utils.process_allgather(info)
-                if infos is None:
-                    infos = jax.tree_map(lambda x: [x], info)
+                # For KFM: sweep aligned t values on the grid of size 2^d
+                if FLAGS.model['train_type'] == 'khoat-fm':
+                    grid_n = 2 ** int(d)
+                    if grid_n <= 32:
+                        t_values = (np.arange(0, grid_n) / grid_n).tolist()
+                    else:
+                        idx = np.linspace(0, grid_n - 1, 32, dtype=np.int32)
+                        t_values = (idx / grid_n).tolist()
                 else:
-                    infos = jax.tree_map(lambda x, y: y + [x], info, infos)
-            time_axis = np.array(t_values)
-            axs[0, d].plot(time_axis, infos['loss'])
-            axs[0, d].set_title(f"All {d}")
-            if FLAGS.model['train_type'] == 'shortcut':
-                axs[1, d].plot(time_axis, infos['loss_flow'])
-                axs[1, d].set_title(f"Flow {d}")
-                axs[2, d].plot(time_axis, infos['loss_bootstrap'])
-                axs[2, d].set_title(f"Bootstrap {d}")
+                    t_values = (np.arange(0, 32) / 32).tolist()
 
-            if jax.process_index() == 0:
-                fig.tight_layout()
-                wandb.log({f'mse': wandb.Image(fig)}, step=step)
+                for t in t_values:
+                    batch_images_n, batch_labels_n = next(dataset)
+                    if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                        batch_images_n = vae_encode(key, batch_images_n)
+                    batch_images_sharded, batch_labels_sharded = shard_data(
+                        batch_images_n, batch_labels_n)
+                    _, info = update(train_state, train_state_teacher, batch_images_sharded,
+                                     batch_labels_sharded, force_t=float(t), force_dt=int(d))
+                    info = jax.experimental.multihost_utils.process_allgather(info)
+                    if infos is None:
+                        infos = jax.tree_map(lambda x: [x], info)
+                    else:
+                        infos = jax.tree_map(lambda x, y: y + [x], info, infos)
+                time_axis = np.array(t_values)
+                axs[0, d].plot(time_axis, infos['loss'])
+                axs[0, d].set_title(f"All {d}")
+                if FLAGS.model['train_type'] == 'shortcut':
+                    axs[1, d].plot(time_axis, infos['loss_flow'])
+                    axs[1, d].set_title(f"Flow {d}")
+                    axs[2, d].plot(time_axis, infos['loss_bootstrap'])
+                    axs[2, d].set_title(f"Bootstrap {d}")
+
+                if jax.process_index() == 0:
+                    fig.tight_layout()
+                    wandb.log({f'mse': wandb.Image(fig)}, step=step)
 
         print("One-step Denoising at various t.")
         if 'latent' in FLAGS.dataset_name:
