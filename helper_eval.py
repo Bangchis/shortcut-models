@@ -236,7 +236,7 @@ def eval_model(
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
             images_shape = batch_images.shape
-            num_generations = 1024  # to match with paper's config
+            num_generations = 50000  # to match with paper's config
             print(
                 f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
             for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
