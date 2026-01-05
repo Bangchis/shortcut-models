@@ -95,7 +95,8 @@ def eval_model(
                         batch_images_n, batch_labels_n)
                     _, info = update(train_state, train_state_teacher, batch_images_sharded,
                                      batch_labels_sharded, force_t=float(t), force_dt=int(d))
-                    info = jax.experimental.multihost_utils.process_allgather(info)
+                    info = jax.experimental.multihost_utils.process_allgather(
+                        info)
                     if infos is None:
                         infos = jax.tree_map(lambda x: [x], info)
                     else:
@@ -235,7 +236,7 @@ def eval_model(
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
             images_shape = batch_images.shape
-            num_generations = 50048  # to match with paper's config
+            num_generations = 1024  # to match with paper's config
             print(
                 f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
             for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):

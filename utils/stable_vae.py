@@ -51,6 +51,42 @@ class StableVAE:
         return latents
 
     @partial(jax.jit, static_argnames="scale")
+    def encode_posterior(
+        self, images: Float[Array, "b h w 3"], scale: bool = True
+    ) -> tuple[Float[Array, "b lh lw 4"], Float[Array, "b lh lw 4"]]:
+        """
+        Get VAE posterior parameters (μ, logσ²) without sampling.
+
+        This is used for caching posterior parameters to enable stochastic
+        sampling during training without running VAE encoder each iteration.
+
+        Args:
+            images: Input images (b, h, w, 3)
+            scale: Whether to apply VAE scaling_factor
+
+        Returns:
+            mu: Mean of posterior (b, lh, lw, 4)
+            logvar: Log variance of posterior (b, lh, lw, 4)
+        """
+        images = rearrange(images, "b h w c -> b c h w")
+        latent_dist = self.module.apply(
+            {"params": self.params}, images, method=self.module.encode
+        ).latent_dist
+
+        mu = latent_dist.mean
+        std = latent_dist.std
+        logvar = 2.0 * jax.numpy.log(std)  # logvar = log(σ²) = 2*log(σ)
+
+        if scale:
+            # Scale mean
+            mu *= self.module.config.scaling_factor
+            # Scale variance: var' = var * scale²
+            # logvar' = log(var * scale²) = logvar + 2*log(scale)
+            logvar += 2.0 * jax.numpy.log(self.module.config.scaling_factor)
+
+        return mu, logvar
+
+    @partial(jax.jit, static_argnames="scale")
     def decode(
         self, latents: Float[Array, "b lh lw 4"], scale: bool = True
     ) -> Float[Array, "b h w 3"]:

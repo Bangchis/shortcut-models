@@ -172,10 +172,18 @@ def main(_):
         example_obs_shape = example_obs.shape
         vae_rng = jax.random.PRNGKey(42)
 
-        # Create wrapper with epsilon_scale baked in for consistency
+        # Create wrapper for VAE encoding
+        # For posterior caching (gmm-fm-paper), use encode_posterior() to get (μ, logσ²)
+        # For legacy modes, use encode() with epsilon_scale baked in
         def vae_encode(key, images):
             return vae.encode(key, images, epsilon_scale=epsilon_scale)
+
+        def vae_encode_posterior(key, images):
+            # Note: key is ignored since encode_posterior is deterministic
+            return vae.encode_posterior(images, scale=True)
+
         vae_encode = jax.jit(vae_encode)
+        vae_encode_posterior = jax.jit(vae_encode_posterior)
         vae_decode = jax.jit(vae.decode)
 
     # ------------------------------------------------------------
@@ -221,10 +229,11 @@ def main(_):
         from utils.cache_dataset import CacheDatasetIterator
 
         # Run preprocessing (creates or loads caches)
+        # Use vae_encode_posterior to cache (μ, logσ²) for stochastic sampling
         latent_cache_path, prior_path, cluster_cache_path = run_gmm_fm_paper_preprocessing(
             FLAGS=FLAGS,
             get_dataset_fn=get_dataset,
-            encode_fn=vae_encode,
+            encode_fn=vae_encode_posterior,  # Returns (mu, logvar) tuple
             local_batch_size=local_batch_size,
             verbose=True
         )
@@ -236,17 +245,26 @@ def main(_):
         latent_cache = load_latent_cache(latent_cache_path, mode='r')
         cluster_cache = load_cluster_cache(cluster_cache_path)
 
-        # Create cache dataset iterator
+        # Get vae_epsilon_scale (used as τ stochasticity parameter)
+        vae_epsilon_scale = float(FLAGS.model.get('vae_epsilon_scale', 1.0))
+
+        # Create cache dataset iterator with stochastic sampling
         cache_dataset_iter = CacheDatasetIterator(
             latent_cache=latent_cache,
             cluster_cache=cluster_cache,
             batch_size=local_batch_size,
             rng_seed=FLAGS.seed + jax.process_index(),
+            vae_epsilon_scale=vae_epsilon_scale,  # Stochasticity parameter τ
         )
         cache_dataset_iter = iter(cache_dataset_iter)
 
+        is_posterior = isinstance(latent_cache, tuple)
         print(f"[GMM-FM Paper] Cache dataset initialized")
-        print(f"  Latent cache: {latent_cache.shape}")
+        if is_posterior:
+            print(f"  Latent cache: Posterior mode (μ, logσ²) with shape {latent_cache[0].shape}")
+            print(f"  VAE epsilon scale (τ): {vae_epsilon_scale} ({'deterministic' if vae_epsilon_scale == 0.0 else 'stochastic'})")
+        else:
+            print(f"  Latent cache: Legacy mode with shape {latent_cache.shape}")
         print(f"  Cluster cache: K={cluster_cache.K}, N={cluster_cache.N}")
 
     if FLAGS.fid_stats is not None:

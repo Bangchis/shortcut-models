@@ -7,7 +7,7 @@ CSR (Compressed Sparse Row) structure for efficient sampling.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Union
 import json
 
 import jax
@@ -60,7 +60,7 @@ class ClusterCacheConfig:
 
 
 def create_cluster_cache(
-    latent_cache: np.memmap,
+    latent_cache: Union[np.memmap, Tuple[np.memmap, np.memmap]],
     gmm_prior: GMMPrior,
     cfg: ClusterCacheConfig,
     batch_size: int = 1024,
@@ -76,7 +76,8 @@ def create_cluster_cache(
     4. Save clusters.npz
 
     Args:
-        latent_cache: Memory-mapped latents array (N, H, W, C)
+        latent_cache: Memory-mapped latents array (N, H, W, C) OR
+                     (mu_mmap, logvar_mmap) tuple for posterior mode
         gmm_prior: Fitted GMM prior
         cfg: ClusterCacheConfig
         batch_size: Batch size for processing
@@ -88,16 +89,28 @@ def create_cluster_cache(
     save_path = cfg.save_path
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # Handle both single memmap and tuple input
+    if isinstance(latent_cache, tuple):
+        # Posterior mode: use μ only for deterministic clustering
+        mu_cache, logvar_cache = latent_cache
+        latents_for_clustering = mu_cache
+        is_posterior = True
+    else:
+        # Legacy mode: use fixed latents
+        latents_for_clustering = latent_cache
+        is_posterior = False
+
     # Multi-host: only process 0 creates cache
     if jax.process_index() == 0:
         if verbose:
             print(f"[Cluster Cache] Creating cluster cache at: {save_path}")
+            print(f"[Cluster Cache] Mode: {'Posterior (using μ only)' if is_posterior else 'Legacy (fixed latents)'}")
             print(f"[Cluster Cache] GMM prior: K={gmm_prior.K} components")
-            print(f"[Cluster Cache] Dataset size: N={latent_cache.shape[0]}")
+            print(f"[Cluster Cache] Dataset size: N={latents_for_clustering.shape[0]}")
 
-        N = latent_cache.shape[0]
+        N = latents_for_clustering.shape[0]
         K = gmm_prior.K
-        D = np.prod(latent_cache.shape[1:])  # Flatten dimension
+        D = np.prod(latents_for_clustering.shape[1:])  # Flatten dimension
 
         # Allocate cluster_id array
         cluster_id = np.zeros(N, dtype=np.int32)
@@ -120,8 +133,8 @@ def create_cluster_cache(
                 end_idx = min(start_idx + batch_size, N)
                 B = end_idx - start_idx
 
-                # Load batch and flatten
-                latents_batch = latent_cache[start_idx:end_idx]  # (B, H, W, C)
+                # Load batch and flatten (use latents_for_clustering)
+                latents_batch = latents_for_clustering[start_idx:end_idx]  # (B, H, W, C)
                 latents_flat = latents_batch.reshape(B, -1).astype(np.float32)
                 latents_flat = jnp.asarray(latents_flat)
 

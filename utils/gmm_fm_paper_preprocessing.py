@@ -42,21 +42,21 @@ def run_gmm_fm_paper_preprocessing(
     Steps:
     1. Determine cache paths
     2. Check if caches exist (unless force_recache)
-    3. Create latent cache (or load existing)
-    4. Fit GMM prior (or load existing)
-    5. Create cluster cache (or load existing)
+    3. Create latent cache (or load existing) - uses encode_posterior() for (μ, logσ²)
+    4. Fit GMM prior (or load existing) - uses μ only
+    5. Create cluster cache (or load existing) - uses μ only
     6. Validate caches
     7. Log to W&B
 
     Args:
         FLAGS: Configuration flags
         get_dataset_fn: Function to get dataset iterator
-        encode_fn: VAE encoding function
+        encode_fn: VAE encoding function (should return (mu, logvar) in posterior mode)
         local_batch_size: Batch size
         verbose: Show progress
 
     Returns:
-        latent_cache_path: Path to latents.npy
+        latent_cache_path: Path to latents.npy (mu file in posterior mode)
         prior_path: Path to prior.npz
         cluster_cache_path: Path to clusters.npz
     """
@@ -77,13 +77,14 @@ def run_gmm_fm_paper_preprocessing(
     # 2. Get epsilon scale from FLAGS
     vae_epsilon_scale = float(FLAGS.model.get('vae_epsilon_scale', 1.0))
 
-    # 3. Latent cache configuration
+    # 3. Latent cache configuration (use posterior mode by default)
     latent_cfg = LatentCacheConfig(
         cache_dir=cache_dir,
         dataset_name=FLAGS.dataset_name,
         vae_epsilon_scale=vae_epsilon_scale,
         dtype=FLAGS.model.get('gmm_paper_cache_dtype', 'float16'),
-        overwrite=FLAGS.model.get('gmm_paper_force_recache', False)
+        overwrite=FLAGS.model.get('gmm_paper_force_recache', False),
+        cache_posterior=True  # Cache (μ, logσ²) for stochastic sampling
     )
 
     latent_cache_path = latent_cfg.get_cache_path()
@@ -133,7 +134,8 @@ def run_gmm_fm_paper_preprocessing(
     cache_info = get_cache_info(latent_cache_path)
     if verbose and jax.process_index() == 0:
         print(f"  Latent cache shape: {cache_info['shape']}")
-        print(f"  VAE epsilon scale: {cache_info['vae_epsilon_scale']}")
+        print(f"  Cache mode: {'Posterior (μ, logσ²)' if cache_info.get('cache_posterior', False) else 'Legacy (fixed latents)'}")
+        print(f"  VAE epsilon scale (τ): {cache_info['vae_epsilon_scale']}")
 
     # 5. GMM prior configuration
     gmm_cfg = GMMPreprocessConfig.from_flags(FLAGS)
