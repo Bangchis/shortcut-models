@@ -114,7 +114,12 @@ def run_gmm_fm_paper_preprocessing(
         example_images, _ = next(dataset)
         dataset = get_dataset_fn(FLAGS.dataset_name, local_batch_size, is_train=True, debug_overfit=FLAGS.debug_overfit)  # Reset
         example_latent = encode_fn(jax.random.PRNGKey(0), example_images[:1])
-        example_latent_shape = example_latent.shape[1:]  # (H, W, C)
+
+        # Handle tuple return from encode_posterior (mu, logvar)
+        if isinstance(example_latent, tuple):
+            example_latent_shape = example_latent[0].shape[1:]  # Use mu shape
+        else:
+            example_latent_shape = example_latent.shape[1:]  # (H, W, C)
 
         # Create cache
         latent_cache_path = create_latent_cache(
@@ -155,7 +160,9 @@ def run_gmm_fm_paper_preprocessing(
 
         def encode_to_latent(batch_images, key):
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                batch_images = encode_fn(key, batch_images)
+                result = encode_fn(key, batch_images)
+                # If posterior mode, use μ only for GMM fitting (deterministic)
+                batch_images = result[0] if isinstance(result, tuple) else result
             if 'latent' in FLAGS.dataset_name and batch_images.shape[-1] > 4:
                 batch_images = batch_images[..., batch_images.shape[-1] // 2:]
             return batch_images
