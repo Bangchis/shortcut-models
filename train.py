@@ -60,7 +60,7 @@ model_config = ml_collections.ConfigDict({
     'num_heads': 2,  # change this!
     'mlp_ratio': 1,  # change this!
     'class_dropout_prob': 0.1,
-    'num_classes': 1000,
+    'num_classes': 1000,  # For GMM-FM-Paper: set to K (GMM clusters) for cluster-conditional generation
     'denoise_timesteps': 128,
     'cfg_scale': 4.0,
     'target_update_rate': 0.999,
@@ -266,6 +266,18 @@ def main(_):
         else:
             print(f"  Latent cache: Legacy mode with shape {latent_cache.shape}")
         print(f"  Cluster cache: K={cluster_cache.K}, N={cluster_cache.N}")
+
+        # Validate that num_classes matches GMM K (for cluster-conditional generation)
+        gmm_K = gmm_prior.K
+        num_classes = FLAGS.model['num_classes']
+        if num_classes != gmm_K:
+            raise ValueError(
+                f"For cluster-conditional GMM-FM-Paper, num_classes must equal GMM K.\n"
+                f"Expected: num_classes = {gmm_K}\n"
+                f"Got: num_classes = {num_classes}\n"
+                f"Please set FLAGS.model['num_classes'] = {gmm_K} in your config."
+            )
+        print(f"  Validation passed: num_classes ({num_classes}) == K ({gmm_K})")
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats

@@ -68,9 +68,9 @@ def do_inference(
         if FLAGS.mode == 'interpolate':
             seed = 5
             if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
-                eps0_flat, _ = sample_x0_uncond(
+                eps0_flat, k0 = sample_x0_uncond(
                     gmm_prior, jax.random.PRNGKey(seed), 1)
-                eps1_flat, _ = sample_x0_uncond(
+                eps1_flat, k1 = sample_x0_uncond(
                     gmm_prior, jax.random.PRNGKey(seed+1), 1)
                 eps0 = eps0_flat.reshape(batch_images[0].shape)
                 eps1 = eps1_flat.reshape(batch_images[0].shape)
@@ -115,13 +115,20 @@ def do_inference(
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
             if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
-                x_flat, _ = sample_x0_uncond(
+                x_flat, k_sampled = sample_x0_uncond(
                     gmm_prior, eps_key, images_shape[0])
                 x = x_flat.reshape(images_shape)
+                # For cluster-conditional gmm-fm-paper: use sampled cluster IDs as labels
+                if FLAGS.model.train_type == 'gmm-fm-paper':
+                    labels = k_sampled  # (B,) int32, aligned with x0's cluster
+                else:
+                    # For gmm-fm (old): sample labels independently
+                    labels = jax.random.randint(
+                        label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             else:
                 x = jax.random.normal(eps_key, images_shape)
-            labels = jax.random.randint(
-                label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+                labels = jax.random.randint(
+                    label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)
             x0_initial = x  # initial noise for ti==0 special-case
             x0.append(

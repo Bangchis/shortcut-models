@@ -183,10 +183,16 @@ def eval_model(
             delta_t = 1.0 / denoise_timesteps
             # Sample initial noise: GMM prior for gmm-fm/gmm-fm-paper, Gaussian for others
             if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
-                x_flat, _ = sample_x0_uncond(gmm_prior, key, eps.shape[0])
+                x_flat, k_sampled = sample_x0_uncond(gmm_prior, key, eps.shape[0])
                 x = x_flat.reshape(eps.shape)
+                # For cluster-conditional gmm-fm-paper: use sampled cluster IDs as labels
+                if FLAGS.model.train_type == 'gmm-fm-paper':
+                    visualize_labels_to_use = k_sampled  # Align with x0's cluster
+                else:
+                    visualize_labels_to_use = visualize_labels
             else:
                 x = eps  # [local_batch, ...]
+                visualize_labels_to_use = visualize_labels
             x = shard_data(x)  # [batch, ...] (on all devices)
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
@@ -198,10 +204,10 @@ def eval_model(
                 t_vector, dt_base = shard_data(t_vector, dt_base)
                 if not do_cfg:
                     v = call_model(train_state, x, t_vector, dt_base,
-                                   visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond)
+                                   visualize_labels_to_use if FLAGS.model.cfg_scale != 0 else labels_uncond)
                 else:
                     v_cond = call_model(
-                        train_state, x, t_vector, dt_base, visualize_labels)
+                        train_state, x, t_vector, dt_base, visualize_labels_to_use)
                     v_uncond = call_model(
                         train_state, x, t_vector, dt_base, labels_uncond)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
@@ -245,13 +251,20 @@ def eval_model(
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
                 if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
-                    x_flat, _ = sample_x0_uncond(
+                    x_flat, k_sampled = sample_x0_uncond(
                         gmm_prior, eps_key, images_shape[0])
                     x = x_flat.reshape(images_shape)
+                    # For cluster-conditional gmm-fm-paper: use sampled cluster IDs as labels
+                    if FLAGS.model.train_type == 'gmm-fm-paper':
+                        labels = k_sampled  # (B,) int32, aligned with x0's cluster
+                    else:
+                        # For gmm-fm (old): sample labels independently
+                        labels = jax.random.randint(
+                            label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 else:
                     x = jax.random.normal(eps_key, images_shape)
-                labels = jax.random.randint(
-                    label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+                    labels = jax.random.randint(
+                        label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 x, labels = shard_data(x, labels)
                 x0_initial = x  # initial noise for ti==0 special-case
                 delta_t = 1.0 / denoise_timesteps
