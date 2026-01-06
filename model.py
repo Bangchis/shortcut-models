@@ -99,11 +99,29 @@ class LabelEmbedder(nn.Module):
 
     @nn.compact
     def __call__(self, labels):
-        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size, 
+        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size,
                                    embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
         embeddings = embedding_table(labels)
         return embeddings
-    
+
+
+class ClusterEmbedder(nn.Module):
+    """
+    Embeds cluster IDs into vector representations for cluster-conditional generation.
+    Used in GMM-FM-Paper to condition on latent space clusters.
+    """
+    num_clusters: int
+    hidden_size: int
+    tc: TrainConfig
+
+    @nn.compact
+    def __call__(self, clusters):
+        embedding_table = nn.Embed(self.num_clusters, self.hidden_size,
+                                   embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
+        embeddings = embedding_table(clusters)
+        return embeddings
+
+
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     patch_size: int
@@ -229,12 +247,13 @@ class DiT(nn.Module):
     out_channels: int
     class_dropout_prob: float
     num_classes: int
+    num_clusters: int = 0  # Number of GMM clusters for cluster conditioning (0 = disabled)
     ignore_dt: bool = False
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x, t, dt, y, train=False, return_activations=False):
+    def __call__(self, x, t, dt, y, k=None, train=False, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         print("DiT: Input of shape", x.shape, "dtype", x.dtype)
         activations = {}
@@ -261,12 +280,21 @@ class DiT(nn.Module):
         te = TimestepEmbedder(self.hidden_size, tc=tc)(t) # (B, hidden_size)
         dte = TimestepEmbedder(self.hidden_size, tc=tc)(dt) # (B, hidden_size)
         ye = LabelEmbedder(self.num_classes, self.hidden_size, tc=tc)(y) # (B, hidden_size)
-        c = te + ye + dte
-        
+
+        # Cluster conditioning (for GMM-FM-Paper)
+        if self.num_clusters > 0 and k is not None:
+            ke = ClusterEmbedder(self.num_clusters, self.hidden_size, tc=tc)(k)  # (B, hidden_size)
+        else:
+            ke = jnp.zeros((batch_size, self.hidden_size), dtype=self.dtype)
+
+        # Additive combination of all conditioning signals
+        c = te + ye + dte + ke
+
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = te
         activations['dt_embed'] = dte
         activations['label_embed'] = ye
+        activations['cluster_embed'] = ke
         activations['conditioning'] = c
 
         print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)

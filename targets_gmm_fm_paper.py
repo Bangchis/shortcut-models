@@ -37,7 +37,7 @@ def get_targets(FLAGS, key, train_state, images_latent, k_vec, gmm_prior, force_
         v_t: (B, H, W, C) - target velocity
         t: (B,) - timesteps
         dt_base: (B,) - dt values
-        labels: (B,) - labels (cluster IDs for cluster-conditional generation)
+        labels: (B,) - unconditional labels (cluster IDs passed separately via k_vec)
         info: dict - logging info
     """
     time_key, noise_key = jax.random.split(key, 2)
@@ -82,8 +82,8 @@ def get_targets(FLAGS, key, train_state, images_latent, k_vec, gmm_prior, force_
         dt_base
     )
 
-    # Use cluster IDs as conditioning labels (cluster-conditional, no CFG)
-    labels = k_vec  # (B,) int32, values [0, K-1]
+    # Return unconditional labels (cluster IDs passed separately as k parameter to model)
+    labels = jnp.ones(B, dtype=jnp.int32) * FLAGS.model['num_classes']  # Unconditional token
 
     # Logging: cluster assignment stats
     K = int(gmm_prior.pi.shape[0])

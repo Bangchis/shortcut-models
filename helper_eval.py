@@ -55,13 +55,13 @@ def eval_model(
             img = np.array(img)
             return img
 
-        @partial(jax.jit, static_argnums=(5,))
-        def call_model(train_state, images, t, dt, labels, use_ema=True):
+        @partial(jax.jit, static_argnums=(6,))
+        def call_model(train_state, images, t, dt, labels, k=None, use_ema=True):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_model_ema
             else:
                 call_fn = train_state.call_model
-            output = call_fn(images, t, dt, labels, train=False)
+            output = call_fn(images, t, dt, labels, k=k, train=False)
             return output
 
         # Skip "Training Loss per T" for gmm-fm-paper (requires cache, not standard dataset)
@@ -185,14 +185,10 @@ def eval_model(
             if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
                 x_flat, k_sampled = sample_x0_uncond(gmm_prior, key, eps.shape[0])
                 x = x_flat.reshape(eps.shape)
-                # For cluster-conditional gmm-fm-paper: use sampled cluster IDs as labels
-                if FLAGS.model.train_type == 'gmm-fm-paper':
-                    visualize_labels_to_use = k_sampled  # Align with x0's cluster
-                else:
-                    visualize_labels_to_use = visualize_labels
+                k_sampled = shard_data(k_sampled)
             else:
                 x = eps  # [local_batch, ...]
-                visualize_labels_to_use = visualize_labels
+                k_sampled = None
             x = shard_data(x)  # [batch, ...] (on all devices)
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
@@ -202,14 +198,19 @@ def eval_model(
                 if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                     dt_base = jnp.zeros_like(t_vector)
                 t_vector, dt_base = shard_data(t_vector, dt_base)
+
+                # Determine k for cluster conditioning (gmm-fm-paper uses k_sampled, others None)
+                k_for_model = k_sampled if FLAGS.model.train_type == 'gmm-fm-paper' and gmm_prior is not None else None
+
                 if not do_cfg:
                     v = call_model(train_state, x, t_vector, dt_base,
-                                   visualize_labels_to_use if FLAGS.model.cfg_scale != 0 else labels_uncond)
+                                   visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond,
+                                   k=k_for_model)
                 else:
                     v_cond = call_model(
-                        train_state, x, t_vector, dt_base, visualize_labels_to_use)
+                        train_state, x, t_vector, dt_base, visualize_labels, k=k_for_model)
                     v_uncond = call_model(
-                        train_state, x, t_vector, dt_base, labels_uncond)
+                        train_state, x, t_vector, dt_base, labels_uncond, k=k_for_model)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
@@ -254,18 +255,18 @@ def eval_model(
                     x_flat, k_sampled = sample_x0_uncond(
                         gmm_prior, eps_key, images_shape[0])
                     x = x_flat.reshape(images_shape)
-                    # For cluster-conditional gmm-fm-paper: use sampled cluster IDs as labels
-                    if FLAGS.model.train_type == 'gmm-fm-paper':
-                        labels = k_sampled  # (B,) int32, aligned with x0's cluster
-                    else:
-                        # For gmm-fm (old): sample labels independently
-                        labels = jax.random.randint(
-                            label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+                    # Sample class labels (independent of cluster for gmm-fm-paper)
+                    labels = jax.random.randint(
+                        label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 else:
                     x = jax.random.normal(eps_key, images_shape)
                     labels = jax.random.randint(
                         label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+                    k_sampled = None
+
                 x, labels = shard_data(x, labels)
+                if FLAGS.model.train_type in ('gmm-fm', 'gmm-fm-paper') and gmm_prior is not None:
+                    k_sampled = shard_data(k_sampled)
                 x0_initial = x  # initial noise for ti==0 special-case
                 delta_t = 1.0 / denoise_timesteps
                 for ti in range(denoise_timesteps):
@@ -277,17 +278,21 @@ def eval_model(
                     if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                         dt_base = jnp.zeros_like(t_vector)
                     t_vector, dt_base = shard_data(t_vector, dt_base)
+
+                    # Determine k for cluster conditioning (gmm-fm-paper uses k_sampled, others None)
+                    k_for_model = k_sampled if FLAGS.model.train_type == 'gmm-fm-paper' and gmm_prior is not None else None
+
                     if cfg_scale == 1:
                         v = call_model(train_state, x, t_vector,
-                                       dt_base, labels)
+                                       dt_base, labels, k=k_for_model)
                     elif cfg_scale == 0:
                         v = call_model(train_state, x, t_vector,
-                                       dt_base, labels_uncond)
+                                       dt_base, labels_uncond, k=k_for_model)
                     else:
                         v_pred_uncond = call_model(
-                            train_state, x, t_vector, dt_base, labels_uncond)
+                            train_state, x, t_vector, dt_base, labels_uncond, k=k_for_model)
                         v_pred_label = call_model(
-                            train_state, x, t_vector, dt_base, labels)
+                            train_state, x, t_vector, dt_base, labels, k=k_for_model)
                         v = v_pred_uncond + cfg_scale * \
                             (v_pred_label - v_pred_uncond)
 

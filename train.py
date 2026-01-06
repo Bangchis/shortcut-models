@@ -60,7 +60,8 @@ model_config = ml_collections.ConfigDict({
     'num_heads': 2,  # change this!
     'mlp_ratio': 1,  # change this!
     'class_dropout_prob': 0.1,
-    'num_classes': 1000,  # For GMM-FM-Paper: set to K (GMM clusters) for cluster-conditional generation
+    'num_classes': 1000,  # Number of class labels (0 for unconditional)
+    'num_clusters': 0,    # Number of GMM clusters for cluster conditioning (0 = disabled, auto-set for gmm-fm-paper)
     'denoise_timesteps': 128,
     'cfg_scale': 4.0,
     'target_update_rate': 0.999,
@@ -267,17 +268,21 @@ def main(_):
             print(f"  Latent cache: Legacy mode with shape {latent_cache.shape}")
         print(f"  Cluster cache: K={cluster_cache.K}, N={cluster_cache.N}")
 
-        # Validate that num_classes matches GMM K (for cluster-conditional generation)
+        # Auto-configure cluster conditioning for GMM-FM-Paper
         gmm_K = gmm_prior.K
-        num_classes = FLAGS.model['num_classes']
-        if num_classes != gmm_K:
-            raise ValueError(
-                f"For cluster-conditional GMM-FM-Paper, num_classes must equal GMM K.\n"
-                f"Expected: num_classes = {gmm_K}\n"
-                f"Got: num_classes = {num_classes}\n"
-                f"Please set FLAGS.model['num_classes'] = {gmm_K} in your config."
-            )
-        print(f"  Validation passed: num_classes ({num_classes}) == K ({gmm_K})")
+        if FLAGS.model.get('num_clusters', 0) == 0:
+            # Auto-enable cluster conditioning with K clusters
+            FLAGS.model['num_clusters'] = gmm_K
+            print(f"  Auto-configured: num_clusters = {gmm_K}")
+        else:
+            # Validate manual configuration
+            if FLAGS.model['num_clusters'] != gmm_K:
+                raise ValueError(
+                    f"num_clusters must match GMM K.\n"
+                    f"Expected: num_clusters = {gmm_K}\n"
+                    f"Got: num_clusters = {FLAGS.model['num_clusters']}"
+                )
+            print(f"  Using configured: num_clusters = {gmm_K}")
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats
@@ -483,7 +488,7 @@ def main(_):
 
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(
-                x_t, t, dt_base, labels, train=True,
+                x_t, t, dt_base, labels, k=k_vec, train=True,
                 rngs={'dropout': dropout_key},
                 params=grad_params,
                 return_activations=True
