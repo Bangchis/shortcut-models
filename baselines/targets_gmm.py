@@ -10,24 +10,7 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
     1. Hard Assignment using Log-Likelihood (Mahalanobis Distance).
     2. Importance Sampling Weights Calculation.
     3. Handle latent dataset mode (pre-computed x_0).
-
-    Args:
-        FLAGS: Config flags
-        key: JAX random key
-        train_state: Training state
-        images: Input images [B, H, W, C]
-        labels: Class labels [B]
-        gmm_stats: Dict with keys 'means', 'covs', 'weights', 'empirical_probs'
-        force_t: Override t value (-1 = random)
-        force_dt: Override dt value (-1 = use default)
-
-    Returns:
-        x_t: Interpolated samples [B, H, W, C]
-        v_t: Velocity targets [B, H, W, C]
-        t: Time values [B]
-        dt_base: dt values [B]
-        labels_dropped: Labels with dropout [B]
-        info: Dict with 'loss_weights', 'max_is_weight', 'dropped_ratio'
+    4. JIT-safe (no python control flow on tracers).
     """
     label_key, time_key, noise_key = jax.random.split(key, 3)
     info = {}
@@ -44,7 +27,6 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         info['loss_weights'] = jnp.ones(B)
         info['max_is_weight'] = 1.0
 
-    # === GMM PRIOR MODE ===
     # === GMM PRIOR MODE ===
     else:
         x_1 = images
@@ -125,10 +107,9 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
     t = jax.random.randint(time_key, (B,), minval=0, maxval=FLAGS.model['denoise_timesteps']).astype(jnp.float32)
     t /= FLAGS.model['denoise_timesteps']
 
-    # Override t if force_t is specified
-    if force_t != -1:
-        force_t_vec = jnp.ones(B, dtype=jnp.float32) * force_t
-        t = jnp.where(force_t_vec != -1, force_t_vec, t)
+    # Override t if force_t is specified (using jnp.where for JIT compat)
+    force_t_vec = jnp.ones(B, dtype=jnp.float32) * force_t
+    t = jnp.where(force_t_vec != -1, force_t_vec, t)
 
     t_full = t[:, None, None, None]
 
