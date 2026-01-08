@@ -45,17 +45,24 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         info['max_is_weight'] = 1.0
 
     # === GMM PRIOR MODE ===
+    # === GMM PRIOR MODE ===
     else:
         x_1 = images
 
         # === 1. HARD ASSIGNMENT (Log-Likelihood) ===
         # Flatten images: [B, D]
+        # Robustly calculate D - the dimension of the flattened image
         x_flat = x_1.reshape(B, -1)
+        D = x_flat.shape[1] 
 
         # Flatten GMM params: [K, D]
-        means = gmm_stats['means'].reshape(gmm_stats['means'].shape[0], -1)
-        covs = gmm_stats['covs'].reshape(gmm_stats['covs'].shape[0], -1)
-        weights = gmm_stats['weights']
+        # Robustly reshape to (-1, D) to handle any prefix dimensions (like 1 from replication)
+        means = gmm_stats['means'].reshape(-1, D)
+        covs = gmm_stats['covs'].reshape(-1, D)
+        weights = gmm_stats['weights'].flatten() # [K]
+        
+        # Recalculate K from the flattened weights
+        K = weights.shape[0]
 
         # Tính Log-Likelihood Score:
         # Score_k = log(pi_k) - 0.5 * sum(log(sigma_k^2)) - 0.5 * sum((x - mu_k)^2 / sigma_k^2)
@@ -81,14 +88,15 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
 
         # === 2. IMPORTANCE SAMPLING WEIGHTS ===
         # Lấy Pi (Model Belief)
-        model_pi = jnp.take(gmm_stats['weights'], cluster_ids)
+        model_pi = jnp.take(weights, cluster_ids)
 
         # Lấy P_emp (Data Reality) từ stats
-        emp_prob = jnp.take(gmm_stats['empirical_probs'], cluster_ids)
+        emp_prob = gmm_stats['empirical_probs'].flatten()
+        emp_prob_selected = jnp.take(emp_prob, cluster_ids)
 
         # Tính Weight: w = Pi / P_emp
         # Nếu GMM gán trọng số cao (Pi) cho vùng ít dữ liệu (P_emp thấp) -> Weight lớn
-        raw_weights = model_pi / (emp_prob + 1e-8)
+        raw_weights = model_pi / (emp_prob_selected + 1e-8)
 
         # Normalize weights trong batch để giữ cho Loss scale ổn định (Mean ~ 1)
         # Điều này cực kỳ quan trọng để không làm Learning Rate bị sai lệch
@@ -100,14 +108,17 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         info['max_is_weight'] = jnp.max(loss_weights)
 
         # === 3. SAMPLE SOURCE FROM GMM ===
-        # Lấy params của cụm được chọn
-        batch_means = jnp.take(gmm_stats['means'], cluster_ids, axis=0)  # [B, H, W, C]
-        batch_vars = jnp.take(gmm_stats['covs'], cluster_ids, axis=0)   # [B, H, W, C]
-        batch_stds = jnp.sqrt(batch_vars)
+        # Lấy params của cụm được chọn (đã reshape flat [K, D])
+        batch_means_flat = jnp.take(means, cluster_ids, axis=0)  # [B, D]
+        batch_vars_flat = jnp.take(covs, cluster_ids, axis=0)   # [B, D]
+        batch_stds_flat = jnp.sqrt(batch_vars_flat)
 
         # Sample x0 ~ N(mu_k, sigma_k)
-        eps = jax.random.normal(noise_key, images.shape)
-        x_0 = batch_means + batch_stds * eps
+        eps_flat = jax.random.normal(noise_key, x_flat.shape)
+        x_0_flat = batch_means_flat + batch_stds_flat * eps_flat
+
+        # Reshape x0 về không gian ảnh [B, H, W, C] để flow matching
+        x_0 = x_0_flat.reshape(images.shape)
 
     # === 4. STANDARD FLOW MATCHING INTERPOLATION ===
     # Sample t

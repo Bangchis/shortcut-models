@@ -237,7 +237,7 @@ def main(_):
         print("[GMM] Initializing GMM Manager...")
         gmm_stats_cpu = get_or_fit_gmm(FLAGS)
         print("[GMM] Replicating to devices...")
-        gmm_stats_replicated = jax.tree_map(
+        gmm_stats_replicated = jax.tree_util.tree_map(
             lambda x: jax.device_put_replicated(x, jax.local_devices()),
             gmm_stats_cpu
         )
@@ -300,9 +300,12 @@ def main(_):
         elif FLAGS.model['train_type'] == 'gmm-prior':
             from baselines.targets_gmm import get_targets
             # Lấy local stats (phần tử [0] vì đã replicate)
-            stats_local = gmm_stats
+            # stats_local = jax.tree_map(lambda x: x[0], gmm_stats) if gmm_stats else None
+            
+            # Sửa: Truyền thẳng gmm_stats, không cần x[0] nữa
+            # Code targets_gmm.py mới đã tự handle việc có hay không dimension đầu
             x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, stats_local, force_t, force_dt)
+                FLAGS, targets_key, train_state, images, labels, gmm_stats, force_t, force_dt)
 
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
