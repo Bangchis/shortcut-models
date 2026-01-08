@@ -32,6 +32,15 @@ def do_inference(
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
+
+        # Load GMM stats if using GMM-prior
+        gmm_means, gmm_covs, gmm_weights = None, None, None
+        if FLAGS.model['train_type'] == 'gmm-prior':
+            loaded = np.load(FLAGS.gmm_path)
+            gmm_means = jnp.array(loaded['means'])
+            gmm_covs = jnp.array(loaded['covs'])
+            gmm_weights = jnp.array(loaded['weights'])
+
         batch_images, batch_labels = next(dataset)
         valid_images, valid_labels = next(dataset_valid)
         if FLAGS.model.use_stable_vae:
@@ -93,7 +102,16 @@ def do_inference(
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
-            x = jax.random.normal(eps_key, images_shape)
+
+            # Sample initial noise (with GMM support)
+            if FLAGS.model['train_type'] == 'gmm-prior':
+                cluster_ids = jax.random.categorical(eps_key, jnp.log(gmm_weights), shape=(images_shape[0],))
+                batch_means = jnp.take(gmm_means, cluster_ids, axis=0)
+                batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))
+                x = batch_means + batch_stds * jax.random.normal(eps_key, images_shape)
+            else:
+                x = jax.random.normal(eps_key, images_shape)
+
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)
             x0_initial = x  # initial noise for ti==0 special-case

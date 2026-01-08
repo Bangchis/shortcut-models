@@ -38,6 +38,10 @@ flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
+# GMM Flags
+flags.DEFINE_string('gmm_path', 'gmm_stats.npz', 'Path to GMM stats file.')
+flags.DEFINE_integer('gmm_fit_samples', 30000, 'Number of samples for GMM fitting.')
+flags.DEFINE_bool('use_importance_sampling', True, 'Use IS weights in GMM loss.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -66,7 +70,10 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 4,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
-    'train_type': 'shortcut',  # or naive, khoat-fm.
+    'train_type': 'shortcut',  # or naive, khoat-fm, gmm-prior.
+
+    # ===== GMM-Prior Flow Matching defaults =====
+    'gmm_components': 20,  # Number of GMM clusters
 
     # ===== Khoat Flow Matching defaults =====
     'kfm_p_min': 0.20,          # P_min = 75%
@@ -223,6 +230,19 @@ def main(_):
     else:
         train_state_teacher = None
 
+    # ================= GMM AUTO-INIT =================
+    gmm_stats_replicated = None
+    if FLAGS.model['train_type'] == 'gmm-prior':
+        from utils.gmm_manager import get_or_fit_gmm
+        print("[GMM] Initializing GMM Manager...")
+        gmm_stats_cpu = get_or_fit_gmm(FLAGS)
+        print("[GMM] Replicating to devices...")
+        gmm_stats_replicated = jax.tree_map(
+            lambda x: jax.device_put_replicated(x, jax.local_devices()),
+            gmm_stats_cpu
+        )
+    # =================================================
+
     visualize_labels = example_labels
     visualize_labels = shard_data(visualize_labels)
     visualize_labels = jax.experimental.multihost_utils.process_allgather(
@@ -234,7 +254,7 @@ def main(_):
     ###################################
 
     @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
-    def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1):
+    def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1, gmm_stats=None):
         new_rng, targets_key, dropout_key, perm_key = jax.random.split(
             train_state.rng, 4)
         info = {}
@@ -277,14 +297,26 @@ def main(_):
             from targets_khoat_fm import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'gmm-prior':
+            from baselines.targets_gmm import get_targets
+            # Lấy local stats (phần tử [0] vì đã replicate)
+            stats_local = jax.tree_map(lambda x: x[0], gmm_stats) if gmm_stats else None
+            x_t, v_t, t, dt_base, labels, info = get_targets(
+                FLAGS, targets_key, train_state, images, labels, stats_local, force_t, force_dt)
 
         def loss_fn(grad_params):
             v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
                                                                    'dropout': dropout_key}, params=grad_params, return_activations=True)
             mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
-            loss = jnp.mean(mse_v)
 
-            info = {
+            # Apply Importance Sampling weights for GMM-Prior
+            if FLAGS.model['train_type'] == 'gmm-prior' and FLAGS.use_importance_sampling and 'loss_weights' in info:
+                is_weights = info['loss_weights']
+                loss = jnp.mean(mse_v * is_weights)
+            else:
+                loss = jnp.mean(mse_v)
+
+            info_out = {
                 'loss': loss,
                 'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                 **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
@@ -292,10 +324,14 @@ def main(_):
 
             if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
                 bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
-                info['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
-                info['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
+                info_out['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
+                info_out['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
 
-            return loss, info
+            # Merge info from targets (IS weights, etc.)
+            if FLAGS.model['train_type'] == 'gmm-prior':
+                info_out.update({k: v for k, v in info.items() if k != 'loss'})
+
+            return loss, info_out
 
         grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
         info = {**info, **new_info}
@@ -336,7 +372,8 @@ def main(_):
 
         # Train update.
         train_state, update_info = update(
-            train_state, train_state_teacher, batch_images, batch_labels)
+            train_state, train_state_teacher, batch_images, batch_labels,
+            gmm_stats=gmm_stats_replicated)
 
         if i % FLAGS.log_interval == 0 or i == 1:
             update_info = jax.device_get(update_info)
@@ -349,7 +386,8 @@ def main(_):
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                 valid_images = vae_encode(vae_rng, valid_images)
             _, valid_update_info = update(
-                train_state, train_state_teacher, valid_images, valid_labels)
+                train_state, train_state_teacher, valid_images, valid_labels,
+                gmm_stats=gmm_stats_replicated)
             valid_update_info = jax.device_get(valid_update_info)
             valid_update_info = jax.tree_map(
                 lambda x: x.mean(), valid_update_info)
