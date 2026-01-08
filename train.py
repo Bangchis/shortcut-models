@@ -300,7 +300,7 @@ def main(_):
         elif FLAGS.model['train_type'] == 'gmm-prior':
             from baselines.targets_gmm import get_targets
             # Lấy local stats (phần tử [0] vì đã replicate)
-            stats_local = jax.tree_map(lambda x: x[0], gmm_stats) if gmm_stats else None
+            stats_local = gmm_stats
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, stats_local, force_t, force_dt)
 
@@ -406,7 +406,7 @@ def main(_):
         if i % FLAGS.eval_interval == 0:
             eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
                        get_fid_activations, imagenet_labels, visualize_labels,
-                       fid_from_stats, truth_fid_stats)
+                       fid_from_stats, truth_fid_stats, gmm_stats=gmm_stats_replicated)
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             train_state_gather = jax.experimental.multihost_utils.process_allgather(

@@ -23,6 +23,7 @@ def eval_model(
     visualize_labels,
     fid_from_stats,
     truth_fid_stats,
+    gmm_stats=None,
 ):
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
@@ -31,10 +32,15 @@ def eval_model(
         # Load GMM stats if using GMM-prior
         gmm_means, gmm_covs, gmm_weights = None, None, None
         if FLAGS.model['train_type'] == 'gmm-prior':
-            loaded = np.load(FLAGS.gmm_path)
-            gmm_means = jnp.array(loaded['means'])
-            gmm_covs = jnp.array(loaded['covs'])
-            gmm_weights = jnp.array(loaded['weights'])
+            if gmm_stats is not None:
+                gmm_means = gmm_stats['means']
+                gmm_covs = gmm_stats['covs']
+                gmm_weights = gmm_stats['weights']
+            else:
+                loaded = np.load(FLAGS.gmm_path)
+                gmm_means = jnp.array(loaded['means'])
+                gmm_covs = jnp.array(loaded['covs'])
+                gmm_weights = jnp.array(loaded['weights'])
 
         batch_images, batch_labels = next(dataset)
         valid_images, valid_labels = next(dataset_valid)
@@ -93,7 +99,7 @@ def eval_model(
                 if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                     batch_images_n = vae_encode(key, batch_images_n)
                 batch_images_sharded, batch_labels_sharded = shard_data(batch_images_n, batch_labels_n)
-                _, info = update(train_state, train_state_teacher, batch_images_sharded, batch_labels_sharded, force_t=float(t), force_dt=int(d))
+                _, info = update(train_state, train_state_teacher, batch_images_sharded, batch_labels_sharded, force_t=float(t), force_dt=int(d), gmm_stats=gmm_stats)
                 info = jax.experimental.multihost_utils.process_allgather(info)
                 if infos is None:
                     infos = jax.tree_map(lambda x: [x], info)
