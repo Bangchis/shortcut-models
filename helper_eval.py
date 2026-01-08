@@ -33,9 +33,9 @@ def eval_model(
         gmm_means, gmm_covs, gmm_weights = None, None, None
         if FLAGS.model['train_type'] == 'gmm-prior':
             if gmm_stats is not None:
-                gmm_means = gmm_stats['means']
-                gmm_covs = gmm_stats['covs']
-                gmm_weights = gmm_stats['weights']
+                gmm_means = gmm_stats['means'][0]
+                gmm_covs = gmm_stats['covs'][0]
+                gmm_weights = gmm_stats['weights'][0]
             else:
                 loaded = np.load(FLAGS.gmm_path)
                 gmm_means = jnp.array(loaded['means'])
@@ -222,7 +222,7 @@ def eval_model(
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
             images_shape = batch_images.shape
-            num_generations = 50048 #to match with paper's config
+            num_generations = 100 #to match with paper's config
             print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
             for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
                 key = jax.random.PRNGKey(42)
