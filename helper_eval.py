@@ -248,7 +248,7 @@ def eval_model(
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
             images_shape = batch_images.shape
-            num_generations = 100  # to match with paper's config
+            num_generations = 50024  # to match with paper's config
             print(
                 f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
             for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
@@ -305,23 +305,13 @@ def eval_model(
                             x = x + alpha * (delta_t * v)
                     else:
                         x = x + v * delta_t  # Euler sampling.
-
                 if FLAGS.model.use_stable_vae:
                     x = vae_decode(x)  # Image is in [-1, 1] space.
-
-                # --- FIX START: Denormalize về [0, 1] ---
-                x = (x + 1.0) / 2.0
-                x = jnp.clip(x, 0.0, 1.0)
-                # ----------------------------------------
-
-                # Resize sau khi đã đưa về dải màu dương [0, 1]
                 x = jax.image.resize(
                     x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
-
-                # Truyền vào mạng Inception
-                acts = get_fid_activations(x)[..., 0, 0, :]
-
+                x = jnp.clip(x, -1, 1)
                 # [devices, batch//devices, 2048]
+                acts = get_fid_activations(x)[..., 0, 0, :]
                 acts = jax.experimental.multihost_utils.process_allgather(acts)
                 acts = np.array(acts)
                 activations.append(acts)
