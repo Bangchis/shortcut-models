@@ -6,6 +6,7 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
+from utils.dct_utils import idct_power_law
 
 
 def eval_model(
@@ -128,12 +129,15 @@ def eval_model(
         if 'latent' in FLAGS.dataset_name:
             eps = eps_valid
         elif FLAGS.model['train_type'] == 'gmm-prior':
-            # Sample from GMM for visualization
+            # Sample from GMM for visualization (with Power Law reconstruction)
             cluster_ids = jax.random.categorical(
                 key, jnp.log(gmm_weights), shape=(eps.shape[0],))
-            batch_means = jnp.take(gmm_means, cluster_ids, axis=0)
-            batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))
-            eps = batch_means + batch_stds * jax.random.normal(key, eps.shape)
+            batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, 256]
+            batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, 256]
+            # Sample trong không gian nén [B, 256]
+            z_sample = batch_means + batch_stds * jax.random.normal(key, (eps.shape[0], 256))
+            # Khôi phục bằng Power Law Noise
+            eps = idct_power_law(key, z_sample, alpha=1.0, noise_scale=1.0)
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -257,15 +261,17 @@ def eval_model(
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
 
-                # Sample initial noise (with GMM support)
+                # Sample initial noise (with GMM support and Power Law reconstruction)
                 if FLAGS.model['train_type'] == 'gmm-prior':
                     cluster_ids = jax.random.categorical(
                         eps_key, jnp.log(gmm_weights), shape=(images_shape[0],))
-                    batch_means = jnp.take(gmm_means, cluster_ids, axis=0)
+                    batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, 256]
                     batch_stds = jnp.sqrt(
-                        jnp.take(gmm_covs, cluster_ids, axis=0))
-                    x = batch_means + batch_stds * \
-                        jax.random.normal(eps_key, images_shape)
+                        jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, 256]
+                    # Sample trong không gian nén [B, 256]
+                    z_sample = batch_means + batch_stds * jax.random.normal(eps_key, (images_shape[0], 256))
+                    # Khôi phục bằng Power Law Noise
+                    x = idct_power_law(eps_key, z_sample, alpha=1.0, noise_scale=1.0)
                 else:
                     x = jax.random.normal(eps_key, images_shape)
 

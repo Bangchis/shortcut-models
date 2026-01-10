@@ -20,6 +20,7 @@ import warnings
 # Import các module nội bộ
 from utils.datasets import get_dataset
 from utils.stable_vae import StableVAE
+from utils.dct_utils import dct_reduce
 
 def get_or_fit_gmm(FLAGS):
     """
@@ -97,6 +98,13 @@ def _run_gmm_fitting(FLAGS):
     X = np.concatenate(latents_buffer, axis=0)[:num_samples]
     print(f"Data Collected Shape: {X.shape}")
 
+    # 2.5. Apply DCT Reduction (4096 -> 256 dims)
+    print("Applying DCT Reduction (keep_size=8)...")
+    X_img = X.reshape(-1, 32, 32, 4)  # Reshape về ảnh
+    X_dct = dct_reduce(X_img, keep_size=8)  # Nén xuống 256 chiều
+    X_dct = np.array(X_dct)  # Chuyển về numpy cho sklearn
+    print(f"Reduced Data Shape: {X_dct.shape}")  # Sẽ là [N, 256]
+
     # 3. Fit GMM (Fix Crash settings)
     print("Fitting GMM (CPU, diag)... using 'random_from_data' init to avoid KMeans crash...")
     
@@ -113,7 +121,7 @@ def _run_gmm_fitting(FLAGS):
             verbose=1,
             random_state=42
         )
-        gmm.fit(X)
+        gmm.fit(X_dct)
     except ValueError:
         print("Falling back to init_params='random'...")
         gmm = GaussianMixture(
@@ -125,11 +133,11 @@ def _run_gmm_fitting(FLAGS):
             verbose=1,
             random_state=42
         )
-        gmm.fit(X)
+        gmm.fit(X_dct)
     
     # 4. Calculate Empirical Stats for Importance Sampling
     print("Calculating Empirical Probabilities...")
-    labels = gmm.predict(X)
+    labels = gmm.predict(X_dct)
     counts = np.bincount(labels, minlength=num_components)
     empirical_probs = counts / np.sum(counts)
     model_weights = gmm.weights_
@@ -145,12 +153,11 @@ def _run_gmm_fitting(FLAGS):
             data=table_data, columns=["Cluster", "Model_Pi", "Empirical_Prob", "Count", "Est_IS_Weight"]
         )})
 
-    # 6. Save .npz
-    H, W, C = 32, 32, 4
+    # 6. Save .npz (Keep [K, 256] shape - no reshape to H,W,C)
     np.savez(
         FLAGS.gmm_path,
-        means=gmm.means_.reshape(num_components, H, W, C),
-        covs=gmm.covariances_.reshape(num_components, H, W, C),
+        means=gmm.means_,  # [K, 256]
+        covs=gmm.covariances_,  # [K, 256]
         weights=model_weights,
         empirical_probs=empirical_probs
     )

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from utils.dct_utils import dct_reduce, idct_power_law
 
 
 def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, force_dt=-1):
@@ -12,7 +13,7 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
     3. Handle latent dataset mode (pre-computed x_0).
     4. JIT-safe (no python control flow on tracers).
     """
-    label_key, time_key, noise_key = jax.random.split(key, 3)
+    label_key, time_key, noise_key, dct_noise_key = jax.random.split(key, 4)
     info = {}
 
     B = images.shape[0]
@@ -29,78 +30,55 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
 
     # === GMM PRIOR MODE ===
     else:
-        x_1 = images
+        x_1 = images  # [B, 32, 32, 4]
 
-        # === 1. HARD ASSIGNMENT (Log-Likelihood) ===
-        # Flatten images: [B, D]
-        # Robustly calculate D - the dimension of the flattened image
-        x_flat = x_1.reshape(B, -1)
-        D = x_flat.shape[1] 
+        # === 1. COMPRESS INPUT WITH DCT ===
+        # Nén ảnh input để tìm cụm trong không gian 256 chiều
+        z_flat = dct_reduce(x_1, keep_size=8)  # [B, 256]
+        D = z_flat.shape[1]  # Should be 256
 
-        # Flatten GMM params: [K, D]
-        # Robustly reshape to (-1, D) to handle any prefix dimensions (like 1 from replication)
-        means = gmm_stats['means'].reshape(-1, D)
-        covs = gmm_stats['covs'].reshape(-1, D)
-        weights = gmm_stats['weights'].flatten() # [K]
-        
-        # Recalculate K from the flattened weights
+        # === 2. GMM ASSIGNMENT (on DCT-compressed space) ===
+        # GMM params: [K, 256]
+        means = gmm_stats['means'].reshape(-1, D)  # [K, 256]
+        covs = gmm_stats['covs'].reshape(-1, D)    # [K, 256]
+        weights = gmm_stats['weights'].flatten()    # [K]
+
         K = weights.shape[0]
 
-        # Tính Log-Likelihood Score:
-        # Score_k = log(pi_k) - 0.5 * sum(log(sigma_k^2)) - 0.5 * sum((x - mu_k)^2 / sigma_k^2)
-
-        # Term 1: Log Weights [K]
+        # Tính Log-Likelihood Score (Mahalanobis Distance)
         log_weights = jnp.log(weights + 1e-10)
-
-        # Term 2: Log Determinant [K] (Sum log variances for diagonal covariance)
-        # Thêm epsilon nhỏ để tránh log(0)
         log_det = jnp.sum(jnp.log(covs + 1e-10), axis=-1)
 
-        # Term 3: Mahalanobis Distance [B, K]
-        # Broadcasting: [B, 1, D] - [1, K, D] -> [B, K, D]
-        diff = x_flat[:, None, :] - means[None, :, :]
-        # Chia cho variance: [B, K, D]
+        # Mahalanobis Distance [B, K]
+        diff = z_flat[:, None, :] - means[None, :, :]  # [B, K, 256]
         mahalanobis = jnp.sum((diff ** 2) / (covs[None, :, :] + 1e-10), axis=-1)
 
-        # Tổng hợp Score [B, K]
+        # Log Probs [B, K]
         log_probs = log_weights[None, :] - 0.5 * log_det[None, :] - 0.5 * mahalanobis
 
-        # Hard Assignment: Chọn cụm k có score cao nhất
+        # Hard Assignment
         cluster_ids = jnp.argmax(log_probs, axis=-1)  # [B]
 
-        # === 2. IMPORTANCE SAMPLING WEIGHTS ===
-        # Lấy Pi (Model Belief)
+        # === 3. IMPORTANCE SAMPLING WEIGHTS ===
         model_pi = jnp.take(weights, cluster_ids)
-
-        # Lấy P_emp (Data Reality) từ stats
         emp_prob = gmm_stats['empirical_probs'].flatten()
         emp_prob_selected = jnp.take(emp_prob, cluster_ids)
 
-        # Tính Weight: w = Pi / P_emp
-        # Nếu GMM gán trọng số cao (Pi) cho vùng ít dữ liệu (P_emp thấp) -> Weight lớn
         raw_weights = model_pi / (emp_prob_selected + 1e-8)
-
-        # Normalize weights trong batch để giữ cho Loss scale ổn định (Mean ~ 1)
-        # Điều này cực kỳ quan trọng để không làm Learning Rate bị sai lệch
         loss_weights = raw_weights / (jnp.mean(raw_weights) + 1e-8)
 
-        # Lưu vào info để train.py sử dụng
         info['loss_weights'] = loss_weights
-        # Log để theo dõi xem có weight nào quá lớn không (dấu hiệu GMM fit lỗi)
         info['max_is_weight'] = jnp.max(loss_weights)
 
-        # === 3. SAMPLE SOURCE FROM GMM ===
-        # Lấy params của cụm được chọn (đã reshape flat [K, D])
-        batch_means_flat = jnp.take(means, cluster_ids, axis=0)  # [B, D]
-        batch_vars_flat = jnp.take(covs, cluster_ids, axis=0)   # [B, D]
-        batch_stds_flat = jnp.sqrt(batch_vars_flat)
+        # === 4. SAMPLE & RECONSTRUCT WITH POWER LAW ===
+        # Sample trong không gian nén [B, 256]
+        batch_means = jnp.take(means, cluster_ids, axis=0)  # [B, 256]
+        batch_stds = jnp.sqrt(jnp.take(covs, cluster_ids, axis=0))  # [B, 256]
 
-        # Sample x0 ~ N(mu_k, sigma_k)
-        eps_flat = jax.random.normal(noise_key, x_flat.shape)
-        x_0_flat = batch_means_flat + batch_stds_flat * eps_flat
+        z_0 = batch_means + batch_stds * jax.random.normal(noise_key, z_flat.shape)
 
-        # Reshape x0 về không gian ảnh [B, H, W, C] để flow matching
-        x_0 = x_0_flat.reshape(images.shape)
+        # Khôi phục x_0 bằng Power Law Noise (Pink Noise)
+        x_0 = idct_power_law(dct_noise_key, z_0, alpha=1.0, noise_scale=1.0)  # [B, 32, 32, 4]
 
     # === 4. STANDARD FLOW MATCHING INTERPOLATION ===
     # Sample t
