@@ -27,48 +27,60 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         info['loss_weights'] = jnp.ones(B)
         info['max_is_weight'] = 1.0
 
-    # === GMM PRIOR MODE ===
+    # === GMM PRIOR MODE (WITH PCA) ===
     else:
         x_1 = images
 
-        # === 1. HARD ASSIGNMENT (Log-Likelihood) ===
-        # Flatten images: [B, D]
-        # Robustly calculate D - the dimension of the flattened image
+        # === 0. EXTRACT PCA PARAMS ===
+        # Flatten images to pixel space: [B, 4096]
         x_flat = x_1.reshape(B, -1)
-        D = x_flat.shape[1] 
 
-        # Flatten GMM params: [K, D]
-        # Robustly reshape to (-1, D) to handle any prefix dimensions (like 1 from replication)
-        means = gmm_stats['means'].reshape(-1, D)
-        covs = gmm_stats['covs'].reshape(-1, D)
-        weights = gmm_stats['weights'].flatten() # [K]
-        
-        # Recalculate K from the flattened weights
+        # PCA parameters for projection
+        pca_comps = gmm_stats['pca_components']  # [pca_dim, 4096]
+        pca_mean = gmm_stats['pca_mean']         # [4096]
+
+        # GMM parameters (in PCA space)
+        means = gmm_stats['means']      # [K, pca_dim] or [1, K, pca_dim] if replicated
+        covs = gmm_stats['covs']        # [K, pca_dim]
+        weights = gmm_stats['weights']  # [K] or [1, K]
+
+        # Handle replication dimension if present
+        if means.ndim > 2:
+            means = means.reshape(-1, means.shape[-1])
+        if covs.ndim > 2:
+            covs = covs.reshape(-1, covs.shape[-1])
+        weights = weights.flatten()
+
         K = weights.shape[0]
+        pca_dim = means.shape[1]
 
-        # Tính Log-Likelihood Score:
-        # Score_k = log(pi_k) - 0.5 * sum(log(sigma_k^2)) - 0.5 * sum((x - mu_k)^2 / sigma_k^2)
+        # === 1. FORWARD PCA PROJECTION ===
+        # Project to PCA space: z = (x - mean) @ V.T
+        x_centered = x_flat - pca_mean
+        z_flat = jnp.dot(x_centered, pca_comps.T)  # [B, pca_dim]
+
+        # === 2. HARD ASSIGNMENT (in PCA space) ===
+        # Compute Log-Likelihood Score in PCA space (pca_dim instead of 4096)
+        # Score_k = log(pi_k) - 0.5 * sum(log(sigma_k^2)) - 0.5 * sum((z - mu_k)^2 / sigma_k^2)
 
         # Term 1: Log Weights [K]
         log_weights = jnp.log(weights + 1e-10)
 
         # Term 2: Log Determinant [K] (Sum log variances for diagonal covariance)
-        # Thêm epsilon nhỏ để tránh log(0)
         log_det = jnp.sum(jnp.log(covs + 1e-10), axis=-1)
 
-        # Term 3: Mahalanobis Distance [B, K]
-        # Broadcasting: [B, 1, D] - [1, K, D] -> [B, K, D]
-        diff = x_flat[:, None, :] - means[None, :, :]
-        # Chia cho variance: [B, K, D]
+        # Term 3: Mahalanobis Distance [B, K] in PCA space
+        # Broadcasting: [B, 1, pca_dim] - [1, K, pca_dim] -> [B, K, pca_dim]
+        diff = z_flat[:, None, :] - means[None, :, :]
         mahalanobis = jnp.sum((diff ** 2) / (covs[None, :, :] + 1e-10), axis=-1)
 
-        # Tổng hợp Score [B, K]
+        # Aggregate Score [B, K]
         log_probs = log_weights[None, :] - 0.5 * log_det[None, :] - 0.5 * mahalanobis
 
-        # Hard Assignment: Chọn cụm k có score cao nhất
+        # Hard Assignment: Choose cluster k with highest score
         cluster_ids = jnp.argmax(log_probs, axis=-1)  # [B]
 
-        # === 2. IMPORTANCE SAMPLING WEIGHTS ===
+        # === 3. IMPORTANCE SAMPLING WEIGHTS ===
         # Lấy Pi (Model Belief)
         model_pi = jnp.take(weights, cluster_ids)
 
@@ -84,25 +96,28 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         # Điều này cực kỳ quan trọng để không làm Learning Rate bị sai lệch
         loss_weights = raw_weights / (jnp.mean(raw_weights) + 1e-8)
 
-        # Lưu vào info để train.py sử dụng
+        # Store in info for train.py to use
         info['loss_weights'] = loss_weights
-        # Log để theo dõi xem có weight nào quá lớn không (dấu hiệu GMM fit lỗi)
         info['max_is_weight'] = jnp.max(loss_weights)
 
-        # === 3. SAMPLE SOURCE FROM GMM ===
-        # Lấy params của cụm được chọn (đã reshape flat [K, D])
-        batch_means_flat = jnp.take(means, cluster_ids, axis=0)  # [B, D]
-        batch_vars_flat = jnp.take(covs, cluster_ids, axis=0)   # [B, D]
-        batch_stds_flat = jnp.sqrt(batch_vars_flat)
+        # === 4. SAMPLE x_0 IN PCA SPACE & INVERSE PROJECT ===
+        # Get cluster parameters in PCA space [K, pca_dim]
+        batch_means_pca = jnp.take(means, cluster_ids, axis=0)  # [B, pca_dim]
+        batch_vars_pca = jnp.take(covs, cluster_ids, axis=0)    # [B, pca_dim]
+        batch_stds_pca = jnp.sqrt(batch_vars_pca)
 
-        # Sample x0 ~ N(mu_k, sigma_k)
-        eps_flat = jax.random.normal(noise_key, x_flat.shape)
-        x_0_flat = batch_means_flat + batch_stds_flat * eps_flat
+        # Sample z_0 ~ N(mu_k, sigma_k) in PCA space
+        eps_pca = jax.random.normal(noise_key, z_flat.shape)  # [B, pca_dim]
+        z_0 = batch_means_pca + batch_stds_pca * eps_pca     # [B, pca_dim]
 
-        # Reshape x0 về không gian ảnh [B, H, W, C] để flow matching
+        # Inverse PCA projection: x = z @ V + mean
+        # [B, pca_dim] @ [pca_dim, 4096] -> [B, 4096]
+        x_0_flat = jnp.dot(z_0, pca_comps) + pca_mean
+
+        # Reshape to image space [B, H, W, C] for flow matching
         x_0 = x_0_flat.reshape(images.shape)
 
-    # === 4. STANDARD FLOW MATCHING INTERPOLATION ===
+    # === 5. STANDARD FLOW MATCHING INTERPOLATION ===
     # Sample t
     t = jax.random.randint(time_key, (B,), minval=0, maxval=FLAGS.model['denoise_timesteps']).astype(jnp.float32)
     t /= FLAGS.model['denoise_timesteps']
@@ -121,12 +136,12 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
     # Velocity: v_t = x_1 - (1-eps)*x_0
     v_t = x_1 - (1 - eps_flow) * x_0
 
-    # === 5. LABEL DROPOUT FOR CLASSIFIER-FREE GUIDANCE ===
+    # === 6. LABEL DROPOUT FOR CLASSIFIER-FREE GUIDANCE ===
     labels_dropout = jax.random.bernoulli(label_key, FLAGS.model['class_dropout_prob'], (labels.shape[0],))
     labels_dropped = jnp.where(labels_dropout, FLAGS.model['num_classes'], labels)
     info['dropped_ratio'] = jnp.mean(labels_dropped == FLAGS.model['num_classes'])
 
-    # === 6. DT_BASE (for compatibility with shortcut models) ===
+    # === 7. DT_BASE (for compatibility with shortcut models) ===
     # For naive/gmm-prior mode, dt_base is always maximum (log2(denoise_timesteps))
     dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
     dt_base = jnp.ones(B, dtype=jnp.int32) * dt_flow

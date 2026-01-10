@@ -42,6 +42,7 @@ flags.DEFINE_string('mode', 'train', 'train or inference.')
 flags.DEFINE_string('gmm_path', 'gmm_stats.npz', 'Path to GMM stats file.')
 flags.DEFINE_integer('gmm_fit_samples', 30000, 'Number of samples for GMM fitting.')
 flags.DEFINE_bool('use_importance_sampling', True, 'Use IS weights in GMM loss.')
+flags.DEFINE_integer('gmm_pca_dim', 64, 'Number of PCA components for GMM reduction.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,

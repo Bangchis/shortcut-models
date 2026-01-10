@@ -8,6 +8,60 @@ import matplotlib.pyplot as plt
 from functools import partial
 
 
+def sample_gmm_pca_prior(key, shape, gmm_stats):
+    """
+    Sample from GMM in PCA space then inverse project to pixel space.
+
+    Args:
+        key: JAX random key
+        shape: Target shape [B, H, W, C]
+        gmm_stats: Dictionary containing:
+            - means: [K, pca_dim] cluster means in PCA space
+            - covs: [K, pca_dim] cluster variances in PCA space
+            - weights: [K] cluster weights
+            - pca_components: [pca_dim, 4096] PCA components
+            - pca_mean: [4096] PCA mean
+
+    Returns:
+        Samples in pixel space with shape [B, H, W, C]
+    """
+    def get_arr(arr):
+        """Handle potential replication dimension from pmap."""
+        # If array has extra dim 0 from replication (e.g., [8, K, D]) -> take [0]
+        # If shape is standard [K, D] -> keep as is
+        if arr.ndim > 2 and arr.shape[0] == jax.local_device_count():
+            return arr[0]
+        elif arr.ndim > 1 and arr.shape[0] == jax.local_device_count() and len(arr.shape) == 2:
+            # For 2D arrays like weights [8, K] -> take [0]
+            return arr[0]
+        return arr
+
+    # Extract and handle replication
+    means = get_arr(gmm_stats['means'])               # [K, pca_dim]
+    covs = get_arr(gmm_stats['covs'])                 # [K, pca_dim]
+    weights = get_arr(gmm_stats['weights'])           # [K]
+    pca_comps = get_arr(gmm_stats['pca_components'])  # [pca_dim, 4096]
+    pca_mean = get_arr(gmm_stats['pca_mean'])         # [4096]
+
+    B = shape[0]
+    k_key, z_key = jax.random.split(key)
+
+    # Sample cluster IDs
+    cluster_ids = jax.random.categorical(k_key, jnp.log(weights + 1e-10), shape=(B,))
+
+    # Get cluster parameters
+    b_means = jnp.take(means, cluster_ids, axis=0)  # [B, pca_dim]
+    b_stds = jnp.sqrt(jnp.take(covs, cluster_ids, axis=0))
+
+    # Sample in PCA space
+    z_pca = b_means + b_stds * jax.random.normal(z_key, (B, means.shape[1]))
+
+    # Inverse PCA projection
+    latents_flat = jnp.dot(z_pca, pca_comps) + pca_mean
+
+    return latents_flat.reshape(shape)
+
+
 def eval_model(
     FLAGS,
     train_state,
@@ -128,12 +182,9 @@ def eval_model(
         if 'latent' in FLAGS.dataset_name:
             eps = eps_valid
         elif FLAGS.model['train_type'] == 'gmm-prior':
-            # Sample from GMM for visualization
-            cluster_ids = jax.random.categorical(
-                key, jnp.log(gmm_weights), shape=(eps.shape[0],))
-            batch_means = jnp.take(gmm_means, cluster_ids, axis=0)
-            batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))
-            eps = batch_means + batch_stds * jax.random.normal(key, eps.shape)
+            # Sample from GMM in PCA space for visualization
+            key, eps_key = jax.random.split(key)
+            eps = sample_gmm_pca_prior(eps_key, eps.shape, gmm_stats)
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -257,15 +308,9 @@ def eval_model(
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
 
-                # Sample initial noise (with GMM support)
+                # Sample initial noise (with GMM-PCA support)
                 if FLAGS.model['train_type'] == 'gmm-prior':
-                    cluster_ids = jax.random.categorical(
-                        eps_key, jnp.log(gmm_weights), shape=(images_shape[0],))
-                    batch_means = jnp.take(gmm_means, cluster_ids, axis=0)
-                    batch_stds = jnp.sqrt(
-                        jnp.take(gmm_covs, cluster_ids, axis=0))
-                    x = batch_means + batch_stds * \
-                        jax.random.normal(eps_key, images_shape)
+                    x = sample_gmm_pca_prior(eps_key, images_shape, gmm_stats)
                 else:
                     x = jax.random.normal(eps_key, images_shape)
 
