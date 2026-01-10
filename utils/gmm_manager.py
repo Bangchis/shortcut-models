@@ -98,12 +98,13 @@ def _run_gmm_fitting(FLAGS):
     X = np.concatenate(latents_buffer, axis=0)[:num_samples]
     print(f"Data Collected Shape: {X.shape}")
 
-    # 2.5. Apply DCT Reduction (4096 -> 256 dims)
-    print("Applying DCT Reduction (keep_size=8)...")
+    # 2.5. Apply DCT Reduction (4096 -> variable dims)
+    keep_size = FLAGS.model['dct_keep_size']
+    print(f"Applying DCT Reduction (keep_size={keep_size})...")
     X_img = X.reshape(-1, 32, 32, 4)  # Reshape về ảnh
-    X_dct = dct_reduce(X_img, keep_size=8)  # Nén xuống 256 chiều
+    X_dct = dct_reduce(X_img, keep_size=keep_size)  # Nén xuống keep_size^2*4 chiều
     X_dct = np.array(X_dct)  # Chuyển về numpy cho sklearn
-    print(f"Reduced Data Shape: {X_dct.shape}")  # Sẽ là [N, 256]
+    print(f"Reduced Data Shape: {X_dct.shape}")  # Sẽ là [N, keep_size^2*4]
 
     # 3. Fit GMM (Fix Crash settings)
     print("Fitting GMM (CPU, diag)... using 'random_from_data' init to avoid KMeans crash...")

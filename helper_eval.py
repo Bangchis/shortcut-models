@@ -130,14 +130,16 @@ def eval_model(
             eps = eps_valid
         elif FLAGS.model['train_type'] == 'gmm-prior':
             # Sample from GMM for visualization (with Power Law reconstruction)
+            keep_size = FLAGS.model['dct_keep_size']
+            D = keep_size * keep_size * 4  # Compressed dimension
             cluster_ids = jax.random.categorical(
                 key, jnp.log(gmm_weights), shape=(eps.shape[0],))
-            batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, 256]
-            batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, 256]
-            # Sample trong không gian nén [B, 256]
-            z_sample = batch_means + batch_stds * jax.random.normal(key, (eps.shape[0], 256))
+            batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, D]
+            batch_stds = jnp.sqrt(jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, D]
+            # Sample trong không gian nén [B, D]
+            z_sample = batch_means + batch_stds * jax.random.normal(key, (eps.shape[0], D))
             # Khôi phục bằng Power Law Noise
-            eps = idct_power_law(key, z_sample, alpha=1.0, noise_scale=1.0)
+            eps = idct_power_law(key, z_sample, keep_size=keep_size, alpha=1.0, noise_scale=1.0)
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -263,15 +265,17 @@ def eval_model(
 
                 # Sample initial noise (with GMM support and Power Law reconstruction)
                 if FLAGS.model['train_type'] == 'gmm-prior':
+                    keep_size = FLAGS.model['dct_keep_size']
+                    D = keep_size * keep_size * 4  # Compressed dimension
                     cluster_ids = jax.random.categorical(
                         eps_key, jnp.log(gmm_weights), shape=(images_shape[0],))
-                    batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, 256]
+                    batch_means = jnp.take(gmm_means, cluster_ids, axis=0)  # [B, D]
                     batch_stds = jnp.sqrt(
-                        jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, 256]
-                    # Sample trong không gian nén [B, 256]
-                    z_sample = batch_means + batch_stds * jax.random.normal(eps_key, (images_shape[0], 256))
+                        jnp.take(gmm_covs, cluster_ids, axis=0))  # [B, D]
+                    # Sample trong không gian nén [B, D]
+                    z_sample = batch_means + batch_stds * jax.random.normal(eps_key, (images_shape[0], D))
                     # Khôi phục bằng Power Law Noise
-                    x = idct_power_law(eps_key, z_sample, alpha=1.0, noise_scale=1.0)
+                    x = idct_power_law(eps_key, z_sample, keep_size=keep_size, alpha=1.0, noise_scale=1.0)
                 else:
                     x = jax.random.normal(eps_key, images_shape)
 

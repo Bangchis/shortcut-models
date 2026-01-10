@@ -33,14 +33,15 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         x_1 = images  # [B, 32, 32, 4]
 
         # === 1. COMPRESS INPUT WITH DCT ===
-        # Nén ảnh input để tìm cụm trong không gian 256 chiều
-        z_flat = dct_reduce(x_1, keep_size=8)  # [B, 256]
-        D = z_flat.shape[1]  # Should be 256
+        # Nén ảnh input để tìm cụm trong không gian nén
+        keep_size = FLAGS.model['dct_keep_size']
+        z_flat = dct_reduce(x_1, keep_size=keep_size)  # [B, keep_size^2*4]
+        D = z_flat.shape[1]  # Should be keep_size^2*4
 
         # === 2. GMM ASSIGNMENT (on DCT-compressed space) ===
-        # GMM params: [K, 256]
-        means = gmm_stats['means'].reshape(-1, D)  # [K, 256]
-        covs = gmm_stats['covs'].reshape(-1, D)    # [K, 256]
+        # GMM params: [K, D] where D = keep_size^2*4
+        means = gmm_stats['means'].reshape(-1, D)  # [K, D]
+        covs = gmm_stats['covs'].reshape(-1, D)    # [K, D]
         weights = gmm_stats['weights'].flatten()    # [K]
 
         K = weights.shape[0]
@@ -71,14 +72,14 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         info['max_is_weight'] = jnp.max(loss_weights)
 
         # === 4. SAMPLE & RECONSTRUCT WITH POWER LAW ===
-        # Sample trong không gian nén [B, 256]
-        batch_means = jnp.take(means, cluster_ids, axis=0)  # [B, 256]
-        batch_stds = jnp.sqrt(jnp.take(covs, cluster_ids, axis=0))  # [B, 256]
+        # Sample trong không gian nén [B, D]
+        batch_means = jnp.take(means, cluster_ids, axis=0)  # [B, D]
+        batch_stds = jnp.sqrt(jnp.take(covs, cluster_ids, axis=0))  # [B, D]
 
         z_0 = batch_means + batch_stds * jax.random.normal(noise_key, z_flat.shape)
 
         # Khôi phục x_0 bằng Power Law Noise (Pink Noise)
-        x_0 = idct_power_law(dct_noise_key, z_0, alpha=1.0, noise_scale=1.0)  # [B, 32, 32, 4]
+        x_0 = idct_power_law(dct_noise_key, z_0, keep_size=keep_size, alpha=1.0, noise_scale=1.0)  # [B, 32, 32, 4]
 
     # === 4. STANDARD FLOW MATCHING INTERPOLATION ===
     # Sample t

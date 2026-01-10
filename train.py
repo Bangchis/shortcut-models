@@ -74,6 +74,7 @@ model_config = ml_collections.ConfigDict({
 
     # ===== GMM-Prior Flow Matching defaults =====
     'gmm_components': 20,  # Number of GMM clusters
+    'dct_keep_size': 8,    # DCT spatial frequency components to keep (8x8x4=256 dims)
 
     # ===== Khoat Flow Matching defaults =====
     'kfm_p_min': 0.20,          # P_min = 75%
