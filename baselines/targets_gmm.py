@@ -52,10 +52,12 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
 
         # Mahalanobis Distance [B, K]
         diff = z_flat[:, None, :] - means[None, :, :]  # [B, K, 256]
-        mahalanobis = jnp.sum((diff ** 2) / (covs[None, :, :] + 1e-10), axis=-1)
+        mahalanobis = jnp.sum(
+            (diff ** 2) / (covs[None, :, :] + 1e-10), axis=-1)
 
         # Log Probs [B, K]
-        log_probs = log_weights[None, :] - 0.5 * log_det[None, :] - 0.5 * mahalanobis
+        log_probs = log_weights[None, :] - 0.5 * \
+            log_det[None, :] - 0.5 * mahalanobis
 
         # Hard Assignment
         cluster_ids = jnp.argmax(log_probs, axis=-1)  # [B]
@@ -76,14 +78,17 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         batch_means = jnp.take(means, cluster_ids, axis=0)  # [B, D]
         batch_stds = jnp.sqrt(jnp.take(covs, cluster_ids, axis=0))  # [B, D]
 
-        z_0 = batch_means + batch_stds * jax.random.normal(noise_key, z_flat.shape)
+        z_0 = batch_means + batch_stds * \
+            jax.random.normal(noise_key, z_flat.shape)
 
         # Khôi phục x_0 bằng Power Law Noise (Pink Noise)
-        x_0 = idct_power_law(dct_noise_key, z_0, keep_size=keep_size, alpha=1.0, noise_scale=1.0)  # [B, 32, 32, 4]
+        x_0 = idct_power_law(dct_noise_key, z_0, keep_size=keep_size,
+                             alpha=1.0, noise_scale=0.1)  # [B, 32, 32, 4]
 
     # === 4. STANDARD FLOW MATCHING INTERPOLATION ===
     # Sample t
-    t = jax.random.randint(time_key, (B,), minval=0, maxval=FLAGS.model['denoise_timesteps']).astype(jnp.float32)
+    t = jax.random.randint(time_key, (B,), minval=0,
+                           maxval=FLAGS.model['denoise_timesteps']).astype(jnp.float32)
     t /= FLAGS.model['denoise_timesteps']
 
     # Override t if force_t is specified (using jnp.where for JIT compat)
@@ -101,9 +106,12 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
     v_t = x_1 - (1 - eps_flow) * x_0
 
     # === 5. LABEL DROPOUT FOR CLASSIFIER-FREE GUIDANCE ===
-    labels_dropout = jax.random.bernoulli(label_key, FLAGS.model['class_dropout_prob'], (labels.shape[0],))
-    labels_dropped = jnp.where(labels_dropout, FLAGS.model['num_classes'], labels)
-    info['dropped_ratio'] = jnp.mean(labels_dropped == FLAGS.model['num_classes'])
+    labels_dropout = jax.random.bernoulli(
+        label_key, FLAGS.model['class_dropout_prob'], (labels.shape[0],))
+    labels_dropped = jnp.where(
+        labels_dropout, FLAGS.model['num_classes'], labels)
+    info['dropped_ratio'] = jnp.mean(
+        labels_dropped == FLAGS.model['num_classes'])
 
     # === 6. DT_BASE (for compatibility with shortcut models) ===
     # For naive/gmm-prior mode, dt_base is always maximum (log2(denoise_timesteps))
