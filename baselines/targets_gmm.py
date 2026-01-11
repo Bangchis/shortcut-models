@@ -3,6 +3,34 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def remove_replication_dim(arr):
+    """
+    Remove the leading replication dimension added by jax.device_put_replicated().
+
+    When GMM statistics are replicated across devices, they get an extra leading
+    dimension equal to the number of devices. This function detects and removes it.
+
+    Args:
+        arr: Array that may have a replication dimension
+
+    Returns:
+        Array with replication dimension removed (if it existed)
+
+    Examples:
+        [8, 4096] -> [4096]           (1D array replicated)
+        [8, 64, 4096] -> [64, 4096]   (2D array replicated)
+        [8, K, 64, 64] -> [K, 64, 64] (3D array replicated)
+    """
+    device_count = jax.local_device_count()
+
+    # Check if first dimension matches device count (indicates replication)
+    if arr.shape[0] == device_count and arr.ndim >= 2:
+        # Take the first slice - all slices are identical due to replication
+        return arr[0]
+
+    return arr
+
+
 def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, force_dt=-1):
     """
     GMM-Prior Flow Matching Targets.
@@ -35,20 +63,16 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         # Flatten images to pixel space: [B, 4096]
         x_flat = x_1.reshape(B, -1)
 
-        # PCA parameters for projection
-        pca_comps = gmm_stats['pca_components']  # [pca_dim, 4096]
-        pca_mean = gmm_stats['pca_mean']         # [4096]
+        # PCA parameters for projection - remove replication dimension if present
+        pca_comps = remove_replication_dim(gmm_stats['pca_components'])  # [pca_dim, 4096]
+        pca_mean = remove_replication_dim(gmm_stats['pca_mean'])         # [4096]
 
-        # GMM parameters (in PCA space)
-        means = gmm_stats['means']      # [K, pca_dim] or [1, K, pca_dim] if replicated
-        covs = gmm_stats['covs']        # [K, pca_dim]
-        weights = gmm_stats['weights']  # [K] or [1, K]
+        # GMM parameters (in PCA space) - remove replication dimension if present
+        means = remove_replication_dim(gmm_stats['means'])      # [K, pca_dim]
+        covs = remove_replication_dim(gmm_stats['covs'])        # [K, pca_dim]
+        weights = remove_replication_dim(gmm_stats['weights'])  # [K]
 
-        # Handle replication dimension if present
-        if means.ndim > 2:
-            means = means.reshape(-1, means.shape[-1])
-        if covs.ndim > 2:
-            covs = covs.reshape(-1, covs.shape[-1])
+        # Ensure weights is 1D (flatten in case of any remaining dimensions)
         weights = weights.flatten()
 
         K = weights.shape[0]
@@ -84,8 +108,8 @@ def get_targets(FLAGS, key, train_state, images, labels, gmm_stats, force_t=-1, 
         # Lấy Pi (Model Belief)
         model_pi = jnp.take(weights, cluster_ids)
 
-        # Lấy P_emp (Data Reality) từ stats
-        emp_prob = gmm_stats['empirical_probs'].flatten()
+        # Lấy P_emp (Data Reality) từ stats - remove replication dimension if present
+        emp_prob = remove_replication_dim(gmm_stats['empirical_probs']).flatten()
         emp_prob_selected = jnp.take(emp_prob, cluster_ids)
 
         # Tính Weight: w = Pi / P_emp
