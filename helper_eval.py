@@ -305,6 +305,7 @@ def eval_model(
             denoise_timesteps_list.append('cfg')
 ###################################################################################################
         # >>> ADDED FOR MB-VAR PLOTS
+        ENABLE_MBVAR = False
         Ts_interest = [1, 4, 32, 128]  # 4 đồ thị mỗi lần eval
         MBVAR_DECODE_TO_PIXEL = False  # bật True nếu muốn đo trên pixel-space
         # labels_for_stats = labels_uncond  # đo uncond để ổn định so sánh
@@ -332,7 +333,8 @@ def eval_model(
             x = shard_data(x)
 
             # >>> ADDED FOR MB-VAR PLOTS
-            collect_mbvar = (denoise_timesteps in Ts_interest) and (not do_cfg)
+            collect_mbvar = ENABLE_MBVAR and (
+                denoise_timesteps in Ts_interest) and (not do_cfg)
             if jax.process_index() == 0 and collect_mbvar:
                 stats_mean, stats_max, stats_min, stats_std = [], [], [], []
                 # --- ĐO TẠI t=0 (trước khi update) ---

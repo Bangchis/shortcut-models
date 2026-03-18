@@ -19,7 +19,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
-from model import DiT
+from model import DiT as DiTBase
 from helper_eval import eval_model
 from helper_inference import do_inference
 
@@ -67,7 +67,25 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 4,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
-    'train_type': 'shortcut'  # or naive.
+    'train_type': 'shortcut',  # or naive, projected_diag_gmm.
+    # GMM config (only used when train_type='projected_diag_gmm').
+    'gmm_num_modes': 8,
+    'gmm_top_m': 1,
+    'gmm_use_router_cond': 0,
+    'gmm_mix_weight': 1.0,
+    'gmm_bal_weight': 0.01,
+    'gmm_varreg_weight': 0.01,
+    'gmm_proj_eps': 1e-6,
+    'gmm_cov_eps': 1e-6,
+    'gmm_use_warmup': 0,
+    'gmm_warmup_iters': 0,
+    'gmm_warmup_mode': 'mix_only',
+    'gmm_radius_low': 0.9,
+    'gmm_radius_high': 1.1,
+    'gmm_radius_mu': 0.0,
+    'gmm_radius_sigma': 0.25,
+    'gmm_use_prior_ema': 1,
+    'gmm_stop_gradient_q_top': 0,
 })
 
 
@@ -146,12 +164,21 @@ def main(_):
         'class_dropout_prob': FLAGS.model['class_dropout_prob'],
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
-        'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow')) else True,
+        'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow', 'projected_diag_gmm')) else True,
     }
-    model_def = DiT(**dit_args)
-    tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
-    print(tabulate_fn(example_obs, jnp.zeros((1,)),
-          jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
+    if FLAGS.model['train_type'] == 'projected_diag_gmm' and FLAGS.model['gmm_use_router_cond']:
+        from model_router_cond import DiT as DiTRouterCond
+        dit_args['num_modes'] = FLAGS.model['gmm_num_modes']
+        model_def = DiTRouterCond(**dit_args)
+        tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
+        example_rc = jnp.zeros((1, FLAGS.model['gmm_num_modes']))
+        print(tabulate_fn(example_obs, jnp.zeros((1,)),
+              jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32), example_rc))
+    else:
+        model_def = DiTBase(**dit_args)
+        tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
+        print(tabulate_fn(example_obs, jnp.zeros((1,)),
+              jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
 
     if FLAGS.model.use_cosine:
         lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -166,17 +193,45 @@ def main(_):
     tx = optax.chain(adam)
 
     def init(rng):
-        param_key, dropout_key, dropout2_key = jax.random.split(rng, 3)
+        param_key, dropout_key, dropout2_key, prior_key = jax.random.split(rng, 4)
         example_t = jnp.zeros((1,))
         example_dt = jnp.zeros((1,))
         example_label = jnp.zeros((1,), dtype=jnp.int32)
         example_obs = jnp.zeros(example_obs_shape)
         model_rngs = {'params': param_key,
                       'label_dropout': dropout_key, 'dropout': dropout2_key}
-        params = model_def.init(model_rngs, example_obs,
-                                example_t, example_dt, example_label)['params']
-        opt_state = tx.init(params)
-        return TrainStateEma.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
+
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            from utils.train_state_projected_gmm import TrainStateProjectedGMMEma
+
+            if FLAGS.model['gmm_use_router_cond']:
+                example_rc = jnp.zeros((1, FLAGS.model['gmm_num_modes']))
+                model_params = model_def.init(model_rngs, example_obs,
+                                              example_t, example_dt, example_label, example_rc)['params']
+            else:
+                model_params = model_def.init(model_rngs, example_obs,
+                                              example_t, example_dt, example_label)['params']
+
+            D = int(np.prod(example_obs_shape[1:]))
+            K = FLAGS.model['gmm_num_modes']
+            assert FLAGS.model['gmm_top_m'] <= K, f"gmm_top_m={FLAGS.model['gmm_top_m']} > gmm_num_modes={K}"
+            assert FLAGS.model['gmm_warmup_mode'] in ('mix_only', 'mix_bal'), \
+                f"Unknown gmm_warmup_mode: {FLAGS.model['gmm_warmup_mode']}"
+            prior_params = {
+                'pi_logits': jnp.zeros((K,), dtype=jnp.float32),
+                'mu': 0.02 * jax.random.normal(prior_key, (K, D), dtype=jnp.float32),
+                'r_raw': jnp.zeros((K, D), dtype=jnp.float32),
+            }
+            print(f"GMM prior: K={K}, D={D}, prior param count={K + 2*K*D}")
+
+            params = {"model": model_params, "prior": prior_params}
+            opt_state = tx.init(params)
+            return TrainStateProjectedGMMEma.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
+        else:
+            params = model_def.init(model_rngs, example_obs,
+                                    example_t, example_dt, example_label)['params']
+            opt_state = tx.init(params)
+            return TrainStateEma.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
 
     rng = jax.random.PRNGKey(FLAGS.seed)
     train_state_shape = jax.eval_shape(init, rng)
@@ -184,18 +239,28 @@ def main(_):
     data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding(
         FLAGS.model.sharding, train_state_shape)
     train_state = jax.jit(init, out_shardings=train_state_sharding)(rng)
+    if FLAGS.model['train_type'] == 'projected_diag_gmm':
+        _p = train_state.params['model']
+    else:
+        _p = train_state.params
     jax.debug.visualize_array_sharding(
-        train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+        _p['FinalLayer_0']['Dense_0']['kernel'])
     jax.debug.visualize_array_sharding(
-        train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
+        _p['TimestepEmbedder_1']['Dense_0']['kernel'])
     jax.experimental.multihost_utils.assert_equal(
-        train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
+        _p['TimestepEmbedder_1']['Dense_0']['kernel'])
     start_step = 1
 
     if FLAGS.load_dir is not None:
         cp = Checkpoint(FLAGS.load_dir)
         replace_dict = cp.load_as_dict()['train_state']
         del replace_dict['opt_state']  # Debug
+        # Handle loading non-GMM checkpoint into GMM mode.
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            if 'model' not in replace_dict.get('params', {}):
+                print("Converting non-GMM checkpoint to GMM format (keeping current prior).")
+                replace_dict['params'] = {"model": replace_dict['params'], "prior": train_state.params["prior"]}
+                replace_dict['params_ema'] = {"model": replace_dict['params_ema'], "prior": train_state.params_ema["prior"]}
         train_state = train_state.replace(**replace_dict)
         if FLAGS.wandb.run_id != "None":  # If we are continuing a run.
             start_step = train_state.step
@@ -203,8 +268,12 @@ def main(_):
             lambda x: x, out_shardings=train_state_sharding)(train_state)
         print("Loaded model with step", train_state.step)
         train_state = train_state.replace(step=0)
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            _p_load = train_state.params['model']
+        else:
+            _p_load = train_state.params
         jax.debug.visualize_array_sharding(
-            train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+            _p_load['FinalLayer_0']['Dense_0']['kernel'])
         del cp
 
     if FLAGS.model.train_type == 'progressive' or FLAGS.model.train_type == 'consistency-distillation':
@@ -239,49 +308,195 @@ def main(_):
             labels = jnp.ones(
                 labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
 
-        if FLAGS.model['train_type'] == 'naive':
-            from baselines.targets_naive import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
-        elif FLAGS.model['train_type'] == 'shortcut':
-            from targets_shortcut import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
-        elif FLAGS.model['train_type'] == 'progressive':
-            from baselines.targets_progressive import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
-        elif FLAGS.model['train_type'] == 'consistency-distillation':
-            from baselines.targets_consistency_distillation import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
-        elif FLAGS.model['train_type'] == 'consistency':
-            from baselines.targets_consistency_training import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
-        elif FLAGS.model['train_type'] == 'livereflow':
-            from baselines.targets_livereflow import get_targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
-                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            from baselines.targets_projected_diag_gmm import sample_time_and_labels, apply_label_dropout, sample_batch_radius
+            from utils.projected_diag_gmm import (
+                flatten_latent, unflatten_latent, compute_router_posterior,
+                select_top_m, sample_projected_sources, apply_sample_radius,
+                build_sparse_router_cond, compute_mix_loss, compute_bal_loss,
+                compute_var_reg_loss
+            )
 
-        def loss_fn(grad_params):
-            v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
-                                                                   'dropout': dropout_key}, params=grad_params, return_activations=True)
-            mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
-            loss = jnp.mean(mse_v)
+            time_key, radius_key, source_key, label_key = jax.random.split(targets_key, 4)
+            t, dt_base, pre_info = sample_time_and_labels(time_key, images, FLAGS)
+            labels_dropped, dropped_ratio = apply_label_dropout(label_key, labels, FLAGS)
+            info['dropped_ratio'] = dropped_ratio
 
-            info = {
-                'loss': loss,
-                'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
-                **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
-            }
+            # Handle force_t.
+            force_t_vec = jnp.ones(images.shape[0], dtype=jnp.float32) * force_t
+            t = jnp.where(force_t_vec != -1, force_t_vec, t)
 
-            if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
-                bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
-                info['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
-                info['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
+            r_scalar = sample_batch_radius(
+                radius_key, images.shape[0],
+                FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
+                FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
 
-            return loss, info
+            B = images.shape[0]
+            H, W, C = images.shape[1], images.shape[2], images.shape[3]
+            M = FLAGS.model['gmm_top_m']
+
+            def loss_fn(grad_params):
+                prior_params = grad_params["prior"]
+                x1_flat = flatten_latent(images)  # [B, D]
+
+                # Router posterior (differentiable w.r.t. prior_params).
+                q_full, log_mixprob, router_stats = compute_router_posterior(
+                    x1_flat, prior_params, FLAGS.model['gmm_cov_eps'])
+
+                # Top-M selection.
+                top_idx, q_top = select_top_m(q_full, M)
+
+                # Sample projected sources (differentiable via reparameterization).
+                x0_dir_bmd, source_stats = sample_projected_sources(
+                    source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])
+
+                # Apply per-sample radius (stop_gradient on r).
+                x0_flat_bmd = apply_sample_radius(x0_dir_bmd, r_scalar)  # [B, M, D]
+
+                # Unflatten to spatial.
+                x0_bmhwc = unflatten_latent(x0_flat_bmd, (H, W, C))  # [B, M, H, W, C]
+                x1_bmhwc = images[:, None, :, :, :]  # [B, 1, H, W, C] -> broadcast
+
+                # Build flow pair.
+                t_full = t[:, None, None, None, None]  # [B, 1, 1, 1, 1]
+                x_t_bmhwc = (1 - (1 - 1e-5) * t_full) * x0_bmhwc + t_full * x1_bmhwc
+                v_t_bmhwc = x1_bmhwc - (1 - 1e-5) * x0_bmhwc
+
+                # Reshape [B, M, H, W, C] -> [B*M, H, W, C] for single model forward.
+                x_t_flat = x_t_bmhwc.reshape(B * M, H, W, C)
+                v_t_flat = v_t_bmhwc.reshape(B * M, H, W, C)
+                t_rep = jnp.repeat(t, M)                    # [B*M]
+                dt_base_rep = jnp.repeat(dt_base, M)        # [B*M]
+                labels_rep = jnp.repeat(labels_dropped, M)  # [B*M]
+
+                # Model forward.
+                if FLAGS.model['gmm_use_router_cond']:
+                    router_cond_sparse = build_sparse_router_cond(
+                        top_idx, q_top, FLAGS.model['gmm_num_modes'])
+                    router_cond_rep = jnp.repeat(router_cond_sparse, M, axis=0)
+                    v_prime, logvars, activations = train_state.call_model(
+                        x_t_flat, t_rep, dt_base_rep, labels_rep,
+                        router_cond_rep,
+                        train=True, rngs={'dropout': dropout_key},
+                        params=grad_params, return_activations=True)
+                else:
+                    v_prime, logvars, activations = train_state.call_model(
+                        x_t_flat, t_rep, dt_base_rep, labels_rep,
+                        train=True, rngs={'dropout': dropout_key},
+                        params=grad_params, return_activations=True)
+
+                # MSE per sample*mode -> reshape [B, M].
+                mse_flat = jnp.mean((v_prime - v_t_flat) ** 2, axis=(1, 2, 3))  # [B*M]
+                mse_bm = mse_flat.reshape(B, M)
+
+                # Weight by q_top.
+                if FLAGS.model['gmm_stop_gradient_q_top']:
+                    q_top_w = jax.lax.stop_gradient(q_top)
+                else:
+                    q_top_w = q_top
+                weighted_mse = jnp.sum(q_top_w * mse_bm, axis=-1)  # [B]
+                loss_fm = jnp.mean(weighted_mse)
+
+                # Auxiliary losses (use dense full-K posterior).
+                loss_mix = compute_mix_loss(log_mixprob)
+                loss_bal = compute_bal_loss(q_full)
+                loss_varreg = compute_var_reg_loss(
+                    prior_params['r_raw'], FLAGS.model['gmm_cov_eps'])
+
+                # Warmup logic.
+                lambda_mix = FLAGS.model['gmm_mix_weight']
+                lambda_bal = FLAGS.model['gmm_bal_weight']
+                lambda_varreg = FLAGS.model['gmm_varreg_weight']
+                if FLAGS.model['gmm_use_warmup']:
+                    is_warmup = train_state.step < FLAGS.model['gmm_warmup_iters']
+                    if FLAGS.model['gmm_warmup_mode'] == 'mix_only':
+                        warmup_loss = lambda_mix * loss_mix + lambda_varreg * loss_varreg
+                    else:  # mix_bal
+                        warmup_loss = lambda_mix * loss_mix + \
+                            lambda_bal * loss_bal + lambda_varreg * loss_varreg
+                    full_loss = loss_fm + lambda_mix * \
+                        loss_mix + lambda_bal * loss_bal + lambda_varreg * loss_varreg
+                    loss = jnp.where(is_warmup, warmup_loss, full_loss)
+                else:
+                    loss = loss_fm + lambda_mix * loss_mix + \
+                        lambda_bal * loss_bal + lambda_varreg * loss_varreg
+
+                # Logging.
+                x0_norms = jnp.sqrt(jnp.sum(x0_flat_bmd ** 2, axis=-1))  # [B, M]
+                mean_q = jnp.mean(q_full, axis=0)  # [K]
+                var_all = jax.nn.softplus(prior_params['r_raw']) ** 2 + \
+                    FLAGS.model['gmm_cov_eps']
+                info = {
+                    'loss': loss,
+                    'loss_flow': loss_fm,
+                    'loss_mix': loss_mix,
+                    'loss_bal': loss_bal,
+                    'loss_varreg': loss_varreg,
+                    'in_gmm_warmup': jnp.where(
+                        FLAGS.model['gmm_use_warmup'],
+                        (train_state.step < FLAGS.model['gmm_warmup_iters']).astype(jnp.float32),
+                        0.0),
+                    'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                    'source_x0_norm_mean': jnp.mean(x0_norms),
+                    'source_x0_norm_std': jnp.std(x0_norms),
+                    'router_usage_min': jnp.min(mean_q),
+                    'router_usage_max': jnp.max(mean_q),
+                    'prior_var_mean': jnp.mean(var_all),
+                    'prior_var_min': jnp.min(var_all),
+                    'prior_var_max': jnp.max(var_all),
+                    'prior_var_dev_abs_mean': jnp.mean(jnp.abs(var_all - 1.0)),
+                    'has_nan_loss': jnp.any(jnp.isnan(loss)).astype(jnp.float32),
+                    **router_stats,
+                    **source_stats,
+                    **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
+                }
+                return loss, info
+
+        else:
+            # All other train types: get_targets outside loss_fn.
+            if FLAGS.model['train_type'] == 'naive':
+                from baselines.targets_naive import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+            elif FLAGS.model['train_type'] == 'shortcut':
+                from targets_shortcut import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+            elif FLAGS.model['train_type'] == 'progressive':
+                from baselines.targets_progressive import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
+            elif FLAGS.model['train_type'] == 'consistency-distillation':
+                from baselines.targets_consistency_distillation import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
+            elif FLAGS.model['train_type'] == 'consistency':
+                from baselines.targets_consistency_training import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+            elif FLAGS.model['train_type'] == 'livereflow':
+                from baselines.targets_livereflow import get_targets
+                x_t, v_t, t, dt_base, labels, info = get_targets(
+                    FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+
+            def loss_fn(grad_params):
+                v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
+                                                                       'dropout': dropout_key}, params=grad_params, return_activations=True)
+                mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+                loss = jnp.mean(mse_v)
+
+                info = {
+                    'loss': loss,
+                    'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                    **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
+                }
+
+                if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
+                    bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
+                    info['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
+                    info['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
+
+                return loss, info
 
         grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
         info = {**info, **new_info}
@@ -300,9 +515,15 @@ def main(_):
         return train_state, info
 
     if FLAGS.mode != 'train':
-        do_inference(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
-                     get_fid_activations, imagenet_labels, visualize_labels,
-                     fid_from_stats, truth_fid_stats)
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            from helper_inference_projected_gmm import do_inference as do_inference_gmm
+            do_inference_gmm(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                         get_fid_activations, imagenet_labels, visualize_labels,
+                         fid_from_stats, truth_fid_stats)
+        else:
+            do_inference(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                         get_fid_activations, imagenet_labels, visualize_labels,
+                         fid_from_stats, truth_fid_stats)
         return
 
     ###################################
@@ -352,9 +573,15 @@ def main(_):
                     lambda x: x, out_shardings=train_state_sharding)(train_state)
 
         if i % FLAGS.eval_interval == 0:
-            eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
-                       get_fid_activations, imagenet_labels, visualize_labels,
-                       fid_from_stats, truth_fid_stats)
+            if FLAGS.model['train_type'] == 'projected_diag_gmm':
+                from helper_eval_projected_gmm import eval_model as eval_model_gmm
+                eval_model_gmm(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                           get_fid_activations, imagenet_labels, visualize_labels,
+                           fid_from_stats, truth_fid_stats)
+            else:
+                eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                           get_fid_activations, imagenet_labels, visualize_labels,
+                           fid_from_stats, truth_fid_stats)
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             train_state_gather = jax.experimental.multihost_utils.process_allgather(
