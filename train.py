@@ -571,6 +571,19 @@ def main(_):
             valid_update_info = jax.tree_map(
                 lambda x: x.mean(), valid_update_info)
             train_metrics['training/loss_valid'] = valid_update_info['loss']
+            if 'loss_flow' in valid_update_info:
+                train_metrics['training/loss_flow_valid'] = valid_update_info['loss_flow']
+            # Log key valid components to compare apples-to-apples with training metrics.
+            valid_keys = (
+                'loss_mix',
+                'loss_mix_raw',
+                'loss_bal',
+                'loss_varreg',
+                'prior_var_dev_abs_mean',
+            )
+            for k in valid_keys:
+                if k in valid_update_info:
+                    train_metrics[f'training/{k}_valid'] = valid_update_info[k]
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
