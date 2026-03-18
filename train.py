@@ -73,6 +73,7 @@ model_config = ml_collections.ConfigDict({
     'gmm_top_m': 1,
     'gmm_use_router_cond': 0,
     'gmm_mix_weight': 1.0,
+    'gmm_mix_normalize_by_dim': 1,
     'gmm_bal_weight': 0.01,
     'gmm_varreg_weight': 0.01,
     'gmm_proj_eps': 1e-6,
@@ -398,7 +399,14 @@ def main(_):
                 loss_fm = jnp.mean(weighted_mse)
 
                 # Auxiliary losses (use dense full-K posterior).
-                loss_mix = compute_mix_loss(log_mixprob)
+                loss_mix_raw = compute_mix_loss(log_mixprob)
+                if FLAGS.model['gmm_mix_normalize_by_dim']:
+                    mix_norm_factor = jnp.asarray(
+                        x1_flat.shape[-1], dtype=loss_mix_raw.dtype)
+                    loss_mix = loss_mix_raw / mix_norm_factor
+                else:
+                    mix_norm_factor = jnp.asarray(1.0, dtype=loss_mix_raw.dtype)
+                    loss_mix = loss_mix_raw
                 loss_bal = compute_bal_loss(q_full)
                 loss_varreg = compute_var_reg_loss(
                     prior_params['r_raw'], FLAGS.model['gmm_cov_eps'])
@@ -430,6 +438,8 @@ def main(_):
                     'loss': loss,
                     'loss_flow': loss_fm,
                     'loss_mix': loss_mix,
+                    'loss_mix_raw': loss_mix_raw,
+                    'loss_mix_norm_factor': mix_norm_factor,
                     'loss_bal': loss_bal,
                     'loss_varreg': loss_varreg,
                     'in_gmm_warmup': jnp.where(

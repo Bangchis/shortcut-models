@@ -133,6 +133,7 @@ python train.py \
 | `gmm_top_m` | int | 1 | Top-M modes per sample for flow loss |
 | `gmm_use_router_cond` | int | 0 | Enable router conditioning in model (0/1) |
 | `gmm_mix_weight` | float | 1.0 | Weight for mixture NLL loss |
+| `gmm_mix_normalize_by_dim` | int | 1 | Normalize `loss_mix` by latent dim D (recommended to avoid loss scale domination) |
 | `gmm_bal_weight` | float | 0.01 | Weight for balance loss |
 | `gmm_varreg_weight` | float | 0.01 | Weight for variance regularizer to keep diag covariance near identity |
 | `gmm_proj_eps` | float | 1e-6 | Epsilon for safe projection |
@@ -195,7 +196,8 @@ v_t = x_1 - (1-1e-5) * x_0
 ```
 L_FM = (1/B) * sum_i sum_{k in S_M(i)} q_top(k|x1_i) * ||v_theta(x_t_i^k, t_i) - v_t_i^k||^2
 
-L_mix = -(1/B) * sum_i log(sum_k pi_k * N(x1_i; mu_k, Sigma_k))
+L_mix_raw = -(1/B) * sum_i log(sum_k pi_k * N(x1_i; mu_k, Sigma_k))
+L_mix = L_mix_raw / D    (when gmm_mix_normalize_by_dim=1)
 
 L_bal = sum_k (mean_q_k - 1/K)^2
 
@@ -253,6 +255,8 @@ Controls whether gradient from flow loss flows through `q_top` into the router:
 | `source_x0_norm_mean` | Mean norm of source after projection+radius | Should be ~1.0 |
 | `source_proj_denom_min` | Min projection denominator | Near 0 = source near origin |
 | `loss_mix` | GMM NLL | Should decrease during warm-up |
+| `loss_mix_raw` | Unnormalized GMM NLL | Can be very large because it scales with latent dimension D |
+| `loss_mix_norm_factor` | Mix normalization divisor | Typically equals latent dim D |
 | `loss_bal` | Balance penalty | Should be small (~0.01) |
 | `loss_varreg` | Unit-variance regularization | Should decrease/stabilize when covariance drifts |
 | `prior_var_dev_abs_mean` | Mean absolute deviation of variance from 1 | Near 0 = covariance close to identity |
