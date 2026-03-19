@@ -230,6 +230,7 @@ When `gmm_fm_pretrain_iters > 0`, the first N steps use:
 - `x0 ~ N(0, I)` (scaled by `gmm_fm_pretrain_noise_std`)
 - optional random pairing `x1 <- x1[perm]` when `gmm_fm_pretrain_random_pair=1`
 - only `L_FM` active (all auxiliary losses are disabled in this phase)
+- prior is frozen (no prior gradient/update, including no AdamW decay update on prior params)
 
 After this phase, training automatically switches back to standard projected-GMM losses.
 

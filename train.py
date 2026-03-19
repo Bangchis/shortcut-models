@@ -559,8 +559,31 @@ def main(_):
 
         grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
         info = {**info, **new_info}
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            # During FM-only pretrain, freeze prior completely:
+            # 1) zero prior grads
+            # 2) zero prior optimizer updates (to avoid AdamW weight decay moving prior)
+            is_fm_pretrain_global = train_state.step < FLAGS.model['gmm_fm_pretrain_iters']
+            zero_prior_grads = jax.tree_map(jnp.zeros_like, grads['prior'])
+            grads = {
+                **grads,
+                'prior': jax.tree_map(
+                    lambda g, z: jnp.where(is_fm_pretrain_global, z, g),
+                    grads['prior'],
+                    zero_prior_grads),
+            }
+            info['prior_frozen'] = is_fm_pretrain_global.astype(jnp.float32)
         updates, new_opt_state = train_state.tx.update(
             grads, train_state.opt_state, train_state.params)
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            zero_prior_updates = jax.tree_map(jnp.zeros_like, updates['prior'])
+            updates = {
+                **updates,
+                'prior': jax.tree_map(
+                    lambda u, z: jnp.where(is_fm_pretrain_global, z, u),
+                    updates['prior'],
+                    zero_prior_updates),
+            }
         new_params = optax.apply_updates(train_state.params, updates)
 
         info['grad_norm'] = optax.global_norm(grads)
