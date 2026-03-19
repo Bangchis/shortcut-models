@@ -76,6 +76,11 @@ model_config = ml_collections.ConfigDict({
     'gmm_mix_normalize_by_dim': 1,
     'gmm_bal_weight': 0.01,
     'gmm_varreg_weight': 0.01,
+    # Optional FM-only pretrain phase for robustness:
+    # first N steps use Gaussian x0 + random pairing and disable auxiliary GMM losses.
+    'gmm_fm_pretrain_iters': 0,
+    'gmm_fm_pretrain_noise_std': 1.0,
+    'gmm_fm_pretrain_random_pair': 1,
     'gmm_proj_eps': 1e-6,
     'gmm_cov_eps': 1e-6,
     'gmm_use_warmup': 0,
@@ -348,15 +353,35 @@ def main(_):
                 top_idx, q_top = select_top_m(q_full, M)
 
                 # Sample projected sources (differentiable via reparameterization).
-                x0_dir_bmd, source_stats = sample_projected_sources(
+                x0_dir_bmd, source_stats_gmm = sample_projected_sources(
                     source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])
 
                 # Apply per-sample radius (stop_gradient on r).
-                x0_flat_bmd = apply_sample_radius(x0_dir_bmd, r_scalar)  # [B, M, D]
+                x0_flat_bmd_gmm = apply_sample_radius(x0_dir_bmd, r_scalar)  # [B, M, D]
+
+                # Optional FM-only pretrain phase:
+                # - source x0 from Gaussian
+                # - random pairing for x1
+                # - disable auxiliary GMM losses
+                is_fm_pretrain = train_state.step < FLAGS.model['gmm_fm_pretrain_iters']
+                pair_key, noise_key = jax.random.split(source_key, 2)
+                if FLAGS.model['gmm_fm_pretrain_random_pair']:
+                    pair_perm = jax.random.permutation(pair_key, B)
+                    x1_flow = images[pair_perm]
+                else:
+                    x1_flow = images
+                x1_flow = jnp.where(is_fm_pretrain, x1_flow, images)
+
+                noise_std = jnp.asarray(
+                    FLAGS.model['gmm_fm_pretrain_noise_std'], dtype=jnp.float32)
+                x0_flat_bmd_pre = noise_std * jax.random.normal(
+                    noise_key, (B, M, x1_flat.shape[-1]), dtype=jnp.float32)
+                x0_flat_bmd = jnp.where(
+                    is_fm_pretrain, x0_flat_bmd_pre, x0_flat_bmd_gmm)
 
                 # Unflatten to spatial.
                 x0_bmhwc = unflatten_latent(x0_flat_bmd, (H, W, C))  # [B, M, H, W, C]
-                x1_bmhwc = images[:, None, :, :, :]  # [B, 1, H, W, C] -> broadcast
+                x1_bmhwc = x1_flow[:, None, :, :, :]  # [B, 1, H, W, C] -> broadcast
 
                 # Build flow pair.
                 t_full = t[:, None, None, None, None]  # [B, 1, 1, 1, 1]
@@ -395,7 +420,9 @@ def main(_):
                     q_top_w = jax.lax.stop_gradient(q_top)
                 else:
                     q_top_w = q_top
-                weighted_mse = jnp.sum(q_top_w * mse_bm, axis=-1)  # [B]
+                q_uniform = jnp.ones_like(q_top_w) / jnp.asarray(M, dtype=q_top_w.dtype)
+                q_flow = jnp.where(is_fm_pretrain, q_uniform, q_top_w)
+                weighted_mse = jnp.sum(q_flow * mse_bm, axis=-1)  # [B]
                 loss_fm = jnp.mean(weighted_mse)
 
                 # Auxiliary losses (use dense full-K posterior).
@@ -424,10 +451,31 @@ def main(_):
                             lambda_bal * loss_bal + lambda_varreg * loss_varreg
                     full_loss = loss_fm + lambda_mix * \
                         loss_mix + lambda_bal * loss_bal + lambda_varreg * loss_varreg
-                    loss = jnp.where(is_warmup, warmup_loss, full_loss)
+                    full_loss = jnp.where(is_warmup, warmup_loss, full_loss)
                 else:
-                    loss = loss_fm + lambda_mix * loss_mix + \
+                    full_loss = loss_fm + lambda_mix * loss_mix + \
                         lambda_bal * loss_bal + lambda_varreg * loss_varreg
+
+                # FM-only pretrain overrides auxiliary losses.
+                loss = jnp.where(is_fm_pretrain, loss_fm, full_loss)
+                loss_mix_logged = jnp.where(is_fm_pretrain, 0.0, loss_mix)
+                loss_mix_raw_logged = jnp.where(is_fm_pretrain, 0.0, loss_mix_raw)
+                loss_bal_logged = jnp.where(is_fm_pretrain, 0.0, loss_bal)
+                loss_varreg_logged = jnp.where(is_fm_pretrain, 0.0, loss_varreg)
+
+                pre_norm = jnp.sqrt(jnp.sum(x0_flat_bmd_pre ** 2, axis=-1))
+                source_proj_denom_min = jnp.where(
+                    is_fm_pretrain,
+                    jnp.min(pre_norm),
+                    source_stats_gmm['source_proj_denom_min'])
+                has_nan_source = jnp.where(
+                    is_fm_pretrain,
+                    jnp.any(jnp.isnan(x0_flat_bmd_pre)).astype(jnp.float32),
+                    source_stats_gmm['has_nan_source'])
+                source_stats = {
+                    'source_proj_denom_min': source_proj_denom_min,
+                    'has_nan_source': has_nan_source,
+                }
 
                 # Logging.
                 x0_norms = jnp.sqrt(jnp.sum(x0_flat_bmd ** 2, axis=-1))  # [B, M]
@@ -437,11 +485,12 @@ def main(_):
                 info = {
                     'loss': loss,
                     'loss_flow': loss_fm,
-                    'loss_mix': loss_mix,
-                    'loss_mix_raw': loss_mix_raw,
+                    'loss_mix': loss_mix_logged,
+                    'loss_mix_raw': loss_mix_raw_logged,
                     'loss_mix_norm_factor': mix_norm_factor,
-                    'loss_bal': loss_bal,
-                    'loss_varreg': loss_varreg,
+                    'loss_bal': loss_bal_logged,
+                    'loss_varreg': loss_varreg_logged,
+                    'in_gmm_fm_pretrain': is_fm_pretrain.astype(jnp.float32),
                     'in_gmm_warmup': jnp.where(
                         FLAGS.model['gmm_use_warmup'],
                         (train_state.step < FLAGS.model['gmm_warmup_iters']).astype(jnp.float32),

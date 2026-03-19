@@ -136,6 +136,9 @@ python train.py \
 | `gmm_mix_normalize_by_dim` | int | 1 | Normalize `loss_mix` by latent dim D (recommended to avoid loss scale domination) |
 | `gmm_bal_weight` | float | 0.01 | Weight for balance loss |
 | `gmm_varreg_weight` | float | 0.01 | Weight for variance regularizer to keep diag covariance near identity |
+| `gmm_fm_pretrain_iters` | int | 0 | First N steps run FM-only pretrain (Gaussian source + no mix/bal/varreg) |
+| `gmm_fm_pretrain_noise_std` | float | 1.0 | Std of Gaussian source used during FM-only pretrain |
+| `gmm_fm_pretrain_random_pair` | int | 1 | Randomly permute x1 pairing during FM-only pretrain (0/1) |
 | `gmm_proj_eps` | float | 1e-6 | Epsilon for safe projection |
 | `gmm_cov_eps` | float | 1e-6 | Covariance floor for diagonal Gaussian |
 | `gmm_use_warmup` | int | 0 | Enable GMM warm-up phase (0/1) |
@@ -219,6 +222,16 @@ When `gmm_use_warmup=1`, the first `gmm_warmup_iters` steps train only the prior
 - **`mix_bal`**: `L = lambda_mix * L_mix + lambda_bal * L_bal`. Also encourages balanced mode usage during warm-up.
 
 After warm-up, switches to the full loss automatically (via `jnp.where` for JIT compatibility).
+
+## 8.1 FM-Only Pretrain (Gaussian + Random Pairing)
+
+When `gmm_fm_pretrain_iters > 0`, the first N steps use:
+
+- `x0 ~ N(0, I)` (scaled by `gmm_fm_pretrain_noise_std`)
+- optional random pairing `x1 <- x1[perm]` when `gmm_fm_pretrain_random_pair=1`
+- only `L_FM` active (all auxiliary losses are disabled in this phase)
+
+After this phase, training automatically switches back to standard projected-GMM losses.
 
 ---
 
