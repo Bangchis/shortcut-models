@@ -36,7 +36,7 @@ Input: batch of images
     |    1. Sample t ~ Uniform{0..T-1}/T
     |    2. Sample dt_base = log2(T)
     |    3. Apply label dropout for CFG
-    |    4. Sample radius r ~ logit-normal on [0.9, 1.1]
+    |    4. Sample radius r ~ logit-normal on [63.75, 64.25]
     |         |
     |    [Inside loss_fn - differentiable]
     |    5. Flatten x_1 -> [B, 4096]
@@ -144,8 +144,8 @@ python train.py \
 | `gmm_use_warmup` | int | 0 | Enable GMM warm-up phase (0/1) |
 | `gmm_warmup_iters` | int | 0 | Number of warm-up iterations |
 | `gmm_warmup_mode` | str | "mix_only" | Warm-up loss: "mix_only" or "mix_bal" |
-| `gmm_radius_low` | float | 0.9 | Lower bound for radius sampling |
-| `gmm_radius_high` | float | 1.1 | Upper bound for radius sampling |
+| `gmm_radius_low` | float | 63.75 | Lower bound for radius sampling |
+| `gmm_radius_high` | float | 64.25 | Upper bound for radius sampling |
 | `gmm_radius_mu` | float | 0.0 | Mean of logit-normal for radius |
 | `gmm_radius_sigma` | float | 0.25 | Std of logit-normal for radius |
 | `gmm_use_prior_ema` | int | 1 | Use EMA prior params for inference (0/1) |
