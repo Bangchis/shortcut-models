@@ -9,12 +9,10 @@ import os
 from functools import partial
 from absl import app, flags
 
-from utils.projected_diag_gmm import sigma_from_raw, safe_project
-from baselines.targets_projected_diag_gmm import sample_batch_radius
+from utils.projected_diag_gmm import sigma_from_raw, safe_project, sample_chi_radius
 
 
-def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6,
-                       r_low=0.9, r_high=1.1, r_mu=0.0, r_sigma=0.25):
+def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6):
     """Sample source from GMM prior for inference.
     Returns: x0 [B, H, W, C].
     """
@@ -43,8 +41,8 @@ def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6,
     # Project onto sphere.
     x0_dir, _ = safe_project(y, eps_proj)
 
-    # Sample radius.
-    r = sample_batch_radius(radius_key, B, r_low, r_high, r_mu, r_sigma)  # [B]
+    # Sample radius R ~ Chi(D): R = sqrt(U), U ~ ChiSquare(D).
+    r = sample_chi_radius(radius_key, B, D)  # [B]
     x0_flat = x0_dir * r[:, None]
 
     # Reshape to spatial.
@@ -79,8 +77,7 @@ def do_inference(
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
 
-        prior_params = train_state.get_prior_params(
-            use_ema=bool(FLAGS.model.get('gmm_use_prior_ema', 1)))
+        prior_params = train_state.get_prior_params(use_ema=False)
 
         def process_img(img):
             img = jnp.squeeze(img)
@@ -124,9 +121,7 @@ def do_inference(
             # GMM source init instead of jax.random.normal.
             x = sample_gmm_source(
                 eps_key, prior_params, images_shape,
-                FLAGS.model['gmm_proj_eps'],
-                FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
-                FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
+                FLAGS.model['gmm_proj_eps'])
 
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)

@@ -8,12 +8,10 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 from functools import partial
 
-from utils.projected_diag_gmm import sigma_from_raw, safe_project
-from baselines.targets_projected_diag_gmm import sample_batch_radius
+from utils.projected_diag_gmm import sigma_from_raw, safe_project, sample_chi_radius
 
 
-def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6,
-                       r_low=0.9, r_high=1.1, r_mu=0.0, r_sigma=0.25):
+def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6):
     """Sample source from GMM prior for eval.
     Returns: x0 [B, H, W, C].
     """
@@ -38,7 +36,7 @@ def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6,
 
     x0_dir, _ = safe_project(y, eps_proj)
 
-    r = sample_batch_radius(radius_key, B, r_low, r_high, r_mu, r_sigma)
+    r = sample_chi_radius(radius_key, B, D)
     x0_flat = x0_dir * r[:, None]
 
     x0 = x0_flat.reshape(B, H, W, C)
@@ -79,22 +77,17 @@ def eval_model(
         labels_uncond = shard_data(jnp.ones(
             batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes'])
 
-        prior_params = train_state.get_prior_params(
-            use_ema=bool(FLAGS.model.get('gmm_use_prior_ema', 1)))
+        prior_params = train_state.get_prior_params(use_ema=False)
 
         # GMM source noise (fixed seed for reproducibility).
         FIX_EVAL_NOISE_SEED = 42
         eval_key = jax.random.PRNGKey(FIX_EVAL_NOISE_SEED)
         eps_eval = sample_gmm_source(
             eval_key, prior_params, batch_images.shape,
-            FLAGS.model['gmm_proj_eps'],
-            FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
-            FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
+            FLAGS.model['gmm_proj_eps'])
         eps = sample_gmm_source(
             key, prior_params, batch_images.shape,
-            FLAGS.model['gmm_proj_eps'],
-            FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
-            FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
+            FLAGS.model['gmm_proj_eps'])
 
         def process_img(img):
             print(f"Debug: Original img shape: {img.shape}")
@@ -160,9 +153,9 @@ def eval_model(
             if 'loss_flow' in infos:
                 axs[1, d].plot(time_axis, infos['loss_flow'])
                 axs[1, d].set_title(f"Flow {d}")
-            if 'loss_mix' in infos:
-                axs[2, d].plot(time_axis, infos['loss_mix'])
-                axs[2, d].set_title(f"Mix {d}")
+            if 'loss_mix_pre' in infos:
+                axs[2, d].plot(time_axis, infos['loss_mix_pre'])
+                axs[2, d].set_title(f"MixPre {d}")
 
             if jax.process_index() == 0:
                 fig.tight_layout()
@@ -252,9 +245,7 @@ def eval_model(
                 # GMM source init.
                 x = sample_gmm_source(
                     eps_key, prior_params, images_shape,
-                    FLAGS.model['gmm_proj_eps'],
-                    FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
-                    FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
+                    FLAGS.model['gmm_proj_eps'])
 
                 labels = jax.random.randint(
                     label_key, (images_shape[0],), 0, FLAGS.model.num_classes)

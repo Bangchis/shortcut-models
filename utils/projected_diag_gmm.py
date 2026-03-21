@@ -53,6 +53,19 @@ def safe_project(y, eps_proj=1e-6):
     return projected, denom_min
 
 
+def project_to_shell(x_flat, target_radius, eps_proj=1e-6):
+    """Project vectors to a sphere with fixed radius.
+    x_flat: [B, D].
+    target_radius: scalar.
+    Returns:
+      y_shell: [B, D], each sample has norm approximately target_radius.
+      denom_min: minimum denominator for debugging.
+    """
+    x_dir, denom_min = safe_project(x_flat, eps_proj=eps_proj)
+    radius = jnp.asarray(target_radius, dtype=x_dir.dtype)
+    return x_dir * radius, denom_min
+
+
 def sigma_from_raw(r_raw):
     """Convert unconstrained r_raw to positive sigma via softplus.
     r_raw: [K, D] -> [K, D].
@@ -117,6 +130,15 @@ def compute_router_posterior(x1_flat, prior_params, eps_cov=1e-6):
     return q_full, log_mixprob, stats
 
 
+def select_hard_top1(q_full):
+    """Hard top-1 routing indices with explicit stop_gradient.
+    q_full: [B, K].
+    Returns: top_idx [B] int32.
+    """
+    top_idx = jnp.argmax(q_full, axis=-1).astype(jnp.int32)
+    return jax.lax.stop_gradient(top_idx)
+
+
 def select_top_m(q_full, top_m):
     """Select top-M modes per sample and renormalize.
     q_full: [B, K].
@@ -125,6 +147,36 @@ def select_top_m(q_full, top_m):
     top_vals, top_idx = jax.lax.top_k(q_full, top_m)  # [B, M] each
     q_top = top_vals / jnp.sum(top_vals, axis=-1, keepdims=True)  # [B, M]
     return top_idx, q_top
+
+
+def sample_chi_radius(key, batch_size, dim, eps=1e-12):
+    """Sample radius R ~ Chi(dim) by R = sqrt(U), U ~ ChiSquare(dim)."""
+    dim = jnp.asarray(dim, dtype=jnp.float32)
+    u = jax.random.chisquare(key, dim, shape=(batch_size,), dtype=jnp.float32)
+    return jnp.sqrt(jnp.maximum(u, eps))
+
+
+def sample_projected_sources_hard_top1(key, prior_params, top_idx, eps_proj=1e-6):
+    """Sample source directions for hard top-1 routing.
+    key: PRNG key.
+    prior_params: dict with mu [K,D], r_raw [K,D].
+    top_idx: [B] hard mode index.
+    Returns: x0_dir [B, D], stats dict.
+    """
+    mu = prior_params['mu'].astype(jnp.float32)   # [K, D]
+    sigma = sigma_from_raw(prior_params['r_raw'])  # [K, D]
+
+    mu_sel = mu[top_idx]        # [B, D]
+    sigma_sel = sigma[top_idx]  # [B, D]
+
+    eps = jax.random.normal(key, mu_sel.shape, dtype=jnp.float32)  # [B, D]
+    y = mu_sel + sigma_sel * eps
+    x0_dir, proj_denom_min = safe_project(y, eps_proj)
+    stats = {
+        'source_proj_denom_min': proj_denom_min,
+        'has_nan_source': jnp.any(jnp.isnan(x0_dir)).astype(jnp.float32),
+    }
+    return x0_dir, stats
 
 
 def sample_projected_sources(key, prior_params, top_idx, eps_proj=1e-6):
@@ -200,13 +252,11 @@ def compute_bal_loss(q_full):
 
 
 def compute_var_reg_loss(r_raw, eps_cov=1e-6):
-    """Variance regularization toward unit covariance.
-    Uses KL[N(mu, diag(var)) || N(mu, I)] per-dimension, averaged over [K, D]:
-        0.5 * (var - 1 - log(var))
-    This is zero at var=1 and positive otherwise.
+    """Variance-only regularization toward unit variance.
+    L_var = mean_{k,d} (log(var_{k,d}))^2, where:
+      var_{k,d} = softplus(r_raw_{k,d})^2 + eps_cov.
     """
     sigma = sigma_from_raw(r_raw)  # [K, D]
     var = sigma ** 2 + eps_cov     # [K, D]
     log_var = jnp.clip(jnp.log(var), -20.0, 20.0)
-    kl_dim = 0.5 * (var - 1.0 - log_var)
-    return jnp.mean(kl_dim)
+    return jnp.mean(jnp.square(log_var))

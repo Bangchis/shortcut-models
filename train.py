@@ -72,17 +72,31 @@ model_config = ml_collections.ConfigDict({
     'gmm_num_modes': 8,
     'gmm_top_m': 1,
     'gmm_use_router_cond': 0,
+    # Stage scheduler: A (GMM warmup), B (FM Gaussian warmup), C (joint).
+    'gmm_stage_a_iters': 0,
+    'gmm_stage_b_iters': 0,
+    # Prior update accumulation during stage C.
+    'gmm_prior_accum_steps': 10,
+    # Stage A loss weights.
+    'gmm_stage_a_mix_weight': 1.0,
+    'gmm_stage_a_bal_weight': 0.01,
+    'gmm_stage_a_var_weight': 0.01,
+    # Stage C joint loss weights.
+    'gmm_joint_bal_weight': 0.01,
+    'gmm_joint_var_weight': 0.01,
+    # Stage B FM source controls.
+    'gmm_stage_b_noise_std': 1.0,
+    'gmm_stage_b_random_pair': 1,
+    'gmm_proj_eps': 1e-6,
+    'gmm_cov_eps': 1e-6,
+    # Legacy flags (kept only for compatibility; ignored by the new stage-based implementation).
     'gmm_mix_weight': 1.0,
-    'gmm_mix_normalize_by_dim': 1,
     'gmm_bal_weight': 0.01,
     'gmm_varreg_weight': 0.01,
-    # Optional FM-only pretrain phase for robustness:
-    # first N steps use Gaussian x0 + random pairing and disable auxiliary GMM losses.
+    'gmm_mix_normalize_by_dim': 1,
     'gmm_fm_pretrain_iters': 0,
     'gmm_fm_pretrain_noise_std': 1.0,
     'gmm_fm_pretrain_random_pair': 1,
-    'gmm_proj_eps': 1e-6,
-    'gmm_cov_eps': 1e-6,
     'gmm_use_warmup': 0,
     'gmm_warmup_iters': 0,
     'gmm_warmup_mode': 'mix_only',
@@ -131,6 +145,13 @@ def main(_):
                           local_batch_size, True, FLAGS.debug_overfit)
     dataset_valid = get_dataset(
         FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit)
+    if FLAGS.model['train_type'] == 'projected_diag_gmm':
+        if FLAGS.model['gmm_top_m'] != 1:
+            print(
+                f"[projected_diag_gmm] hard top-1 is enforced; ignoring gmm_top_m={FLAGS.model['gmm_top_m']}."
+            )
+        if FLAGS.model.get('gmm_use_warmup', 0) or FLAGS.model.get('gmm_warmup_iters', 0) > 0:
+            print("[projected_diag_gmm] legacy gmm_use_warmup/gmm_warmup_* is ignored in stage-based training.")
     example_obs, example_labels = next(dataset)
     example_obs = example_obs[:1]
     example_obs_shape = example_obs.shape
@@ -220,9 +241,11 @@ def main(_):
 
             D = int(np.prod(example_obs_shape[1:]))
             K = FLAGS.model['gmm_num_modes']
-            assert FLAGS.model['gmm_top_m'] <= K, f"gmm_top_m={FLAGS.model['gmm_top_m']} > gmm_num_modes={K}"
-            assert FLAGS.model['gmm_warmup_mode'] in ('mix_only', 'mix_bal'), \
-                f"Unknown gmm_warmup_mode: {FLAGS.model['gmm_warmup_mode']}"
+            assert K >= 1, f"gmm_num_modes must be >=1, got {K}"
+            assert FLAGS.model['gmm_prior_accum_steps'] >= 1, \
+                f"gmm_prior_accum_steps must be >=1, got {FLAGS.model['gmm_prior_accum_steps']}"
+            assert FLAGS.model['gmm_stage_a_iters'] >= 0 and FLAGS.model['gmm_stage_b_iters'] >= 0, \
+                "gmm_stage_a_iters and gmm_stage_b_iters must be non-negative."
             prior_params = {
                 'pi_logits': jnp.zeros((K,), dtype=jnp.float32),
                 'mu': 0.02 * jax.random.normal(prior_key, (K, D), dtype=jnp.float32),
@@ -315,15 +338,17 @@ def main(_):
                 labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
 
         if FLAGS.model['train_type'] == 'projected_diag_gmm':
-            from baselines.targets_projected_diag_gmm import sample_time_and_labels, apply_label_dropout, sample_batch_radius
+            from baselines.targets_projected_diag_gmm import sample_time_and_labels, apply_label_dropout
             from utils.projected_diag_gmm import (
-                flatten_latent, unflatten_latent, compute_router_posterior,
-                select_top_m, sample_projected_sources, apply_sample_radius,
-                build_sparse_router_cond, compute_mix_loss, compute_bal_loss,
-                compute_var_reg_loss
+                flatten_latent, unflatten_latent, project_to_shell,
+                compute_router_posterior, select_hard_top1,
+                sample_projected_sources_hard_top1, sample_chi_radius,
+                compute_mix_loss, compute_bal_loss, compute_var_reg_loss
             )
 
-            time_key, radius_key, source_key, label_key = jax.random.split(targets_key, 4)
+            time_key, source_key, radius_key, label_key, pair_key, noise_key = jax.random.split(
+                targets_key, 6
+            )
             t, dt_base, pre_info = sample_time_and_labels(time_key, images, FLAGS)
             labels_dropped, dropped_ratio = apply_label_dropout(label_key, labels, FLAGS)
             info['dropped_ratio'] = dropped_ratio
@@ -332,172 +357,159 @@ def main(_):
             force_t_vec = jnp.ones(images.shape[0], dtype=jnp.float32) * force_t
             t = jnp.where(force_t_vec != -1, force_t_vec, t)
 
-            r_scalar = sample_batch_radius(
-                radius_key, images.shape[0],
-                FLAGS.model['gmm_radius_low'], FLAGS.model['gmm_radius_high'],
-                FLAGS.model['gmm_radius_mu'], FLAGS.model['gmm_radius_sigma'])
-
             B = images.shape[0]
             H, W, C = images.shape[1], images.shape[2], images.shape[3]
-            M = FLAGS.model['gmm_top_m']
+            D = H * W * C
+            K = FLAGS.model['gmm_num_modes']
+            target_shell_radius = jnp.sqrt(jnp.asarray(D, dtype=jnp.float32))
+
+            stage_a_iters = jnp.asarray(
+                FLAGS.model['gmm_stage_a_iters'], dtype=jnp.int32)
+            stage_b_iters = jnp.asarray(
+                FLAGS.model['gmm_stage_b_iters'], dtype=jnp.int32)
+            stage_b_end = stage_a_iters + stage_b_iters
+            is_stage_a = train_state.step < stage_a_iters
+            is_stage_b = jnp.logical_and(
+                train_state.step >= stage_a_iters, train_state.step < stage_b_end)
+            is_stage_c = jnp.logical_not(jnp.logical_or(is_stage_a, is_stage_b))
 
             def loss_fn(grad_params):
                 prior_params = grad_params["prior"]
                 x1_flat = flatten_latent(images)  # [B, D]
 
-                # Router posterior (differentiable w.r.t. prior_params).
+                # Route on shell-targets y = R0 * x1 / ||x1||.
+                x1_shell_flat, shell_denom_min = project_to_shell(
+                    x1_flat, target_shell_radius, FLAGS.model['gmm_proj_eps'])
                 q_full, log_mixprob, router_stats = compute_router_posterior(
-                    x1_flat, prior_params, FLAGS.model['gmm_cov_eps'])
+                    x1_shell_flat, prior_params, FLAGS.model['gmm_cov_eps'])
 
-                # Top-M selection.
-                top_idx, q_top = select_top_m(q_full, M)
+                # Hard top-1 routing index (no gradient through argmax).
+                top_idx = select_hard_top1(q_full)  # [B]
 
-                # Sample projected sources (differentiable via reparameterization).
-                x0_dir_bmd, source_stats_gmm = sample_projected_sources(
-                    source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])
+                # Stage C source: selected component -> project to sphere -> chi radius.
+                x0_dir_stage_c, source_stats_gmm = sample_projected_sources_hard_top1(
+                    source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])  # [B, D]
+                r_chi = sample_chi_radius(radius_key, B, D)  # [B]
+                x0_flat_stage_c = x0_dir_stage_c * r_chi[:, None]  # [B, D]
 
-                # Apply per-sample radius (stop_gradient on r).
-                x0_flat_bmd_gmm = apply_sample_radius(x0_dir_bmd, r_scalar)  # [B, M, D]
-
-                # Optional FM-only pretrain phase:
-                # - source x0 from Gaussian
-                # - random pairing for x1
-                # - disable auxiliary GMM losses
-                is_fm_pretrain = train_state.step < FLAGS.model['gmm_fm_pretrain_iters']
-                pair_key, noise_key = jax.random.split(source_key, 2)
-                if FLAGS.model['gmm_fm_pretrain_random_pair']:
+                # Stage B source: Gaussian FM warmup (optionally random pairing).
+                if FLAGS.model['gmm_stage_b_random_pair']:
                     pair_perm = jax.random.permutation(pair_key, B)
-                    x1_flow = images[pair_perm]
+                    x1_flow_stage_b = images[pair_perm]
                 else:
-                    x1_flow = images
-                x1_flow = jnp.where(is_fm_pretrain, x1_flow, images)
-
+                    x1_flow_stage_b = images
                 noise_std = jnp.asarray(
-                    FLAGS.model['gmm_fm_pretrain_noise_std'], dtype=jnp.float32)
-                x0_flat_bmd_pre = noise_std * jax.random.normal(
-                    noise_key, (B, M, x1_flat.shape[-1]), dtype=jnp.float32)
-                x0_flat_bmd = jnp.where(
-                    is_fm_pretrain, x0_flat_bmd_pre, x0_flat_bmd_gmm)
+                    FLAGS.model['gmm_stage_b_noise_std'], dtype=jnp.float32)
+                x0_flat_stage_b = noise_std * jax.random.normal(
+                    noise_key, (B, D), dtype=jnp.float32)
+
+                # Select stage-dependent flow pairs.
+                x1_flow = jnp.where(is_stage_b, x1_flow_stage_b, images)
+                x0_flat = jnp.where(is_stage_b, x0_flat_stage_b, x0_flat_stage_c)
 
                 # Unflatten to spatial.
-                x0_bmhwc = unflatten_latent(x0_flat_bmd, (H, W, C))  # [B, M, H, W, C]
-                x1_bmhwc = x1_flow[:, None, :, :, :]  # [B, 1, H, W, C] -> broadcast
+                x0_bhwc = unflatten_latent(x0_flat, (H, W, C))  # [B, H, W, C]
 
                 # Build flow pair.
-                t_full = t[:, None, None, None, None]  # [B, 1, 1, 1, 1]
-                x_t_bmhwc = (1 - (1 - 1e-5) * t_full) * x0_bmhwc + t_full * x1_bmhwc
-                v_t_bmhwc = x1_bmhwc - (1 - 1e-5) * x0_bmhwc
-
-                # Reshape [B, M, H, W, C] -> [B*M, H, W, C] for single model forward.
-                x_t_flat = x_t_bmhwc.reshape(B * M, H, W, C)
-                v_t_flat = v_t_bmhwc.reshape(B * M, H, W, C)
-                t_rep = jnp.repeat(t, M)                    # [B*M]
-                dt_base_rep = jnp.repeat(dt_base, M)        # [B*M]
-                labels_rep = jnp.repeat(labels_dropped, M)  # [B*M]
+                t_full = t[:, None, None, None]  # [B, 1, 1, 1]
+                x_t = (1 - (1 - 1e-5) * t_full) * x0_bhwc + t_full * x1_flow
+                v_t = x1_flow - (1 - 1e-5) * x0_bhwc
 
                 # Model forward.
                 if FLAGS.model['gmm_use_router_cond']:
-                    router_cond_sparse = build_sparse_router_cond(
-                        top_idx, q_top, FLAGS.model['gmm_num_modes'])
-                    router_cond_rep = jnp.repeat(router_cond_sparse, M, axis=0)
+                    router_cond_hard = jax.nn.one_hot(
+                        top_idx, K, dtype=jnp.float32)
+                    router_cond = jnp.where(
+                        is_stage_c, router_cond_hard, jnp.zeros_like(router_cond_hard))
                     v_prime, logvars, activations = train_state.call_model(
-                        x_t_flat, t_rep, dt_base_rep, labels_rep,
-                        router_cond_rep,
+                        x_t, t, dt_base, labels_dropped,
+                        router_cond,
                         train=True, rngs={'dropout': dropout_key},
                         params=grad_params, return_activations=True)
                 else:
                     v_prime, logvars, activations = train_state.call_model(
-                        x_t_flat, t_rep, dt_base_rep, labels_rep,
+                        x_t, t, dt_base, labels_dropped,
                         train=True, rngs={'dropout': dropout_key},
                         params=grad_params, return_activations=True)
 
-                # MSE per sample*mode -> reshape [B, M].
-                mse_flat = jnp.mean((v_prime - v_t_flat) ** 2, axis=(1, 2, 3))  # [B*M]
-                mse_bm = mse_flat.reshape(B, M)
+                # FM loss.
+                mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+                loss_fm = jnp.mean(mse_v)
 
-                # Weight by q_top.
-                if FLAGS.model['gmm_stop_gradient_q_top']:
-                    q_top_w = jax.lax.stop_gradient(q_top)
-                else:
-                    q_top_w = q_top
-                q_uniform = jnp.ones_like(q_top_w) / jnp.asarray(M, dtype=q_top_w.dtype)
-                q_flow = jnp.where(is_fm_pretrain, q_uniform, q_top_w)
-                weighted_mse = jnp.sum(q_flow * mse_bm, axis=-1)  # [B]
-                loss_fm = jnp.mean(weighted_mse)
-
-                # Auxiliary losses (use dense full-K posterior).
-                loss_mix_raw = compute_mix_loss(log_mixprob)
-                if FLAGS.model['gmm_mix_normalize_by_dim']:
-                    mix_norm_factor = jnp.asarray(
-                        x1_flat.shape[-1], dtype=loss_mix_raw.dtype)
-                    loss_mix = loss_mix_raw / mix_norm_factor
-                else:
-                    mix_norm_factor = jnp.asarray(1.0, dtype=loss_mix_raw.dtype)
-                    loss_mix = loss_mix_raw
+                # GMM losses.
+                mix_norm_factor = jnp.asarray(D, dtype=jnp.float32)
+                loss_mix_pre_raw = compute_mix_loss(log_mixprob)
+                loss_mix_pre = loss_mix_pre_raw / mix_norm_factor
                 loss_bal = compute_bal_loss(q_full)
                 loss_varreg = compute_var_reg_loss(
                     prior_params['r_raw'], FLAGS.model['gmm_cov_eps'])
 
-                # Warmup logic.
-                lambda_mix = FLAGS.model['gmm_mix_weight']
-                lambda_bal = FLAGS.model['gmm_bal_weight']
-                lambda_varreg = FLAGS.model['gmm_varreg_weight']
-                if FLAGS.model['gmm_use_warmup']:
-                    is_warmup = train_state.step < FLAGS.model['gmm_warmup_iters']
-                    if FLAGS.model['gmm_warmup_mode'] == 'mix_only':
-                        warmup_loss = lambda_mix * loss_mix + lambda_varreg * loss_varreg
-                    else:  # mix_bal
-                        warmup_loss = lambda_mix * loss_mix + \
-                            lambda_bal * loss_bal + lambda_varreg * loss_varreg
-                    full_loss = loss_fm + lambda_mix * \
-                        loss_mix + lambda_bal * loss_bal + lambda_varreg * loss_varreg
-                    full_loss = jnp.where(is_warmup, warmup_loss, full_loss)
-                else:
-                    full_loss = loss_fm + lambda_mix * loss_mix + \
-                        lambda_bal * loss_bal + lambda_varreg * loss_varreg
+                # Stage losses.
+                lambda_mix_pre = jnp.asarray(
+                    FLAGS.model['gmm_stage_a_mix_weight'], dtype=jnp.float32)
+                lambda_bal_pre = jnp.asarray(
+                    FLAGS.model['gmm_stage_a_bal_weight'], dtype=jnp.float32)
+                lambda_var_pre = jnp.asarray(
+                    FLAGS.model['gmm_stage_a_var_weight'], dtype=jnp.float32)
+                lambda_bal_joint = jnp.asarray(
+                    FLAGS.model['gmm_joint_bal_weight'], dtype=jnp.float32)
+                lambda_var_joint = jnp.asarray(
+                    FLAGS.model['gmm_joint_var_weight'], dtype=jnp.float32)
 
-                # FM-only pretrain overrides auxiliary losses.
-                loss = jnp.where(is_fm_pretrain, loss_fm, full_loss)
-                loss_mix_logged = jnp.where(is_fm_pretrain, 0.0, loss_mix)
-                loss_mix_raw_logged = jnp.where(is_fm_pretrain, 0.0, loss_mix_raw)
-                loss_bal_logged = jnp.where(is_fm_pretrain, 0.0, loss_bal)
-                loss_varreg_logged = jnp.where(is_fm_pretrain, 0.0, loss_varreg)
+                loss_stage_a = lambda_mix_pre * loss_mix_pre + \
+                    lambda_bal_pre * loss_bal + lambda_var_pre * loss_varreg
+                loss_stage_b = loss_fm
+                loss_stage_c = loss_fm + lambda_bal_joint * \
+                    loss_bal + lambda_var_joint * loss_varreg
+                loss = jnp.where(is_stage_a, loss_stage_a,
+                                 jnp.where(is_stage_b, loss_stage_b, loss_stage_c))
 
-                pre_norm = jnp.sqrt(jnp.sum(x0_flat_bmd_pre ** 2, axis=-1))
+                # Stage-aware logging (no loss_mix branch in stage C).
+                loss_mix_pre_logged = jnp.where(is_stage_a, loss_mix_pre, 0.0)
+                loss_mix_pre_raw_logged = jnp.where(
+                    is_stage_a, loss_mix_pre_raw, 0.0)
+                loss_bal_logged = jnp.where(is_stage_b, 0.0, loss_bal)
+                loss_varreg_logged = jnp.where(is_stage_b, 0.0, loss_varreg)
+
+                pre_norm = jnp.sqrt(jnp.sum(x0_flat_stage_b ** 2, axis=-1))
                 source_proj_denom_min = jnp.where(
-                    is_fm_pretrain,
+                    is_stage_b,
                     jnp.min(pre_norm),
                     source_stats_gmm['source_proj_denom_min'])
                 has_nan_source = jnp.where(
-                    is_fm_pretrain,
-                    jnp.any(jnp.isnan(x0_flat_bmd_pre)).astype(jnp.float32),
+                    is_stage_b,
+                    jnp.any(jnp.isnan(x0_flat_stage_b)).astype(jnp.float32),
                     source_stats_gmm['has_nan_source'])
                 source_stats = {
                     'source_proj_denom_min': source_proj_denom_min,
                     'has_nan_source': has_nan_source,
+                    'target_shell_denom_min': shell_denom_min,
                 }
 
                 # Logging.
-                x0_norms = jnp.sqrt(jnp.sum(x0_flat_bmd ** 2, axis=-1))  # [B, M]
+                x0_norms = jnp.sqrt(jnp.sum(x0_flat ** 2, axis=-1))  # [B]
                 mean_q = jnp.mean(q_full, axis=0)  # [K]
                 var_all = jax.nn.softplus(prior_params['r_raw']) ** 2 + \
                     FLAGS.model['gmm_cov_eps']
+                stage_id = jnp.where(is_stage_a, 0.0,
+                                     jnp.where(is_stage_b, 1.0, 2.0))
                 info = {
                     'loss': loss,
                     'loss_flow': loss_fm,
-                    'loss_mix': loss_mix_logged,
-                    'loss_mix_raw': loss_mix_raw_logged,
-                    'loss_mix_norm_factor': mix_norm_factor,
+                    'loss_mix_pre': loss_mix_pre_logged,
+                    'loss_mix_pre_raw': loss_mix_pre_raw_logged,
+                    'loss_mix_pre_norm_factor': mix_norm_factor,
                     'loss_bal': loss_bal_logged,
                     'loss_varreg': loss_varreg_logged,
-                    'in_gmm_fm_pretrain': is_fm_pretrain.astype(jnp.float32),
-                    'in_gmm_warmup': jnp.where(
-                        FLAGS.model['gmm_use_warmup'],
-                        (train_state.step < FLAGS.model['gmm_warmup_iters']).astype(jnp.float32),
-                        0.0),
+                    'gmm_stage_id': stage_id,
+                    'in_gmm_stage_a': is_stage_a.astype(jnp.float32),
+                    'in_gmm_stage_b': is_stage_b.astype(jnp.float32),
+                    'in_gmm_stage_c': is_stage_c.astype(jnp.float32),
                     'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                     'source_x0_norm_mean': jnp.mean(x0_norms),
                     'source_x0_norm_std': jnp.std(x0_norms),
+                    'source_radius_mean': jnp.mean(r_chi),
+                    'source_radius_std': jnp.std(r_chi),
                     'router_usage_min': jnp.min(mean_q),
                     'router_usage_max': jnp.max(mean_q),
                     'prior_var_mean': jnp.mean(var_all),
@@ -560,27 +572,102 @@ def main(_):
         grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
         info = {**info, **new_info}
         if FLAGS.model['train_type'] == 'projected_diag_gmm':
-            # During FM-only pretrain, freeze prior completely:
-            # 1) zero prior grads
-            # 2) zero prior optimizer updates (to avoid AdamW weight decay moving prior)
-            is_fm_pretrain_global = train_state.step < FLAGS.model['gmm_fm_pretrain_iters']
+            stage_a_iters = jnp.asarray(
+                FLAGS.model['gmm_stage_a_iters'], dtype=jnp.int32)
+            stage_b_iters = jnp.asarray(
+                FLAGS.model['gmm_stage_b_iters'], dtype=jnp.int32)
+            stage_b_end = stage_a_iters + stage_b_iters
+            is_stage_a_global = train_state.step < stage_a_iters
+            is_stage_b_global = jnp.logical_and(
+                train_state.step >= stage_a_iters, train_state.step < stage_b_end)
+            is_stage_c_global = jnp.logical_not(
+                jnp.logical_or(is_stage_a_global, is_stage_b_global))
+
+            zero_model_grads = jax.tree_map(jnp.zeros_like, grads['model'])
             zero_prior_grads = jax.tree_map(jnp.zeros_like, grads['prior'])
+            model_grads = jax.tree_map(
+                lambda g, z: jnp.where(is_stage_a_global, z, g),
+                grads['model'],
+                zero_model_grads,
+            )
+            prior_grads_active = jax.tree_map(
+                lambda g, z: jnp.where(is_stage_b_global, z, g),
+                grads['prior'],
+                zero_prior_grads,
+            )
+
+            accum_steps = jnp.asarray(
+                FLAGS.model['gmm_prior_accum_steps'], dtype=jnp.int32)
+            accum_steps_f = jnp.asarray(
+                FLAGS.model['gmm_prior_accum_steps'], dtype=jnp.float32)
+            accum_candidate = jax.tree_map(
+                lambda acc, g: jnp.where(is_stage_c_global, acc + g, jnp.zeros_like(acc)),
+                train_state.prior_grad_accum,
+                prior_grads_active,
+            )
+            count_candidate = jnp.where(
+                is_stage_c_global, train_state.prior_accum_count + 1, 0)
+            prior_update_stage_c = jnp.logical_and(
+                is_stage_c_global, count_candidate >= accum_steps)
+            prior_grads_avg_stage_c = jax.tree_map(
+                lambda acc: acc / accum_steps_f,
+                accum_candidate,
+            )
+
+            prior_grads_for_update = jax.tree_map(
+                lambda g_a, g_c, z: jnp.where(
+                    is_stage_a_global, g_a, jnp.where(prior_update_stage_c, g_c, z)
+                ),
+                prior_grads_active,
+                prior_grads_avg_stage_c,
+                zero_prior_grads,
+            )
+
             grads = {
                 **grads,
-                'prior': jax.tree_map(
-                    lambda g, z: jnp.where(is_fm_pretrain_global, z, g),
-                    grads['prior'],
-                    zero_prior_grads),
+                'model': model_grads,
+                'prior': prior_grads_for_update,
             }
-            info['prior_frozen'] = is_fm_pretrain_global.astype(jnp.float32)
+
+            # Accumulator update: active only in stage C; reset otherwise.
+            zero_prior_accum = jax.tree_map(jnp.zeros_like, accum_candidate)
+            prior_accum_next = jax.tree_map(
+                lambda acc, z: jnp.where(
+                    jnp.logical_and(is_stage_c_global, jnp.logical_not(prior_update_stage_c)),
+                    acc,
+                    z,
+                ),
+                accum_candidate,
+                zero_prior_accum,
+            )
+            prior_count_next = jnp.where(
+                jnp.logical_and(is_stage_c_global, jnp.logical_not(prior_update_stage_c)),
+                count_candidate,
+                0,
+            )
+            prior_update_applied = jnp.logical_or(
+                is_stage_a_global, prior_update_stage_c)
+
+            info['prior_update_applied'] = prior_update_applied.astype(jnp.float32)
+            info['prior_accum_count'] = prior_count_next.astype(jnp.float32)
+            info['prior_accum_progress'] = prior_count_next.astype(
+                jnp.float32) / accum_steps_f
+            info['prior_frozen'] = jnp.logical_not(prior_update_applied).astype(
+                jnp.float32)
+            info['model_frozen'] = is_stage_a_global.astype(jnp.float32)
         updates, new_opt_state = train_state.tx.update(
             grads, train_state.opt_state, train_state.params)
         if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            zero_model_updates = jax.tree_map(jnp.zeros_like, updates['model'])
             zero_prior_updates = jax.tree_map(jnp.zeros_like, updates['prior'])
             updates = {
                 **updates,
+                'model': jax.tree_map(
+                    lambda u, z: jnp.where(is_stage_a_global, z, u),
+                    updates['model'],
+                    zero_model_updates),
                 'prior': jax.tree_map(
-                    lambda u, z: jnp.where(is_fm_pretrain_global, z, u),
+                    lambda u, z: jnp.where(prior_update_applied, u, z),
                     updates['prior'],
                     zero_prior_updates),
             }
@@ -591,8 +678,18 @@ def main(_):
         info['param_norm'] = optax.global_norm(new_params)
         info['lr'] = lr_schedule(train_state.step)
 
-        train_state = train_state.replace(
-            rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
+        if FLAGS.model['train_type'] == 'projected_diag_gmm':
+            train_state = train_state.replace(
+                rng=new_rng,
+                step=train_state.step + 1,
+                params=new_params,
+                opt_state=new_opt_state,
+                prior_grad_accum=prior_accum_next,
+                prior_accum_count=prior_count_next,
+            )
+        else:
+            train_state = train_state.replace(
+                rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
         train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
         return train_state, info
 
@@ -647,11 +744,15 @@ def main(_):
                 train_metrics['training/loss_flow_valid'] = valid_update_info['loss_flow']
             # Log key valid components to compare apples-to-apples with training metrics.
             valid_keys = (
-                'loss_mix',
-                'loss_mix_raw',
+                'loss_mix_pre',
+                'loss_mix_pre_raw',
                 'loss_bal',
                 'loss_varreg',
                 'prior_var_dev_abs_mean',
+                'gmm_stage_id',
+                'prior_update_applied',
+                'prior_accum_count',
+                'prior_accum_progress',
             )
             for k in valid_keys:
                 if k in valid_update_info:

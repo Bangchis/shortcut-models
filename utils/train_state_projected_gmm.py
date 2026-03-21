@@ -26,16 +26,23 @@ class TrainStateProjectedGMMEma(flax.struct.PyTreeNode):
     params_ema: Any      # {"model": ..., "prior": ...}
     tx: Any = nonpytree_field()
     opt_state: Any
+    prior_grad_accum: Any
+    prior_accum_count: Any
 
     @classmethod
     def create(cls, model_def, params, rng, tx=None, opt_state=None, **kwargs):
         if tx is not None and opt_state is None:
             opt_state = tx.init(params)
+        prior_grad_accum = jax.tree_map(jnp.zeros_like, params["prior"])
+        prior_accum_count = jnp.array(0, dtype=jnp.int32)
 
         return cls(
             rng=rng, step=1, apply_fn=model_def.apply, model_def=model_def,
             params=params, params_ema=params,
-            tx=tx, opt_state=opt_state, **kwargs,
+            tx=tx, opt_state=opt_state,
+            prior_grad_accum=prior_grad_accum,
+            prior_accum_count=prior_accum_count,
+            **kwargs,
         )
 
     # Call model with given or default params.
@@ -64,9 +71,16 @@ class TrainStateProjectedGMMEma(flax.struct.PyTreeNode):
 
     # Tau should be close to 1, e.g. 0.999.
     def update_ema(self, tau):
-        new_params_ema = jax.tree_map(
-            lambda p, tp: p * (1-tau) + tp * tau, self.params, self.params_ema
+        new_model_ema = jax.tree_map(
+            lambda p, tp: p * (1-tau) + tp * tau,
+            self.params["model"],
+            self.params_ema["model"],
         )
+        # Keep prior EMA equal to online prior (no EMA-GMM behavior).
+        new_params_ema = {
+            "model": new_model_ema,
+            "prior": self.params["prior"],
+        }
         return self.replace(params_ema=new_params_ema)
 
     # For pickling.
@@ -76,6 +90,8 @@ class TrainStateProjectedGMMEma(flax.struct.PyTreeNode):
             'params_ema': self.params_ema,
             'opt_state': self.opt_state,
             'step': self.step,
+            'prior_grad_accum': self.prior_grad_accum,
+            'prior_accum_count': self.prior_accum_count,
         }
 
     def load(self, data):
