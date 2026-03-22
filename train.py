@@ -87,6 +87,10 @@ model_config = ml_collections.ConfigDict({
     # Stage B FM source controls.
     'gmm_stage_b_noise_std': 1.0,
     'gmm_stage_b_random_pair': 1,
+    # Stage C best-of-n directional pairing controls.
+    'gmm_best_of_n': 10,
+    'gmm_best_of_n_threshold': 16,
+    'gmm_best_of_n_chunk': 4,
     'gmm_proj_eps': 1e-6,
     'gmm_cov_eps': 1e-6,
     # Legacy flags (kept only for compatibility; ignored by the new stage-based implementation).
@@ -246,6 +250,12 @@ def main(_):
                 f"gmm_prior_accum_steps must be >=1, got {FLAGS.model['gmm_prior_accum_steps']}"
             assert FLAGS.model['gmm_stage_a_iters'] >= 0 and FLAGS.model['gmm_stage_b_iters'] >= 0, \
                 "gmm_stage_a_iters and gmm_stage_b_iters must be non-negative."
+            assert FLAGS.model['gmm_best_of_n'] >= 1, \
+                f"gmm_best_of_n must be >=1, got {FLAGS.model['gmm_best_of_n']}"
+            assert FLAGS.model['gmm_best_of_n_threshold'] >= 1, \
+                f"gmm_best_of_n_threshold must be >=1, got {FLAGS.model['gmm_best_of_n_threshold']}"
+            assert FLAGS.model['gmm_best_of_n_chunk'] >= 1, \
+                f"gmm_best_of_n_chunk must be >=1, got {FLAGS.model['gmm_best_of_n_chunk']}"
             prior_params = {
                 'pi_logits': jnp.zeros((K,), dtype=jnp.float32),
                 'mu': 0.02 * jax.random.normal(prior_key, (K, D), dtype=jnp.float32),
@@ -342,7 +352,8 @@ def main(_):
             from utils.projected_diag_gmm import (
                 flatten_latent, unflatten_latent, project_to_shell,
                 compute_router_posterior, select_hard_top1,
-                sample_projected_sources_hard_top1, sample_chi_radius,
+                sample_projected_sources_hard_top1,
+                sample_projected_sources_hard_top1_best_of_n, sample_chi_radius,
                 compute_mix_loss, compute_bal_loss, compute_var_reg_loss
             )
 
@@ -386,9 +397,33 @@ def main(_):
                 # Hard top-1 routing index (no gradient through argmax).
                 top_idx = select_hard_top1(q_full)  # [B]
 
-                # Stage C source: selected component -> project to sphere -> chi radius.
-                x0_dir_stage_c, source_stats_gmm = sample_projected_sources_hard_top1(
-                    source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])  # [B, D]
+                # Stage C source: top-1 component + best-of-n directional pairing.
+                # Stage A/B fallback: top-1 single sample (faster, ignored by stage losses).
+                def _sample_stage_c(_):
+                    return sample_projected_sources_hard_top1_best_of_n(
+                        source_key,
+                        prior_params,
+                        top_idx,
+                        x1_flat,
+                        best_of_n=FLAGS.model['gmm_best_of_n'],
+                        best_of_n_threshold=FLAGS.model['gmm_best_of_n_threshold'],
+                        best_of_n_chunk=FLAGS.model['gmm_best_of_n_chunk'],
+                        eps_proj=FLAGS.model['gmm_proj_eps'])
+
+                def _sample_not_stage_c(_):
+                    x0_dir_fallback, stats_fallback = sample_projected_sources_hard_top1(
+                        source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])
+                    stats_fallback = {
+                        **stats_fallback,
+                        'best_of_n': jnp.asarray(0.0, dtype=jnp.float32),
+                        'best_of_n_cos_selected_mean': jnp.asarray(0.0, dtype=jnp.float32),
+                        'best_of_n_cost_min_mean': jnp.asarray(0.0, dtype=jnp.float32),
+                    }
+                    return x0_dir_fallback, stats_fallback
+
+                x0_dir_stage_c, source_stats_gmm = jax.lax.cond(
+                    is_stage_c, _sample_stage_c, _sample_not_stage_c, operand=None
+                )  # [B, D]
                 r_chi = sample_chi_radius(radius_key, B, D)  # [B]
                 x0_flat_stage_c = x0_dir_stage_c * r_chi[:, None]  # [B, D]
 
@@ -484,6 +519,11 @@ def main(_):
                     'source_proj_denom_min': source_proj_denom_min,
                     'has_nan_source': has_nan_source,
                     'target_shell_denom_min': shell_denom_min,
+                    'best_of_n': jnp.where(is_stage_c, source_stats_gmm['best_of_n'], 0.0),
+                    'best_of_n_cos_selected_mean': jnp.where(
+                        is_stage_c, source_stats_gmm['best_of_n_cos_selected_mean'], 0.0),
+                    'best_of_n_cost_min_mean': jnp.where(
+                        is_stage_c, source_stats_gmm['best_of_n_cost_min_mean'], 0.0),
                 }
 
                 # Logging.
@@ -748,6 +788,9 @@ def main(_):
                 'loss_mix_pre_raw',
                 'loss_bal',
                 'loss_varreg',
+                'best_of_n',
+                'best_of_n_cos_selected_mean',
+                'best_of_n_cost_min_mean',
                 'prior_var_dev_abs_mean',
                 'gmm_stage_id',
                 'prior_update_applied',

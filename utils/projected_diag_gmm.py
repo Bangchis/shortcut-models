@@ -171,10 +171,133 @@ def sample_projected_sources_hard_top1(key, prior_params, top_idx, eps_proj=1e-6
 
     eps = jax.random.normal(key, mu_sel.shape, dtype=jnp.float32)  # [B, D]
     y = mu_sel + sigma_sel * eps
-    x0_dir, proj_denom_min = safe_project(y, eps_proj)
+    sq = jnp.sum(y * y, axis=-1, keepdims=True)
+    inv_denom = jax.lax.rsqrt(sq + eps_proj ** 2)
+    x0_dir = y * inv_denom
+    proj_denom_min = jnp.min(jnp.reciprocal(inv_denom + 1e-20))
     stats = {
         'source_proj_denom_min': proj_denom_min,
         'has_nan_source': jnp.any(jnp.isnan(x0_dir)).astype(jnp.float32),
+    }
+    return x0_dir, stats
+
+
+def sample_projected_sources_hard_top1_best_of_n(
+    key,
+    prior_params,
+    top_idx,
+    x1_flat,
+    best_of_n=10,
+    best_of_n_threshold=16,
+    best_of_n_chunk=4,
+    eps_proj=1e-6,
+):
+    """Sample source direction with hard top-1 mode + best-of-n directional selection.
+
+    For each sample i:
+      1) Use hard top-1 route k* (given by top_idx).
+      2) Sample n proposals from component k*.
+      3) Pick j* = argmax_j cos(s0_j, s1), where:
+           s0_j = normalize(proposal_j), s1 = normalize(x1).
+
+    Hybrid auto:
+      - Vectorized full when n <= threshold.
+      - Chunked scan when n > threshold.
+    """
+    n = max(1, int(best_of_n))
+    threshold = max(1, int(best_of_n_threshold))
+    chunk = max(1, int(best_of_n_chunk))
+
+    mu = prior_params['mu'].astype(jnp.float32)        # [K, D]
+    sigma = sigma_from_raw(prior_params['r_raw'])      # [K, D]
+    x1_flat = x1_flat.astype(jnp.float32)              # [B, D]
+
+    top_idx = jax.lax.stop_gradient(top_idx.astype(jnp.int32))
+    mu_sel = mu[top_idx]        # [B, D]
+    sigma_sel = sigma[top_idx]  # [B, D]
+    B, D = mu_sel.shape
+
+    # Normalize x1 to direction s1.
+    s1_sq = jnp.sum(x1_flat * x1_flat, axis=-1, keepdims=True)
+    s1_inv = jax.lax.rsqrt(s1_sq + eps_proj ** 2)
+    s1 = x1_flat * s1_inv
+
+    if n <= threshold:
+        # Vectorized full path: [B, n, D].
+        eps = jax.random.normal(key, (B, n, D), dtype=jnp.float32)
+        y = mu_sel[:, None, :] + sigma_sel[:, None, :] * eps
+        sq = jnp.sum(y * y, axis=-1, keepdims=True)
+        inv_denom = jax.lax.rsqrt(sq + eps_proj ** 2)
+        s0 = y * inv_denom
+
+        cos = jnp.einsum('bnd,bd->bn', s0, s1)
+        j_star = jnp.argmax(cos, axis=-1).astype(jnp.int32)
+        j_star = jax.lax.stop_gradient(j_star)
+        batch_idx = jnp.arange(B, dtype=jnp.int32)
+        x0_dir = s0[batch_idx, j_star]
+        cos_selected = cos[batch_idx, j_star]
+        proj_denom_min = jnp.min(jnp.reciprocal(inv_denom + 1e-20))
+    else:
+        # Chunked scan path: peak memory O(B * chunk * D).
+        num_chunks = (n + chunk - 1) // chunk
+        chunk_keys = jax.random.split(key, num_chunks)
+        chunk_ids = jnp.arange(num_chunks, dtype=jnp.int32)
+
+        init_best_cos = jnp.full((B,), -jnp.inf, dtype=jnp.float32)
+        init_best_dir = jnp.zeros((B, D), dtype=jnp.float32)
+        init_best_idx = jnp.zeros((B,), dtype=jnp.int32)
+        init_proj_denom_min = jnp.asarray(jnp.inf, dtype=jnp.float32)
+
+        def scan_fn(carry, scan_inputs):
+            best_cos, best_dir, best_idx, proj_denom_min = carry
+            chunk_key, chunk_id = scan_inputs
+
+            eps_chunk = jax.random.normal(
+                chunk_key, (B, chunk, D), dtype=jnp.float32)
+            y_chunk = mu_sel[:, None, :] + sigma_sel[:, None, :] * eps_chunk
+            sq_chunk = jnp.sum(y_chunk * y_chunk, axis=-1, keepdims=True)
+            inv_denom_chunk = jax.lax.rsqrt(sq_chunk + eps_proj ** 2)
+            s0_chunk = y_chunk * inv_denom_chunk
+            cos_chunk = jnp.einsum('bcd,bd->bc', s0_chunk, s1)
+
+            start = chunk_id * chunk
+            proposal_ids = start + jnp.arange(chunk, dtype=jnp.int32)
+            valid_mask = proposal_ids < n
+            cos_chunk = jnp.where(valid_mask[None, :], cos_chunk, -jnp.inf)
+
+            local_idx = jnp.argmax(cos_chunk, axis=-1).astype(jnp.int32)
+            local_idx = jax.lax.stop_gradient(local_idx)
+            batch_idx = jnp.arange(B, dtype=jnp.int32)
+            local_cos = cos_chunk[batch_idx, local_idx]
+            local_dir = s0_chunk[batch_idx, local_idx]
+            local_abs_idx = proposal_ids[local_idx]
+
+            take_local = local_cos > best_cos
+            best_cos = jnp.where(take_local, local_cos, best_cos)
+            best_dir = jnp.where(take_local[:, None], local_dir, best_dir)
+            best_idx = jnp.where(take_local, local_abs_idx, best_idx)
+
+            chunk_proj_denom_min = jnp.min(
+                jnp.reciprocal(inv_denom_chunk + 1e-20))
+            proj_denom_min = jnp.minimum(proj_denom_min, chunk_proj_denom_min)
+
+            return (best_cos, best_dir, best_idx, proj_denom_min), None
+
+        (best_cos, best_dir, best_idx, proj_denom_min), _ = jax.lax.scan(
+            scan_fn,
+            (init_best_cos, init_best_dir, init_best_idx, init_proj_denom_min),
+            (chunk_keys, chunk_ids),
+        )
+        _ = jax.lax.stop_gradient(best_idx)
+        x0_dir = best_dir
+        cos_selected = best_cos
+
+    stats = {
+        'source_proj_denom_min': proj_denom_min,
+        'has_nan_source': jnp.any(jnp.isnan(x0_dir)).astype(jnp.float32),
+        'best_of_n': jnp.asarray(float(n), dtype=jnp.float32),
+        'best_of_n_cos_selected_mean': jnp.mean(cos_selected),
+        'best_of_n_cost_min_mean': 1.0 - jnp.mean(cos_selected),
     }
     return x0_dir, stats
 

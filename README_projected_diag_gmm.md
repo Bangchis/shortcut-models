@@ -64,8 +64,13 @@ Prior:
 - Hard top-1 mode:
   - `k* = argmax_k q(k|y1)` with stop-gradient on index.
 - Source:
-  - `y0 = mu[k*] + sigma[k*] * eps`, `eps ~ N(0, I)`
-  - `s0 = y0 / (||y0|| + eps_proj)`
+  - Draw `n = gmm_best_of_n` proposals from selected mode:
+    `y0_j = mu[k*] + sigma[k*] * eps_j`, `eps_j ~ N(0, I)`
+  - Normalize directions:
+    `s0_j = y0_j / (||y0_j|| + eps_proj)`, `s1 = x1 / (||x1|| + eps_proj)`
+  - Select best proposal by cosine:
+    `j* = argmax_j <s0_j, s1>` (equivalent to `argmin_j (1 - <s0_j, s1>)`)
+  - Use `s0 = s0_j*` as source direction.
   - `u ~ ChiSquare(D), R = sqrt(u)` (so `R ~ Chi(D)`)
   - `x0 = R * s0`
 - Loss:
@@ -95,6 +100,9 @@ Prior:
 - `model.gmm_joint_var_weight`
 - `model.gmm_stage_b_noise_std`
 - `model.gmm_stage_b_random_pair`
+- `model.gmm_best_of_n` (default `10`)
+- `model.gmm_best_of_n_threshold` (default `16`)
+- `model.gmm_best_of_n_chunk` (default `4`)
 
 ### Existing configs still used
 
@@ -124,6 +132,9 @@ Legacy warmup flags are ignored by the stage-based implementation:
 - `training/prior_accum_count`
 - `training/prior_accum_progress`
 - `training/source_radius_mean`, `training/source_radius_std`
+- `training/best_of_n` (Stage C only)
+- `training/best_of_n_cos_selected_mean` (Stage C only)
+- `training/best_of_n_cost_min_mean` (Stage C only)
 
 ## Inference / Eval
 
