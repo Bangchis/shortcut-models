@@ -735,27 +735,27 @@ def main(_):
         return train_state, info
 
     @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
-    def update_cluster(train_state, train_state_teacher, images, labels, k_batch):
-        """Stage C update with within-cluster data coupling.
+    def update_cluster(train_state, train_state_teacher, images, labels, x0_source):
+        """Stage C update with standard-prior coupling.
 
-        images:  [B, lH, lW, 4] x1 latents sampled from cluster k (host-side)
-        labels:  [B] int32 class labels from the fetched cluster images
-        k_batch: [B] int32 cluster index for each sample (host-sampled)
+        images:     [B, lH, lW, 4] x1 latents sampled from cluster k (host-side)
+        labels:     [B] int32 class labels from the fetched cluster images
+        x0_source:  [B, lH, lW, 4] x0 ~ N(0,I) noise sampled on host
         """
         from baselines.targets_projected_diag_gmm import sample_time_and_labels, apply_label_dropout
         from utils.projected_diag_gmm import (
             flatten_latent, unflatten_latent, project_to_shell,
             compute_router_posterior,
-            sample_projected_sources_hard_top1,
-            sample_chi_radius, compute_bal_loss, compute_var_reg_loss
+            compute_bal_loss, compute_var_reg_loss
         )
 
-        new_rng, time_key, source_key, radius_key, label_key, dropout_key = jax.random.split(
-            train_state.rng, 6)
+        new_rng, time_key, label_key, dropout_key = jax.random.split(
+            train_state.rng, 4)
         info = {}
 
         images = jax.lax.with_sharding_constraint(images, data_sharding)
         labels = jax.lax.with_sharding_constraint(labels, data_sharding)
+        x0_source = jax.lax.with_sharding_constraint(x0_source, data_sharding)
 
         if FLAGS.model['cfg_scale'] == 0:
             labels = jnp.ones(labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
@@ -773,14 +773,9 @@ def main(_):
 
             x1_flat = flatten_latent(images)  # [B, D]
 
-            # x0: sample from GMM component k (k_batch is host-sampled)
-            top_idx = jax.lax.stop_gradient(k_batch.astype(jnp.int32))  # [B]
-            x0_dir, source_stats = sample_projected_sources_hard_top1(
-                source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])  # [B, D]
-            r_chi = sample_chi_radius(radius_key, B, D)  # [B]
-            x0_flat = x0_dir * r_chi[:, None]  # [B, D]
-
-            x0_bhwc = unflatten_latent(x0_flat, (H, W, C))  # [B, H, W, C]
+            # x0: standard Gaussian from host (prior stays N(0,I))
+            x0_bhwc = x0_source  # [B, H, W, C]
+            x0_flat = flatten_latent(x0_bhwc)  # [B, D]
 
             # Flow pair
             t_full = t[:, None, None, None]  # [B, 1, 1, 1]
@@ -831,9 +826,9 @@ def main(_):
                 'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                 'source_x0_norm_mean': jnp.mean(x0_norms),
                 'source_x0_norm_std': jnp.std(x0_norms),
-                'source_radius_mean': jnp.mean(r_chi),
-                'source_radius_std': jnp.std(r_chi),
-                'source_proj_denom_min': source_stats['source_proj_denom_min'],
+                'source_radius_mean': jnp.asarray(0.0),
+                'source_radius_std': jnp.asarray(0.0),
+                'source_proj_denom_min': jnp.asarray(0.0),
                 'target_shell_denom_min': shell_denom_min,
                 'router_usage_min': jnp.min(mean_q),
                 'router_usage_max': jnp.max(mean_q),
@@ -842,7 +837,7 @@ def main(_):
                 'prior_var_max': jnp.max(var_all),
                 'prior_var_dev_abs_mean': jnp.mean(jnp.abs(var_all - 1.0)),
                 'has_nan_loss': jnp.any(jnp.isnan(loss)).astype(jnp.float32),
-                'has_nan_source': source_stats['has_nan_source'],
+                'has_nan_source': jnp.any(jnp.isnan(x0_flat)).astype(jnp.float32),
                 'dropped_ratio': dropped_ratio,
                 **router_stats,
                 **{'activations/' + k_name: jnp.sqrt(jnp.mean(jnp.square(v)))
@@ -944,7 +939,7 @@ def main(_):
         and not FLAGS.debug_overfit
     )
     if use_cluster_data:
-        from utils.datasets import get_random_access_dataset, get_ordered_dataset, sample_cluster_batch
+        from utils.datasets import get_random_access_dataset, get_ordered_dataset, sample_cluster_batch, sample_cluster_batch_from_source
         from utils.projected_diag_gmm import precompute_cluster_assignments, load_cluster_assignments
         import os as _os
         random_access_source = get_random_access_dataset(FLAGS.dataset_name, is_train=True)
@@ -999,30 +994,32 @@ def main(_):
 
         # -- Sample data --
         if use_cluster_data and in_stage_c_py and cluster_indices is not None:
-            # Cluster-aware path: k is sampled first, x1 comes from cluster k.
+            # Standard-prior path: x0 ~ N(0,I) on host, route through GMM, fetch x1 from cluster.
             _prior_np = jax.device_get(train_state.get_prior_params(use_ema=False))
-            if FLAGS.model.get('gmm_cluster_sample_uniform', 1):
-                _pi_np = None
-            else:
-                import jax.numpy as _jnp
-                _pi_np = np.array(
-                    jax.nn.softmax(_jnp.array(_prior_np['pi_logits'], dtype=_jnp.float32)))
+            _H, _W, _C = example_obs_shape[1], example_obs_shape[2], example_obs_shape[3]
+            _D = _H * _W * _C
+            x0_flat_np = np.random.randn(local_batch_size, _D).astype(np.float32)
 
-            x1_raw, x1_labels_np, k_batch_np = sample_cluster_batch(
-                cluster_indices, cluster_sizes, local_batch_size,
-                random_access_source, FLAGS.dataset_name, pi_np=_pi_np)
+            x1_raw, x1_labels_np, k_batch_np = sample_cluster_batch_from_source(
+                x0_flat_np, _prior_np,
+                cluster_indices, cluster_sizes,
+                random_access_source, FLAGS.dataset_name,
+                eps_proj=FLAGS.model['gmm_proj_eps'],
+                eps_cov=FLAGS.model['gmm_cov_eps'])
 
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                 vae_rng, vae_key = jax.random.split(vae_rng)
                 batch_images = vae_encode(vae_key, x1_raw)
             else:
                 batch_images = x1_raw
+
+            x0_source_np = x0_flat_np.reshape(local_batch_size, _H, _W, _C)
             batch_images = shard_data(batch_images)
             batch_labels = shard_data(x1_labels_np)
-            k_batch_sharded = shard_data(k_batch_np)
+            x0_sharded = shard_data(x0_source_np)
 
             train_state, update_info = update_cluster(
-                train_state, train_state_teacher, batch_images, batch_labels, k_batch_sharded)
+                train_state, train_state_teacher, batch_images, batch_labels, x0_sharded)
             cluster_step_counter += 1
         else:
             # Existing streaming path (Stage A, B, or cluster_data=0).

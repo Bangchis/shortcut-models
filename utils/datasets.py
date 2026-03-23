@@ -83,20 +83,25 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False):
 
 
 def get_random_access_dataset(dataset_name, is_train=True):
-    """Returns a tfds ArrayRecordDataSource supporting source[i] indexing.
+    """Returns a list-like object supporting source[i] indexing.
     Used for within-cluster data sampling in Stage C.
     """
     if 'imagenet256' in dataset_name or 'imagenet128' in dataset_name:
         split = 'train' if is_train else 'validation'
-        return tfds.data_source('imagenet2012', split=split)
+        ds = tfds.load('imagenet2012', split=split)
     elif dataset_name == 'celebahq256':
         split = 'train' if is_train else 'test'
-        return tfds.data_source('celebahq256', split=split)
+        ds = tfds.load('celebahq256', split=split)
     elif dataset_name == 'lsunchurch':
         split = 'church-train' if is_train else 'church-test'
-        return tfds.data_source('lsunc', split=split)
+        ds = tfds.load('lsunc', split=split)
     else:
         raise ValueError(f"get_random_access_dataset: Unknown dataset {dataset_name}")
+
+    print("Materializing dataset into memory for random access...")
+    records = list(tfds.as_numpy(ds))
+    print(f"Loaded {len(records)} records into memory.")
+    return records
 
 
 def get_ordered_dataset(dataset_name, batch_size):
@@ -224,3 +229,86 @@ def sample_cluster_batch(cluster_indices, cluster_sizes, batch_size,
     x1_images, x1_labels = preprocess_images_from_source(
         raw_records, dataset_name, training=True)
     return x1_images, x1_labels, k_batch.astype(np.int32)
+
+
+def _route_source_np(x0_flat_np, prior_params_np, eps_proj=1e-6, eps_cov=1e-6):
+    """HOST-SIDE. Route x0 ~ N(0,I) through GMM to get cluster assignment.
+
+    x0_flat_np: [B, D] float32 source noise (standard Gaussian).
+    prior_params_np: dict with pi_logits [K], mu [K,D], r_raw [K,D].
+    Returns: k_batch [B] int32 hard cluster assignments.
+    """
+    # Shell-project source: y = R0 * x0 / ||x0||
+    D = x0_flat_np.shape[1]
+    R0 = np.sqrt(D).astype(np.float32)
+    norms = np.linalg.norm(x0_flat_np, axis=-1, keepdims=True)  # [B, 1]
+    y_src = R0 * x0_flat_np / (norms + eps_proj)  # [B, D]
+
+    # GMM posterior: log q(k|y) = log pi_k + log N(y; mu_k, sigma_k^2)
+    pi_logits = np.asarray(prior_params_np['pi_logits'], dtype=np.float32)  # [K]
+    mu = np.asarray(prior_params_np['mu'], dtype=np.float32)  # [K, D]
+    r_raw = np.asarray(prior_params_np['r_raw'], dtype=np.float32)  # [K, D]
+
+    # softplus for sigma
+    sigma = np.log1p(np.exp(r_raw))  # [K, D]
+    var = sigma ** 2 + eps_cov  # [K, D]
+    log_var = np.clip(np.log(var), -20.0, 20.0)  # [K, D]
+
+    # log pi via log_softmax
+    log_pi = pi_logits - np.max(pi_logits)
+    log_pi = log_pi - np.log(np.sum(np.exp(log_pi)))  # [K]
+
+    # log N(y; mu_k, sigma_k^2) for each (sample, component)
+    # diff: [B, 1, D] - [1, K, D] = [B, K, D]
+    diff = y_src[:, None, :] - mu[None, :, :]
+    mahal = diff ** 2 / var[None, :, :]  # [B, K, D]
+    log_norm = -0.5 * np.sum(log_var + np.log(2 * np.pi), axis=-1)  # [K]
+    log_exp = -0.5 * np.sum(mahal, axis=-1)  # [B, K]
+    log_comp = log_norm[None, :] + log_exp  # [B, K]
+
+    log_joint = log_pi[None, :] + log_comp  # [B, K]
+    k_batch = np.argmax(log_joint, axis=-1).astype(np.int32)  # [B]
+    return k_batch
+
+
+def sample_cluster_batch_from_source(
+    x0_flat_np, prior_params_np,
+    cluster_indices, cluster_sizes,
+    random_access_source, dataset_name,
+    eps_proj=1e-6, eps_cov=1e-6, rng=None,
+):
+    """HOST-SIDE. Sample x0 ~ N(0,I), route through GMM, fetch x1 from matched cluster.
+
+    x0_flat_np:       [B, D] float32 standard Gaussian noise.
+    prior_params_np:  dict with pi_logits [K], mu [K,D], r_raw [K,D].
+    cluster_indices:  list of K np.arrays of global image indices.
+    cluster_sizes:    np.array [K] int64.
+    random_access_source: list-like supporting source[i].
+    dataset_name:     for preprocessing.
+
+    Returns:
+        x1_images: np.ndarray [B, H, W, 3] float32 in [-1, 1]
+        x1_labels: np.ndarray [B] int32
+        k_batch:   np.ndarray [B] int32 cluster assignments
+    """
+    rng = rng if rng is not None else np.random
+
+    # Route x0 through GMM
+    k_batch = _route_source_np(x0_flat_np, prior_params_np, eps_proj, eps_cov)
+
+    # Fetch x1 from cluster_data[k] for each sample
+    total_size = int(np.sum(cluster_sizes))
+    global_indices = []
+    for b in range(x0_flat_np.shape[0]):
+        k = int(k_batch[b])
+        c_size = int(cluster_sizes[k])
+        if c_size == 0:
+            global_indices.append(int(rng.randint(0, max(total_size, 1))))
+        else:
+            local_idx = int(rng.randint(0, c_size))
+            global_indices.append(int(cluster_indices[k][local_idx]))
+
+    raw_records = [random_access_source[i] for i in global_indices]
+    x1_images, x1_labels = preprocess_images_from_source(
+        raw_records, dataset_name, training=True)
+    return x1_images, x1_labels, k_batch

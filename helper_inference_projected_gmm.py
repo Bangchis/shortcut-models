@@ -13,41 +13,11 @@ from utils.projected_diag_gmm import sigma_from_raw, safe_project, sample_chi_ra
 
 
 def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6):
-    """Sample source from GMM prior for inference.
+    """Sample source from standard Gaussian N(0,I) for inference.
+    GMM is only used for training coupling, not for inference.
     Returns: x0 [B, H, W, C].
     """
-    B = images_shape[0]
-    H, W, C = images_shape[1], images_shape[2], images_shape[3]
-    D = H * W * C
-
-    cat_key, gauss_key, radius_key = jax.random.split(key, 3)
-
-    pi_logits = prior_params['pi_logits'].astype(jnp.float32)
-    mu = prior_params['mu'].astype(jnp.float32)  # [K, D]
-    sigma = sigma_from_raw(prior_params['r_raw'])  # [K, D]
-
-    # Sample mode indices from categorical.
-    log_pi = jax.nn.log_softmax(pi_logits)
-    mode_idx = jax.random.categorical(cat_key, log_pi, shape=(B,))  # [B]
-
-    # Gather selected components.
-    mu_sel = mu[mode_idx]      # [B, D]
-    sigma_sel = sigma[mode_idx]  # [B, D]
-
-    # Sample from selected Gaussian.
-    eps = jax.random.normal(gauss_key, (B, D), dtype=jnp.float32)
-    y = mu_sel + sigma_sel * eps  # [B, D]
-
-    # Project onto sphere.
-    x0_dir, _ = safe_project(y, eps_proj)
-
-    # Sample radius R ~ Chi(D): R = sqrt(U), U ~ ChiSquare(D).
-    r = sample_chi_radius(radius_key, B, D)  # [B]
-    x0_flat = x0_dir * r[:, None]
-
-    # Reshape to spatial.
-    x0 = x0_flat.reshape(B, H, W, C)
-    return x0
+    return jax.random.normal(key, images_shape, dtype=jnp.float32)
 
 
 def do_inference(
