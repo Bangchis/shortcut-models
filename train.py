@@ -87,8 +87,13 @@ model_config = ml_collections.ConfigDict({
     # Stage B FM source controls.
     'gmm_stage_b_noise_std': 1.0,
     'gmm_stage_b_random_pair': 1,
-    # Stage C best-of-n directional pairing controls.
-    'gmm_best_of_n': 10,
+    # Stage C within-cluster data coupling controls (gmm_use_cluster_data=1).
+    'gmm_use_cluster_data': 1,
+    'gmm_cluster_sample_uniform': 1,
+    'gmm_cluster_reassign_interval': 5000,
+    'gmm_cluster_save_path': '/tmp/gmm_clusters/',
+    # Stage C best-of-n fallback controls (gmm_use_cluster_data=0, kept for ablation).
+    'gmm_best_of_n': 1,
     'gmm_best_of_n_threshold': 16,
     'gmm_best_of_n_chunk': 4,
     'gmm_proj_eps': 1e-6,
@@ -250,12 +255,8 @@ def main(_):
                 f"gmm_prior_accum_steps must be >=1, got {FLAGS.model['gmm_prior_accum_steps']}"
             assert FLAGS.model['gmm_stage_a_iters'] >= 0 and FLAGS.model['gmm_stage_b_iters'] >= 0, \
                 "gmm_stage_a_iters and gmm_stage_b_iters must be non-negative."
-            assert FLAGS.model['gmm_best_of_n'] >= 1, \
-                f"gmm_best_of_n must be >=1, got {FLAGS.model['gmm_best_of_n']}"
-            assert FLAGS.model['gmm_best_of_n_threshold'] >= 1, \
-                f"gmm_best_of_n_threshold must be >=1, got {FLAGS.model['gmm_best_of_n_threshold']}"
-            assert FLAGS.model['gmm_best_of_n_chunk'] >= 1, \
-                f"gmm_best_of_n_chunk must be >=1, got {FLAGS.model['gmm_best_of_n_chunk']}"
+            assert FLAGS.model.get('gmm_cluster_reassign_interval', 5000) >= 1, \
+                f"gmm_cluster_reassign_interval must be >=1"
             prior_params = {
                 'pi_logits': jnp.zeros((K,), dtype=jnp.float32),
                 'mu': 0.02 * jax.random.normal(prior_key, (K, D), dtype=jnp.float32),
@@ -733,6 +734,189 @@ def main(_):
         train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
         return train_state, info
 
+    @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
+    def update_cluster(train_state, train_state_teacher, images, labels, k_batch):
+        """Stage C update with within-cluster data coupling.
+
+        images:  [B, lH, lW, 4] x1 latents sampled from cluster k (host-side)
+        labels:  [B] int32 class labels from the fetched cluster images
+        k_batch: [B] int32 cluster index for each sample (host-sampled)
+        """
+        from baselines.targets_projected_diag_gmm import sample_time_and_labels, apply_label_dropout
+        from utils.projected_diag_gmm import (
+            flatten_latent, unflatten_latent, project_to_shell,
+            compute_router_posterior,
+            sample_projected_sources_hard_top1,
+            sample_chi_radius, compute_bal_loss, compute_var_reg_loss
+        )
+
+        new_rng, time_key, source_key, radius_key, label_key, dropout_key = jax.random.split(
+            train_state.rng, 6)
+        info = {}
+
+        images = jax.lax.with_sharding_constraint(images, data_sharding)
+        labels = jax.lax.with_sharding_constraint(labels, data_sharding)
+
+        if FLAGS.model['cfg_scale'] == 0:
+            labels = jnp.ones(labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
+
+        t, dt_base, _ = sample_time_and_labels(time_key, images, FLAGS)
+        labels_dropped, dropped_ratio = apply_label_dropout(label_key, labels, FLAGS)
+
+        B = images.shape[0]
+        H, W, C = images.shape[1], images.shape[2], images.shape[3]
+        D = H * W * C
+        target_shell_radius = jnp.sqrt(jnp.asarray(D, dtype=jnp.float32))
+
+        def loss_fn(grad_params):
+            prior_params = grad_params["prior"]
+
+            x1_flat = flatten_latent(images)  # [B, D]
+
+            # x0: sample from GMM component k (k_batch is host-sampled)
+            top_idx = jax.lax.stop_gradient(k_batch.astype(jnp.int32))  # [B]
+            x0_dir, source_stats = sample_projected_sources_hard_top1(
+                source_key, prior_params, top_idx, FLAGS.model['gmm_proj_eps'])  # [B, D]
+            r_chi = sample_chi_radius(radius_key, B, D)  # [B]
+            x0_flat = x0_dir * r_chi[:, None]  # [B, D]
+
+            x0_bhwc = unflatten_latent(x0_flat, (H, W, C))  # [B, H, W, C]
+
+            # Flow pair
+            t_full = t[:, None, None, None]  # [B, 1, 1, 1]
+            x_t = (1 - (1 - 1e-5) * t_full) * x0_bhwc + t_full * images
+            v_t = images - (1 - 1e-5) * x0_bhwc
+
+            # Model forward (no router conditioning in cluster-data mode)
+            v_prime, logvars, activations = train_state.call_model(
+                x_t, t, dt_base, labels_dropped,
+                train=True, rngs={'dropout': dropout_key},
+                params=grad_params, return_activations=True)
+
+            # FM loss
+            mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))  # [B]
+            loss_fm = jnp.mean(mse_v)
+
+            # Balance + VarReg losses (computed on cluster-fetched x1)
+            x1_shell_flat, shell_denom_min = project_to_shell(
+                x1_flat, target_shell_radius, FLAGS.model['gmm_proj_eps'])
+            q_full, _, router_stats = compute_router_posterior(
+                x1_shell_flat, prior_params, FLAGS.model['gmm_cov_eps'])
+            loss_bal = compute_bal_loss(q_full)
+            loss_varreg = compute_var_reg_loss(
+                prior_params['r_raw'], FLAGS.model['gmm_cov_eps'])
+
+            lambda_bal_joint = jnp.asarray(
+                FLAGS.model['gmm_joint_bal_weight'], dtype=jnp.float32)
+            lambda_var_joint = jnp.asarray(
+                FLAGS.model['gmm_joint_var_weight'], dtype=jnp.float32)
+            loss = loss_fm + lambda_bal_joint * loss_bal + lambda_var_joint * loss_varreg
+
+            x0_norms = jnp.sqrt(jnp.sum(x0_flat ** 2, axis=-1))  # [B]
+            mean_q = jnp.mean(q_full, axis=0)  # [K]
+            var_all = jax.nn.softplus(prior_params['r_raw']) ** 2 + FLAGS.model['gmm_cov_eps']
+
+            inner_info = {
+                'loss': loss,
+                'loss_flow': loss_fm,
+                'loss_mix_pre': jnp.asarray(0.0),
+                'loss_mix_pre_raw': jnp.asarray(0.0),
+                'loss_mix_pre_norm_factor': jnp.asarray(float(D)),
+                'loss_bal': loss_bal,
+                'loss_varreg': loss_varreg,
+                'gmm_stage_id': jnp.asarray(2.0),
+                'in_gmm_stage_a': jnp.asarray(0.0),
+                'in_gmm_stage_b': jnp.asarray(0.0),
+                'in_gmm_stage_c': jnp.asarray(1.0),
+                'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                'source_x0_norm_mean': jnp.mean(x0_norms),
+                'source_x0_norm_std': jnp.std(x0_norms),
+                'source_radius_mean': jnp.mean(r_chi),
+                'source_radius_std': jnp.std(r_chi),
+                'source_proj_denom_min': source_stats['source_proj_denom_min'],
+                'target_shell_denom_min': shell_denom_min,
+                'router_usage_min': jnp.min(mean_q),
+                'router_usage_max': jnp.max(mean_q),
+                'prior_var_mean': jnp.mean(var_all),
+                'prior_var_min': jnp.min(var_all),
+                'prior_var_max': jnp.max(var_all),
+                'prior_var_dev_abs_mean': jnp.mean(jnp.abs(var_all - 1.0)),
+                'has_nan_loss': jnp.any(jnp.isnan(loss)).astype(jnp.float32),
+                'has_nan_source': source_stats['has_nan_source'],
+                'dropped_ratio': dropped_ratio,
+                **router_stats,
+                **{'activations/' + k_name: jnp.sqrt(jnp.mean(jnp.square(v)))
+                   for k_name, v in activations.items()},
+            }
+            return loss, inner_info
+
+        grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
+        info.update(new_info)
+
+        # --- Gradient routing: Stage C only ---
+        # Model: always updated every step.
+        # Prior: accumulated over gmm_prior_accum_steps, then averaged and applied.
+        zero_prior_grads = jax.tree_map(jnp.zeros_like, grads['prior'])
+        accum_steps = jnp.asarray(FLAGS.model['gmm_prior_accum_steps'], dtype=jnp.int32)
+        accum_steps_f = jnp.asarray(FLAGS.model['gmm_prior_accum_steps'], dtype=jnp.float32)
+
+        accum_candidate = jax.tree_map(
+            lambda acc, g: acc + g,
+            train_state.prior_grad_accum,
+            grads['prior'],
+        )
+        count_candidate = train_state.prior_accum_count + 1
+        prior_update_now = count_candidate >= accum_steps
+
+        prior_grads_avg = jax.tree_map(
+            lambda acc: acc / accum_steps_f, accum_candidate)
+        prior_grads_for_update = jax.tree_map(
+            lambda g, z: jnp.where(prior_update_now, g, z),
+            prior_grads_avg, zero_prior_grads)
+
+        grads = {'model': grads['model'], 'prior': prior_grads_for_update}
+
+        updates, new_opt_state = train_state.tx.update(
+            grads, train_state.opt_state, train_state.params)
+
+        zero_prior_updates = jax.tree_map(jnp.zeros_like, updates['prior'])
+        updates = {
+            **updates,
+            'prior': jax.tree_map(
+                lambda u, z: jnp.where(prior_update_now, u, z),
+                updates['prior'], zero_prior_updates),
+        }
+
+        new_params = optax.apply_updates(train_state.params, updates)
+
+        # Accumulator reset
+        zero_prior_accum = jax.tree_map(jnp.zeros_like, accum_candidate)
+        prior_accum_next = jax.tree_map(
+            lambda acc, z: jnp.where(prior_update_now, z, acc),
+            accum_candidate, zero_prior_accum)
+        prior_count_next = jnp.where(prior_update_now, 0, count_candidate)
+
+        info['prior_update_applied'] = prior_update_now.astype(jnp.float32)
+        info['prior_accum_count'] = prior_count_next.astype(jnp.float32)
+        info['prior_accum_progress'] = prior_count_next.astype(jnp.float32) / accum_steps_f
+        info['prior_frozen'] = jnp.logical_not(prior_update_now).astype(jnp.float32)
+        info['model_frozen'] = jnp.asarray(0.0, dtype=jnp.float32)
+        info['grad_norm'] = optax.global_norm(grads)
+        info['update_norm'] = optax.global_norm(updates)
+        info['param_norm'] = optax.global_norm(new_params)
+        info['lr'] = lr_schedule(train_state.step)
+
+        train_state = train_state.replace(
+            rng=new_rng,
+            step=train_state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            prior_grad_accum=prior_accum_next,
+            prior_accum_count=prior_count_next,
+        )
+        train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
+        return train_state, info
+
     if FLAGS.mode != 'train':
         if FLAGS.model['train_type'] == 'projected_diag_gmm':
             from helper_inference_projected_gmm import do_inference as do_inference_gmm
@@ -749,20 +933,109 @@ def main(_):
     # Train Loop
     ###################################
 
+    # -- Host-side cluster state for Stage C within-cluster data coupling --
+    cluster_indices = None
+    cluster_sizes = None
+    random_access_source = None
+    cluster_step_counter = 0
+    use_cluster_data = (
+        FLAGS.model['train_type'] == 'projected_diag_gmm'
+        and FLAGS.model.get('gmm_use_cluster_data', 0)
+        and not FLAGS.debug_overfit
+    )
+    if use_cluster_data:
+        from utils.datasets import get_random_access_dataset, get_ordered_dataset, sample_cluster_batch
+        from utils.projected_diag_gmm import precompute_cluster_assignments, load_cluster_assignments
+        import os as _os
+        random_access_source = get_random_access_dataset(FLAGS.dataset_name, is_train=True)
+        _cluster_save_path = FLAGS.model['gmm_cluster_save_path']
+        _sizes_path = _os.path.join(_cluster_save_path, 'cluster_sizes.npy')
+        if _os.path.exists(_sizes_path):
+            _K = FLAGS.model['gmm_num_modes']
+            cluster_indices, cluster_sizes = load_cluster_assignments(_cluster_save_path, _K)
+            print(f"[GMM] Loaded cluster assignments from {_cluster_save_path}: sizes={cluster_sizes}")
+
+    def _run_cluster_precomputation():
+        """Run one-pass cluster assignment with current GMM params."""
+        _D = int(np.prod(example_obs_shape[1:]))
+        _K = FLAGS.model['gmm_num_modes']
+        _prior_np = jax.device_get(train_state.get_prior_params(use_ema=False))
+        _ordered_iter, _ = get_ordered_dataset(FLAGS.dataset_name, batch_size=64)
+        _vae_enc = vae_encode if FLAGS.model.use_stable_vae else None
+        _vae_rng_local = jax.random.PRNGKey(int(jax.device_get(train_state.step)))
+        _ci, _cs = precompute_cluster_assignments(
+            _ordered_iter, _prior_np, _vae_enc, _vae_rng_local,
+            D=_D, K=_K,
+            gmm_proj_eps=FLAGS.model['gmm_proj_eps'],
+            gmm_cov_eps=FLAGS.model['gmm_cov_eps'],
+            save_path=FLAGS.model['gmm_cluster_save_path'],
+        )
+        return _ci, _cs
+
+    # Python step counter: avoids jax.device_get sync every iteration.
+    _python_step = int(jax.device_get(train_state.step)) if use_cluster_data else 0
+
     for i in tqdm.tqdm(range(1 + start_step, FLAGS.max_steps + 1 + start_step),
                        smoothing=0.1,
                        dynamic_ncols=True):
 
-        # Sample data.
-        if not FLAGS.debug_overfit or i == 1:
-            batch_images, batch_labels = shard_data(*next(dataset))
+        # -- Determine Stage C entry for cluster path --
+        in_stage_c_py = False
+        if use_cluster_data:
+            _current_step = _python_step
+            _stage_c_start = FLAGS.model['gmm_stage_a_iters'] + FLAGS.model['gmm_stage_b_iters']
+            in_stage_c_py = (_current_step >= _stage_c_start)
+
+            if in_stage_c_py:
+                if cluster_indices is None:
+                    print(f"[GMM] Entering Stage C at step {_current_step}. Running cluster precomputation...")
+                    cluster_indices, cluster_sizes = _run_cluster_precomputation()
+                    cluster_step_counter = 0
+                else:
+                    _reassign_interval = FLAGS.model.get('gmm_cluster_reassign_interval', 5000)
+                    if cluster_step_counter > 0 and cluster_step_counter % _reassign_interval == 0:
+                        print(f"[GMM] Reassigning clusters (Stage-C step {cluster_step_counter}, global {_current_step})...")
+                        cluster_indices, cluster_sizes = _run_cluster_precomputation()
+
+        # -- Sample data --
+        if use_cluster_data and in_stage_c_py and cluster_indices is not None:
+            # Cluster-aware path: k is sampled first, x1 comes from cluster k.
+            _prior_np = jax.device_get(train_state.get_prior_params(use_ema=False))
+            if FLAGS.model.get('gmm_cluster_sample_uniform', 1):
+                _pi_np = None
+            else:
+                import jax.numpy as _jnp
+                _pi_np = np.array(
+                    jax.nn.softmax(_jnp.array(_prior_np['pi_logits'], dtype=_jnp.float32)))
+
+            x1_raw, x1_labels_np, k_batch_np = sample_cluster_batch(
+                cluster_indices, cluster_sizes, local_batch_size,
+                random_access_source, FLAGS.dataset_name, pi_np=_pi_np)
+
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                 vae_rng, vae_key = jax.random.split(vae_rng)
-                batch_images = vae_encode(vae_key, batch_images)
+                batch_images = vae_encode(vae_key, x1_raw)
+            else:
+                batch_images = x1_raw
+            batch_images = shard_data(batch_images)
+            batch_labels = shard_data(x1_labels_np)
+            k_batch_sharded = shard_data(k_batch_np)
 
-        # Train update.
-        train_state, update_info = update(
-            train_state, train_state_teacher, batch_images, batch_labels)
+            train_state, update_info = update_cluster(
+                train_state, train_state_teacher, batch_images, batch_labels, k_batch_sharded)
+            cluster_step_counter += 1
+        else:
+            # Existing streaming path (Stage A, B, or cluster_data=0).
+            if not FLAGS.debug_overfit or i == 1:
+                batch_images, batch_labels = shard_data(*next(dataset))
+                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                    vae_rng, vae_key = jax.random.split(vae_rng)
+                    batch_images = vae_encode(vae_key, batch_images)
+
+            train_state, update_info = update(
+                train_state, train_state_teacher, batch_images, batch_labels)
+
+        _python_step += 1
 
         if i % FLAGS.log_interval == 0 or i == 1:
             update_info = jax.device_get(update_info)
@@ -788,14 +1061,14 @@ def main(_):
                 'loss_mix_pre_raw',
                 'loss_bal',
                 'loss_varreg',
-                'best_of_n',
-                'best_of_n_cos_selected_mean',
-                'best_of_n_cost_min_mean',
                 'prior_var_dev_abs_mean',
                 'gmm_stage_id',
                 'prior_update_applied',
                 'prior_accum_count',
                 'prior_accum_progress',
+                'router_usage_min',
+                'router_usage_max',
+                'cluster_step_counter',
             )
             for k in valid_keys:
                 if k in valid_update_info:

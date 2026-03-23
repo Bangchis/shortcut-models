@@ -383,3 +383,88 @@ def compute_var_reg_loss(r_raw, eps_cov=1e-6):
     var = sigma ** 2 + eps_cov     # [K, D]
     log_var = jnp.clip(jnp.log(var), -20.0, 20.0)
     return jnp.mean(jnp.square(log_var))
+
+
+# ─── Cluster precomputation utilities (host-side, not JIT) ───────────────────
+
+def precompute_cluster_assignments(
+    ordered_iter,
+    prior_params,
+    vae_encode,
+    vae_rng,
+    D,
+    K,
+    gmm_proj_eps,
+    gmm_cov_eps,
+    save_path,
+):
+    """One-pass cluster assignment over an ordered (non-shuffled) dataset.
+
+    Streams through ordered_iter, VAE-encodes each batch (if vae_encode is not None),
+    projects to shell, and assigns argmax q(k|x1) for each sample.
+
+    Saves per-cluster index arrays to save_path on disk.
+    Returns: (cluster_indices: list[K][np.array int64], cluster_sizes: np.array [K])
+    """
+    import os
+
+    target_radius = float(np.sqrt(D))
+
+    @jax.jit
+    def assign_batch(latents, params):
+        x1_flat = flatten_latent(latents)
+        R0 = jnp.asarray(target_radius, dtype=jnp.float32)
+        x1_shell, _ = project_to_shell(x1_flat, R0, gmm_proj_eps)
+        q_full, _, _ = compute_router_posterior(x1_shell, params, gmm_cov_eps)
+        return jnp.argmax(q_full, axis=-1).astype(jnp.int32)
+
+    assignments = []  # list of (global_idx, cluster_k)
+    global_idx = 0
+    batch_count = 0
+
+    print(f"[GMM] Precomputing cluster assignments (K={K}, D={D}, R0={target_radius:.1f})...")
+    for batch_images, _ in ordered_iter:
+        if vae_encode is not None:
+            vae_rng, vk = jax.random.split(vae_rng)
+            latents = vae_encode(vk, batch_images)
+        else:
+            latents = batch_images
+        top_idx = np.array(assign_batch(latents, prior_params))
+        B = top_idx.shape[0]
+        for local_i in range(B):
+            assignments.append((global_idx + local_i, int(top_idx[local_i])))
+        global_idx += B
+        batch_count += 1
+        if batch_count % 100 == 0:
+            print(f"[GMM]   ... processed {global_idx} samples")
+
+    cluster_lists = [[] for _ in range(K)]
+    for g_idx, k in assignments:
+        cluster_lists[k].append(g_idx)
+    cluster_sizes = np.array([len(c) for c in cluster_lists], dtype=np.int64)
+
+    print(f"[GMM] Cluster sizes: {cluster_sizes}")
+    print(f"[GMM] Min={cluster_sizes.min()}, Max={cluster_sizes.max()}, Total={cluster_sizes.sum()}")
+
+    os.makedirs(save_path, exist_ok=True)
+    np.save(os.path.join(save_path, 'cluster_sizes.npy'), cluster_sizes)
+    for k in range(K):
+        np.save(
+            os.path.join(save_path, f'cluster_indices_k{k}.npy'),
+            np.array(cluster_lists[k], dtype=np.int64),
+        )
+    print(f"[GMM] Saved cluster assignments to {save_path}")
+    return [np.array(c, dtype=np.int64) for c in cluster_lists], cluster_sizes
+
+
+def load_cluster_assignments(save_path, K):
+    """Load precomputed cluster assignments from disk.
+    Returns: (cluster_indices: list[K][np.array int64], cluster_sizes: np.array [K])
+    """
+    import os
+    cluster_sizes = np.load(os.path.join(save_path, 'cluster_sizes.npy'))
+    cluster_indices = [
+        np.load(os.path.join(save_path, f'cluster_indices_k{k}.npy'))
+        for k in range(K)
+    ]
+    return cluster_indices, cluster_sizes
