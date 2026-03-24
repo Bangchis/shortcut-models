@@ -396,6 +396,7 @@ def precompute_cluster_assignments(
     K,
     gmm_proj_eps,
     gmm_cov_eps,
+    vae_encode_chunk_size,
     save_path,
 ):
     """One-pass cluster assignment over an ordered (non-shuffled) dataset.
@@ -424,11 +425,23 @@ def precompute_cluster_assignments(
     global_idx = 0
     batch_count = 0
 
-    print(f"[GMM] Precomputing cluster assignments (K={K}, D={D}, R0={target_radius:.1f})...")
+    vae_encode_chunk_size = max(1, int(vae_encode_chunk_size))
+    print(
+        f"[GMM] Precomputing cluster assignments (K={K}, D={D}, R0={target_radius:.1f}, "
+        f"vae_chunk={vae_encode_chunk_size})..."
+    )
     for batch_images, _ in ordered_iter:
         if vae_encode is not None:
-            vae_rng, vk = jax.random.split(vae_rng)
-            latents = vae_encode(vk, batch_images)
+            # Encode in chunks to avoid TPU HBM OOM for large precompute batches.
+            B_img = batch_images.shape[0]
+            latent_chunks = []
+            for start in range(0, B_img, vae_encode_chunk_size):
+                end = min(start + vae_encode_chunk_size, B_img)
+                vae_rng, vk = jax.random.split(vae_rng)
+                lat_chunk = vae_encode(vk, batch_images[start:end])
+                latent_chunks.append(np.asarray(lat_chunk))
+            latents = latent_chunks[0] if len(latent_chunks) == 1 else np.concatenate(
+                latent_chunks, axis=0)
         else:
             latents = batch_images
         top_idx = np.asarray(assign_batch(latents, prior_params), dtype=np.int32)

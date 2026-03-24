@@ -167,6 +167,18 @@ def preprocess_images_from_source(raw_records, dataset_name, training=True):
     raw_records: list of dicts with 'image' key (uint8 numpy [H, W, 3]).
     Returns: (images [B, H, W, 3] float32 in [-1,1], labels [B] int32).
     """
+    # Fast path: CelebA-HQ records are already 256x256, and Stage-C cluster sampling
+    # does not need per-sample tf.image ops on host.
+    if dataset_name == 'celebahq256':
+        images = np.stack([rec['image'] for rec in raw_records], axis=0).astype(np.float32)
+        images = images / 255.0
+        images = (images - 0.5) / 0.5
+        labels = np.array(
+            [int(rec['label']) if 'label' in rec else 0 for rec in raw_records],
+            dtype=np.int32,
+        )
+        return images, labels
+
     target_size = 128 if 'imagenet128' in dataset_name else 256
     processed_images = []
     processed_labels = []
@@ -215,17 +227,20 @@ def sample_cluster_batch(cluster_indices, cluster_sizes, batch_size,
         k_batch = rng.randint(0, K, size=batch_size)
 
     total_size = int(np.sum(cluster_sizes))
-    global_indices = []
-    for b in range(batch_size):
-        k = int(k_batch[b])
+    global_indices = np.empty((batch_size,), dtype=np.int64)
+    for k in range(K):
+        mask = (k_batch == k)
+        n = int(np.sum(mask))
+        if n == 0:
+            continue
         c_size = int(cluster_sizes[k])
         if c_size == 0:
-            global_indices.append(int(rng.randint(0, max(total_size, 1))))
+            global_indices[mask] = rng.randint(0, max(total_size, 1), size=(n,))
         else:
-            local_idx = int(rng.randint(0, c_size))
-            global_indices.append(int(cluster_indices[k][local_idx]))
+            local_idx = rng.randint(0, c_size, size=(n,))
+            global_indices[mask] = np.asarray(cluster_indices[k], dtype=np.int64)[local_idx]
 
-    raw_records = [random_access_source[i] for i in global_indices]
+    raw_records = [random_access_source[int(i)] for i in global_indices]
     x1_images, x1_labels = preprocess_images_from_source(
         raw_records, dataset_name, training=True)
     return x1_images, x1_labels, k_batch.astype(np.int32)
@@ -297,18 +312,23 @@ def sample_cluster_batch_from_source(
     k_batch = _route_source_np(x0_flat_np, prior_params_np, eps_proj, eps_cov)
 
     # Fetch x1 from cluster_data[k] for each sample
+    batch_size = x0_flat_np.shape[0]
+    K = len(cluster_indices)
     total_size = int(np.sum(cluster_sizes))
-    global_indices = []
-    for b in range(x0_flat_np.shape[0]):
-        k = int(k_batch[b])
+    global_indices = np.empty((batch_size,), dtype=np.int64)
+    for k in range(K):
+        mask = (k_batch == k)
+        n = int(np.sum(mask))
+        if n == 0:
+            continue
         c_size = int(cluster_sizes[k])
         if c_size == 0:
-            global_indices.append(int(rng.randint(0, max(total_size, 1))))
+            global_indices[mask] = rng.randint(0, max(total_size, 1), size=(n,))
         else:
-            local_idx = int(rng.randint(0, c_size))
-            global_indices.append(int(cluster_indices[k][local_idx]))
+            local_idx = rng.randint(0, c_size, size=(n,))
+            global_indices[mask] = np.asarray(cluster_indices[k], dtype=np.int64)[local_idx]
 
-    raw_records = [random_access_source[i] for i in global_indices]
+    raw_records = [random_access_source[int(i)] for i in global_indices]
     x1_images, x1_labels = preprocess_images_from_source(
         raw_records, dataset_name, training=True)
     return x1_images, x1_labels, k_batch

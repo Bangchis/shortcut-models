@@ -93,6 +93,7 @@ model_config = ml_collections.ConfigDict({
     'gmm_cluster_reassign_interval': 5000,
     'gmm_cluster_save_path': '/tmp/gmm_clusters/',
     'gmm_cluster_precompute_batch_size': 256,
+    'gmm_cluster_precompute_vae_batch_size': 32,
     # Stage C best-of-n fallback controls (gmm_use_cluster_data=0, kept for ablation).
     'gmm_best_of_n': 1,
     'gmm_best_of_n_threshold': 16,
@@ -965,6 +966,8 @@ def main(_):
             D=_D, K=_K,
             gmm_proj_eps=FLAGS.model['gmm_proj_eps'],
             gmm_cov_eps=FLAGS.model['gmm_cov_eps'],
+            vae_encode_chunk_size=int(
+                FLAGS.model.get('gmm_cluster_precompute_vae_batch_size', 32)),
             save_path=FLAGS.model['gmm_cluster_save_path'],
         )
         return _ci, _cs
