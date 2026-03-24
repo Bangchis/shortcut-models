@@ -8,39 +8,12 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 from functools import partial
 
-from utils.projected_diag_gmm import sigma_from_raw, safe_project, sample_chi_radius
-
-
 def sample_gmm_source(key, prior_params, images_shape, eps_proj=1e-6):
-    """Sample source from GMM prior for eval.
+    """Sample source from standard Gaussian N(0, I) for eval.
     Returns: x0 [B, H, W, C].
     """
-    B = images_shape[0]
-    H, W, C = images_shape[1], images_shape[2], images_shape[3]
-    D = H * W * C
-
-    cat_key, gauss_key, radius_key = jax.random.split(key, 3)
-
-    pi_logits = prior_params['pi_logits'].astype(jnp.float32)
-    mu = prior_params['mu'].astype(jnp.float32)
-    sigma = sigma_from_raw(prior_params['r_raw'])
-
-    log_pi = jax.nn.log_softmax(pi_logits)
-    mode_idx = jax.random.categorical(cat_key, log_pi, shape=(B,))
-
-    mu_sel = mu[mode_idx]
-    sigma_sel = sigma[mode_idx]
-
-    eps = jax.random.normal(gauss_key, (B, D), dtype=jnp.float32)
-    y = mu_sel + sigma_sel * eps
-
-    x0_dir, _ = safe_project(y, eps_proj)
-
-    r = sample_chi_radius(radius_key, B, D)
-    x0_flat = x0_dir * r[:, None]
-
-    x0 = x0_flat.reshape(B, H, W, C)
-    return x0
+    del prior_params, eps_proj
+    return jax.random.normal(key, images_shape, dtype=jnp.float32)
 
 
 def eval_model(
@@ -79,14 +52,11 @@ def eval_model(
 
         prior_params = train_state.get_prior_params(use_ema=False)
 
-        # GMM source noise (fixed seed for reproducibility).
+        # Standard Gaussian source noise (fixed seed for reproducibility).
         FIX_EVAL_NOISE_SEED = 42
         eval_key = jax.random.PRNGKey(FIX_EVAL_NOISE_SEED)
         eps_eval = sample_gmm_source(
             eval_key, prior_params, batch_images.shape,
-            FLAGS.model['gmm_proj_eps'])
-        eps = sample_gmm_source(
-            key, prior_params, batch_images.shape,
             FLAGS.model['gmm_proj_eps'])
 
         def process_img(img):
@@ -177,7 +147,7 @@ def eval_model(
             all_x = []
             delta_t = 1.0 / denoise_timesteps
 
-            # GMM source init (fixed seed).
+            # Standard Gaussian source init (fixed seed).
             x = eps_eval
             B_local = eps_eval.shape[0]
             x = shard_data(x)
@@ -242,7 +212,7 @@ def eval_model(
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
 
-                # GMM source init.
+                # Standard Gaussian source init.
                 x = sample_gmm_source(
                     eps_key, prior_params, images_shape,
                     FLAGS.model['gmm_proj_eps'])

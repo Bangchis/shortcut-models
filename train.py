@@ -92,6 +92,7 @@ model_config = ml_collections.ConfigDict({
     'gmm_cluster_sample_uniform': 1,
     'gmm_cluster_reassign_interval': 5000,
     'gmm_cluster_save_path': '/tmp/gmm_clusters/',
+    'gmm_cluster_precompute_batch_size': 256,
     # Stage C best-of-n fallback controls (gmm_use_cluster_data=0, kept for ablation).
     'gmm_best_of_n': 1,
     'gmm_best_of_n_threshold': 16,
@@ -955,7 +956,8 @@ def main(_):
         _D = int(np.prod(example_obs_shape[1:]))
         _K = FLAGS.model['gmm_num_modes']
         _prior_np = jax.device_get(train_state.get_prior_params(use_ema=False))
-        _ordered_iter, _ = get_ordered_dataset(FLAGS.dataset_name, batch_size=64)
+        _precompute_bs = int(FLAGS.model.get('gmm_cluster_precompute_batch_size', 256))
+        _ordered_iter, _ = get_ordered_dataset(FLAGS.dataset_name, batch_size=_precompute_bs)
         _vae_enc = vae_encode if FLAGS.model.use_stable_vae else None
         _vae_rng_local = jax.random.PRNGKey(int(jax.device_get(train_state.step)))
         _ci, _cs = precompute_cluster_assignments(

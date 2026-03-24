@@ -418,7 +418,9 @@ def precompute_cluster_assignments(
         q_full, _, _ = compute_router_posterior(x1_shell, params, gmm_cov_eps)
         return jnp.argmax(q_full, axis=-1).astype(jnp.int32)
 
-    assignments = []  # list of (global_idx, cluster_k)
+    # Per-cluster chunks of global indices (vectorized append per batch).
+    # This avoids Python per-sample loops, which become a bottleneck on large datasets.
+    cluster_chunks = [[] for _ in range(K)]
     global_idx = 0
     batch_count = 0
 
@@ -429,19 +431,25 @@ def precompute_cluster_assignments(
             latents = vae_encode(vk, batch_images)
         else:
             latents = batch_images
-        top_idx = np.array(assign_batch(latents, prior_params))
+        top_idx = np.asarray(assign_batch(latents, prior_params), dtype=np.int32)
         B = top_idx.shape[0]
-        for local_i in range(B):
-            assignments.append((global_idx + local_i, int(top_idx[local_i])))
+        batch_global_idx = np.arange(global_idx, global_idx + B, dtype=np.int64)
+        for k in range(K):
+            mask = (top_idx == k)
+            if np.any(mask):
+                cluster_chunks[k].append(batch_global_idx[mask])
         global_idx += B
         batch_count += 1
         if batch_count % 100 == 0:
             print(f"[GMM]   ... processed {global_idx} samples")
 
-    cluster_lists = [[] for _ in range(K)]
-    for g_idx, k in assignments:
-        cluster_lists[k].append(g_idx)
-    cluster_sizes = np.array([len(c) for c in cluster_lists], dtype=np.int64)
+    cluster_lists = []
+    for k in range(K):
+        if len(cluster_chunks[k]) == 0:
+            cluster_lists.append(np.empty((0,), dtype=np.int64))
+        else:
+            cluster_lists.append(np.concatenate(cluster_chunks[k], axis=0))
+    cluster_sizes = np.array([c.shape[0] for c in cluster_lists], dtype=np.int64)
 
     print(f"[GMM] Cluster sizes: {cluster_sizes}")
     print(f"[GMM] Min={cluster_sizes.min()}, Max={cluster_sizes.max()}, Total={cluster_sizes.sum()}")
@@ -451,10 +459,10 @@ def precompute_cluster_assignments(
     for k in range(K):
         np.save(
             os.path.join(save_path, f'cluster_indices_k{k}.npy'),
-            np.array(cluster_lists[k], dtype=np.int64),
+            cluster_lists[k].astype(np.int64, copy=False),
         )
     print(f"[GMM] Saved cluster assignments to {save_path}")
-    return [np.array(c, dtype=np.int64) for c in cluster_lists], cluster_sizes
+    return [c.astype(np.int64, copy=False) for c in cluster_lists], cluster_sizes
 
 
 def load_cluster_assignments(save_path, K):
