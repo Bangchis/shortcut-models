@@ -84,7 +84,8 @@ def eval_model(
                 dtype=jnp.float32,
             )
             z, condition = shard_data(z, condition)
-            return call_source(train_state, z, condition)
+            x0, _ = call_source(train_state, z, condition)
+            return x0
 
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
@@ -112,7 +113,8 @@ def eval_model(
             )
             z = jax.random.normal(z_key, latents.shape)
             z, condition = shard_data(z, condition)
-            return call_source(train_state, z, condition)
+            x0, _ = call_source(train_state, z, condition)
+            return x0
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:

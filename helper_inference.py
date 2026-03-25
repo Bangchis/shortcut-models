@@ -84,7 +84,7 @@ def do_inference(
                 dtype=jnp.float32,
             )
             z, condition = shard_data(z, condition)
-            x0 = call_source(train_state, z, condition)
+            x0, _ = call_source(train_state, z, condition)
             return x0
         
         if FLAGS.mode == 'interpolate':
