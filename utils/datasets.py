@@ -1,8 +1,35 @@
 import os
+import sys
+import importlib
 
 import jax
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
+
+def _maybe_import_custom_builder(data_dir, dataset_name):
+    if data_dir is None:
+        return
+
+    builders_root = os.path.join(os.path.dirname(os.path.abspath(data_dir)), 'tfds_builders')
+    if not os.path.isdir(builders_root):
+        return
+
+    if builders_root not in sys.path:
+        sys.path.insert(0, builders_root)
+
+    module_candidates = [dataset_name]
+    package_dir = os.path.join(builders_root, dataset_name)
+    if os.path.isdir(package_dir):
+        for filename in sorted(os.listdir(package_dir)):
+            if filename.endswith('.py') and filename != '__init__.py':
+                module_candidates.append(f"{dataset_name}.{filename[:-3]}")
+
+    for module_name in module_candidates:
+        try:
+            importlib.import_module(module_name)
+        except Exception:
+            continue
 
 
 def _find_built_dataset_dir(data_dir, dataset_name):
@@ -23,6 +50,7 @@ def _find_built_dataset_dir(data_dir, dataset_name):
 
 
 def _load_tfds_dataset(tfds_name, split, data_dir=None):
+    _maybe_import_custom_builder(data_dir, tfds_name)
     try:
         return tfds.load(tfds_name, split=split, data_dir=data_dir, try_gcs=False)
     except Exception:
@@ -34,6 +62,7 @@ def _load_tfds_dataset(tfds_name, split, data_dir=None):
 
 
 def _load_tfds_builder(tfds_name, data_dir=None):
+    _maybe_import_custom_builder(data_dir, tfds_name)
     try:
         return tfds.builder(tfds_name, data_dir=data_dir, try_gcs=False)
     except Exception:
