@@ -19,14 +19,14 @@ nonpytree_field = functools.partial(flax.struct.field, pytree_node=False)
 class TrainStateEma(flax.struct.PyTreeNode):
     rng: Any
     step: int
-    apply_fn: Callable = nonpytree_field()
-    model_def: Any = nonpytree_field()
-    source_apply_fn: Optional[Callable] = nonpytree_field(default=None)
-    source_model_def: Any = nonpytree_field(default=None)
     params: Any
     params_ema: Any
+    apply_fn: Callable = nonpytree_field()
+    model_def: Any = nonpytree_field()
     tx: Any = nonpytree_field()
     opt_state: Any
+    source_apply_fn: Optional[Callable] = nonpytree_field(default=None)
+    source_model_def: Any = nonpytree_field(default=None)
 
     @classmethod
     def create(

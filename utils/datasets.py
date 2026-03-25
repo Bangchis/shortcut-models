@@ -19,13 +19,19 @@ def _maybe_import_custom_builder(data_dir, dataset_name):
         sys.path.insert(0, builders_root)
 
     module_candidates = [dataset_name]
-    package_dir = os.path.join(builders_root, dataset_name)
-    if os.path.isdir(package_dir):
-        for filename in sorted(os.listdir(package_dir)):
-            if filename.endswith('.py') and filename != '__init__.py':
-                module_candidates.append(f"{dataset_name}.{filename[:-3]}")
+    for dirpath, _, filenames in os.walk(builders_root):
+        rel_dir = os.path.relpath(dirpath, builders_root)
+        for filename in sorted(filenames):
+            if not filename.endswith('.py') or filename == '__init__.py':
+                continue
+            module_stem = filename[:-3]
+            if rel_dir == '.':
+                module_name = module_stem
+            else:
+                module_name = rel_dir.replace(os.sep, '.') + '.' + module_stem
+            module_candidates.append(module_name)
 
-    for module_name in module_candidates:
+    for module_name in dict.fromkeys(module_candidates):
         try:
             importlib.import_module(module_name)
         except Exception:
@@ -44,7 +50,14 @@ def _find_built_dataset_dir(data_dir, dataset_name):
         if 'dataset_info.json' in filenames:
             candidates.append(dirpath)
     if not candidates:
-        return None
+        version_dirs = []
+        for name in sorted(os.listdir(dataset_root)):
+            candidate = os.path.join(dataset_root, name)
+            if os.path.isdir(candidate):
+                version_dirs.append(candidate)
+        if version_dirs:
+            return version_dirs[-1]
+        return dataset_root
     candidates.sort(key=lambda path: (path.count(os.sep), path))
     return candidates[-1]
 
