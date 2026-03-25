@@ -37,23 +37,48 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False):
         dataset = tfds.as_numpy(dataset)
         dataset = iter(dataset)
         return dataset
-    elif dataset_name == 'celebahq256':
+    elif dataset_name.startswith('celebahq256'):
+        split_specs = {
+            'train': 'train[:90%]',
+            'validation': 'train[90%:95%]',
+            'test': 'train[95%:]',
+        }
+        if dataset_name == 'celebahq256_valid':
+            split_name = 'validation'
+        elif dataset_name == 'celebahq256_test':
+            split_name = 'test'
+        else:
+            split_name = 'train' if (is_train or debug_overfit) else 'validation'
+        apply_augmentation = split_name == 'train' and is_train
+
         def deserialization_fn(data):
             image = data['image']
-            image = tf.image.random_flip_left_right(image)
+            if apply_augmentation:
+                image = tf.image.random_flip_left_right(image)
             image = tf.cast(image, tf.float32)
             image = image / 255.0
             image = (image - 0.5) / 0.5 # Normalize to [-1, 1]
             return image,  data['label']
 
-        # split = tfds.split_for_jax_process('train' if is_train else 'validation', drop_remainder=True)
-        split='train'
+        # CelebA-HQ is loaded from a TFDS builder without a dedicated validation/test
+        # stream in this codepath, so we carve out deterministic holdout slices from
+        # the train split: 90% train, 5% validation, 5% test.
+        split = split_specs[split_name]
         dataset = tfds.load('celebahq256', split=split)
         dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.shuffle(20000, seed=42+jax.process_index(), reshuffle_each_iteration=True)
-        dataset = dataset.repeat()
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        if debug_overfit:
+            dataset = dataset.take(8)
+            dataset = dataset.repeat()
+            dataset = dataset.batch(batch_size)
+        elif split_name == 'train':
+            dataset = dataset.shuffle(20000, seed=42+jax.process_index(), reshuffle_each_iteration=True)
+            dataset = dataset.repeat()
+            dataset = dataset.batch(batch_size)
+            dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        else:
+            dataset = dataset.repeat()
+            dataset = dataset.batch(batch_size)
+            dataset = dataset.prefetch(tf.data.AUTOTUNE)
         dataset = tfds.as_numpy(dataset)
         dataset = iter(dataset)
         return dataset

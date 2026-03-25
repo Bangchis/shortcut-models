@@ -63,8 +63,9 @@ def eval_model(
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
-        batch_images, batch_labels = next(dataset)
-        valid_images, valid_labels = next(dataset_valid)
+        # Evaluation should be anchored on the validation stream, not the train stream.
+        batch_images, batch_labels = next(dataset_valid)
+        valid_images, valid_labels = batch_images, batch_labels
         if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
             batch_images = vae_encode(key, batch_images)
             valid_images = vae_encode(key, valid_images)
@@ -134,7 +135,7 @@ def eval_model(
             for t in np.arange(0, 32):
                 t = t * (1.0 / 32)
 
-                batch_images_n, batch_labels_n = next(dataset)
+                batch_images_n, batch_labels_n = next(dataset_valid)
                 if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                     batch_images_n = vae_encode(key, batch_images_n)
                 batch_images_sharded, batch_labels_sharded = shard_data(
