@@ -6,6 +6,7 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
+from gmm_utils import flatten_latents, posterior_from_stats
 
 def eval_model(
     FLAGS,
@@ -23,6 +24,7 @@ def eval_model(
     visualize_labels,
     fid_from_stats,
     truth_fid_stats,
+    gmm_state=None,
 ):
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
@@ -57,6 +59,60 @@ def eval_model(
                 call_fn = train_state.call_model
             output = call_fn(images, t, dt, labels, train=False)
             return output
+
+        @partial(jax.jit, static_argnums=(3, 4))
+        def call_source(train_state, latents, condition, return_experts=False, use_ema=True):
+            if use_ema and FLAGS.model.use_ema:
+                call_fn = train_state.call_source_ema
+            else:
+                call_fn = train_state.call_source
+            return call_fn(latents, condition, return_experts=return_experts)
+
+        def sample_source_prior(sample_key, batch_shape):
+            if FLAGS.model.train_type != 'naive-moe-source':
+                return shard_data(jax.random.normal(sample_key, batch_shape))
+            z_key, cond_key = jax.random.split(sample_key)
+            z = jax.random.normal(z_key, batch_shape)
+            sampled_modes = jax.random.categorical(
+                cond_key,
+                jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
+                shape=(batch_shape[0],),
+            )
+            condition = jax.nn.one_hot(
+                sampled_modes,
+                FLAGS.model['gmm_num_modes'],
+                dtype=jnp.float32,
+            )
+            z, condition = shard_data(z, condition)
+            return call_source(train_state, z, condition)
+
+        def sample_source_posterior(sample_key, latents):
+            if FLAGS.model.train_type != 'naive-moe-source':
+                return latents
+            z_key, cond_key = jax.random.split(sample_key)
+            flat_latents = flatten_latents(latents)
+            q = posterior_from_stats(
+                flat_latents,
+                gmm_state['mean'],
+                gmm_state['std'],
+                float(np.asarray(gmm_state.get('standardize_eps', np.array(1e-6, dtype=np.float32)))),
+                gmm_state['log_pi'],
+                gmm_state['mu'],
+                gmm_state['var'],
+            )
+            sampled_modes = jax.random.categorical(
+                cond_key,
+                jnp.log(jnp.maximum(q, 1e-8)),
+                axis=-1,
+            )
+            condition = jax.nn.one_hot(
+                sampled_modes,
+                FLAGS.model['gmm_num_modes'],
+                dtype=jnp.float32,
+            )
+            z = jax.random.normal(z_key, latents.shape)
+            z, condition = shard_data(z, condition)
+            return call_source(train_state, z, condition)
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:
@@ -107,6 +163,9 @@ def eval_model(
         print("One-step Denoising at various t.")
         if 'latent' in FLAGS.dataset_name:
             eps = eps_valid
+        if FLAGS.model.train_type == 'naive-moe-source':
+            eps = sample_source_posterior(jax.random.fold_in(key, 17), valid_images)
+            eps = jax.experimental.multihost_utils.process_allgather(eps)[0]
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -158,8 +217,10 @@ def eval_model(
                 do_cfg = True
             all_x = []
             delta_t = 1.0 / denoise_timesteps
-            x = eps # [local_batch, ...]
-            x = shard_data(x) # [batch, ...] (on all devices)
+            if FLAGS.model.train_type == 'naive-moe-source':
+                x = sample_source_prior(jax.random.fold_in(key, denoise_timesteps), eps.shape)
+            else:
+                x = shard_data(eps) # [batch, ...] (on all devices)
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
@@ -208,9 +269,9 @@ def eval_model(
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
-                x = jax.random.normal(eps_key, images_shape)
+                x = sample_source_prior(eps_key, images_shape)
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
-                x, labels = shard_data(x, labels)
+                labels = shard_data(labels)
                 x0_initial = x  # initial noise for ti==0 special-case
                 delta_t = 1.0 / denoise_timesteps
                 for ti in range(denoise_timesteps):

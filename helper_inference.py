@@ -28,6 +28,7 @@ def do_inference(
     visualize_labels,
     fid_from_stats,
     truth_fid_stats,
+    gmm_state=None,
 ):
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
@@ -57,6 +58,34 @@ def do_inference(
                 call_fn = train_state.call_model
             output = call_fn(images, t, dt, labels, train=False)
             return output
+
+        @partial(jax.jit, static_argnums=(3, 4))
+        def call_source(train_state, latents, condition, return_experts=False, use_ema=True):
+            if use_ema and FLAGS.model.use_ema:
+                call_fn = train_state.call_source_ema
+            else:
+                call_fn = train_state.call_source
+            return call_fn(latents, condition, return_experts=return_experts)
+
+        def sample_source_prior(sample_key):
+            if FLAGS.model.train_type != 'naive-moe-source':
+                latents = jax.random.normal(sample_key, images_shape)
+                return shard_data(latents)
+            z_key, cond_key = jax.random.split(sample_key)
+            z = jax.random.normal(z_key, images_shape)
+            sampled_modes = jax.random.categorical(
+                cond_key,
+                jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
+                shape=(images_shape[0],),
+            )
+            condition = jax.nn.one_hot(
+                sampled_modes,
+                FLAGS.model['gmm_num_modes'],
+                dtype=jnp.float32,
+            )
+            z, condition = shard_data(z, condition)
+            x0 = call_source(train_state, z, condition)
+            return x0
         
         if FLAGS.mode == 'interpolate':
             seed = 5
@@ -93,16 +122,16 @@ def do_inference(
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
-            x = jax.random.normal(eps_key, images_shape)
+            x = sample_source_prior(eps_key)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
-            x, labels = shard_data(x, labels)
+            labels = shard_data(labels)
             x0_initial = x  # initial noise for ti==0 special-case
             x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             delta_t = 1.0 / denoise_timesteps
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
                 t_vector = jnp.full((images_shape[0], ), t)
-                if FLAGS.model.train_type == 'naive':
+                if FLAGS.model.train_type in ('naive', 'naive-moe-source'):
                     dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
                     dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow # Smallest dt.
                 else: # shortcut
