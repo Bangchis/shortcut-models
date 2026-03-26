@@ -35,7 +35,7 @@ def do_inference(
         key = jax.random.PRNGKey(42 + jax.process_index())
         batch_images, batch_labels = next(dataset)
         valid_images, valid_labels = next(dataset_valid)
-        if FLAGS.model.use_stable_vae:
+        if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
             batch_images = vae_encode(key, batch_images)
             valid_images = vae_encode(key, valid_images)
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
@@ -71,7 +71,7 @@ def do_inference(
             if FLAGS.model.train_type != 'naive-moe-source':
                 latents = jax.random.normal(sample_key, images_shape)
                 return shard_data(latents)
-            z_key, cond_key = jax.random.split(sample_key)
+            z_key, cond_key, x0_key = jax.random.split(sample_key, 3)
             z = jax.random.normal(z_key, images_shape)
             sampled_modes = jax.random.categorical(
                 cond_key,
@@ -84,8 +84,9 @@ def do_inference(
                 dtype=jnp.float32,
             )
             z, condition = shard_data(z, condition)
-            x0, _ = call_source(train_state, z, condition)
-            return x0
+            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition)
+            x0_key = shard_data(jax.random.normal(x0_key, images_shape))
+            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
         
         if FLAGS.mode == 'interpolate':
             seed = 5

@@ -71,7 +71,7 @@ def eval_model(
         def sample_source_prior(sample_key, batch_shape):
             if FLAGS.model.train_type != 'naive-moe-source':
                 return shard_data(jax.random.normal(sample_key, batch_shape))
-            z_key, cond_key = jax.random.split(sample_key)
+            z_key, cond_key, x0_key = jax.random.split(sample_key, 3)
             z = jax.random.normal(z_key, batch_shape)
             sampled_modes = jax.random.categorical(
                 cond_key,
@@ -84,13 +84,14 @@ def eval_model(
                 dtype=jnp.float32,
             )
             z, condition = shard_data(z, condition)
-            x0, _ = call_source(train_state, z, condition)
-            return x0
+            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition)
+            x0_key = shard_data(jax.random.normal(x0_key, batch_shape))
+            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
 
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
                 return latents
-            z_key, cond_key = jax.random.split(sample_key)
+            z_key, x0_key = jax.random.split(sample_key)
             flat_latents = flatten_latents(latents)
             q = posterior_from_stats(
                 flat_latents,
@@ -101,20 +102,11 @@ def eval_model(
                 gmm_state['mu'],
                 gmm_state['var'],
             )
-            sampled_modes = jax.random.categorical(
-                cond_key,
-                jnp.log(jnp.maximum(q, 1e-8)),
-                axis=-1,
-            )
-            condition = jax.nn.one_hot(
-                sampled_modes,
-                FLAGS.model['gmm_num_modes'],
-                dtype=jnp.float32,
-            )
             z = jax.random.normal(z_key, latents.shape)
-            z, condition = shard_data(z, condition)
-            x0, _ = call_source(train_state, z, condition)
-            return x0
+            z, q = shard_data(z, q)
+            mu_x0, logvar_x0, _, _ = call_source(train_state, z, q)
+            x0_key = shard_data(jax.random.normal(x0_key, latents.shape))
+            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:

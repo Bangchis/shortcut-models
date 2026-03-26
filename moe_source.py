@@ -1,14 +1,27 @@
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
 
+def sample_diag_gaussian(key, mu, logvar):
+    eps = jax.random.normal(key, mu.shape)
+    return mu + eps * jnp.exp(0.5 * logvar)
+
+
+def var_only_kld_loss(var, logvar, target_std=1.0, eps=1e-6):
+    target_var = jnp.maximum(jnp.asarray(target_std, dtype=var.dtype) ** 2, eps)
+    var_star = var / target_var
+    logvar_star = logvar - jnp.log(target_var)
+    return -0.5 * jnp.mean(1.0 + logvar_star - var_star)
+
+
 class ConditionProjector(nn.Module):
-    num_modes: int
+    condition_dim: int
     hidden_channels: int
 
     @nn.compact
-    def __call__(self, condition):
-        x = nn.Dense(self.hidden_channels)(condition)
+    def __call__(self, condition_embedding):
+        x = nn.Dense(self.hidden_channels)(condition_embedding)
         x = nn.silu(x)
         x = nn.Dense(self.hidden_channels)(x)
         return x
@@ -45,37 +58,65 @@ class SourceExpert(nn.Module):
     hidden_channels: int
     out_channels: int
     zero_init: bool
+    logvar_min: float
+    logvar_max: float
 
     @nn.compact
     def __call__(self, features):
         x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(features)
         x = nn.silu(x)
-        kernel_init = nn.initializers.zeros if self.zero_init else nn.initializers.lecun_normal()
-        bias_init = nn.initializers.zeros
-        x = nn.Conv(
+        if self.zero_init:
+            kernel_init = nn.initializers.zeros
+            mu_bias_init = nn.initializers.zeros
+            logvar_bias_init = nn.initializers.zeros
+        else:
+            kernel_init = nn.initializers.lecun_normal()
+            mu_bias_init = nn.initializers.zeros
+            logvar_bias_init = nn.initializers.zeros
+        mu = nn.Conv(
             self.out_channels,
             (3, 3),
             padding='SAME',
             kernel_init=kernel_init,
-            bias_init=bias_init,
+            bias_init=mu_bias_init,
+            name='mu_head',
         )(x)
-        return x
+        logvar = nn.Conv(
+            self.out_channels,
+            (3, 3),
+            padding='SAME',
+            kernel_init=kernel_init,
+            bias_init=logvar_bias_init,
+            name='logvar_head',
+        )(x)
+        logvar = jnp.clip(logvar, self.logvar_min, self.logvar_max)
+        return mu, logvar
 
 
 class SourceMoE(nn.Module):
     num_modes: int
+    condition_dim: int
     hidden_channels: int
     out_channels: int
     tau: float
+    var_eps: float
+    logvar_min: float
+    logvar_max: float
     zero_init: bool = True
 
     @nn.compact
-    def __call__(self, z, condition, return_experts=False):
+    def __call__(self, z, condition_weights, return_experts=False):
+        mode_embeddings = self.param(
+            'mode_embeddings',
+            nn.initializers.normal(stddev=0.02),
+            (self.num_modes, self.condition_dim),
+        )
+        condition_embedding = jnp.matmul(condition_weights, mode_embeddings)
         condition_bias = ConditionProjector(
-            num_modes=self.num_modes,
+            condition_dim=self.condition_dim,
             hidden_channels=self.hidden_channels,
             name='condition_projector',
-        )(condition)
+        )(condition_embedding)
         condition_bias = condition_bias[:, None, None, :]
 
         features = SharedTrunk(
@@ -91,23 +132,38 @@ class SourceMoE(nn.Module):
             name='router',
         )(conditioned_features)
 
-        expert_outputs = []
+        expert_mu = []
+        expert_logvar = []
         for idx in range(self.num_modes):
-            expert_outputs.append(
-                SourceExpert(
-                    hidden_channels=self.hidden_channels,
-                    out_channels=self.out_channels,
-                    zero_init=self.zero_init,
-                    name=f'expert_{idx}',
-                )(conditioned_features)
-            )
-        expert_outputs = jnp.stack(expert_outputs, axis=1)
-        delta = jnp.sum(
-            expert_outputs * alpha[:, :, None, None, None],
-            axis=1,
-        )
-        x0 = z + delta
+            mu_j, logvar_j = SourceExpert(
+                hidden_channels=self.hidden_channels,
+                out_channels=self.out_channels,
+                zero_init=self.zero_init,
+                logvar_min=self.logvar_min,
+                logvar_max=self.logvar_max,
+                name=f'expert_{idx}',
+            )(conditioned_features)
+            expert_mu.append(mu_j)
+            expert_logvar.append(logvar_j)
+
+        expert_mu = jnp.stack(expert_mu, axis=1)
+        expert_logvar = jnp.stack(expert_logvar, axis=1)
+        expert_var = jnp.exp(expert_logvar)
+
+        alpha_full = alpha[:, :, None, None, None]
+        mu_x0 = jnp.sum(expert_mu * alpha_full, axis=1)
+        second_moment = jnp.sum(alpha_full * (expert_var + expert_mu ** 2), axis=1)
+        var_x0 = jnp.maximum(second_moment - mu_x0 ** 2, self.var_eps)
+        logvar_x0 = jnp.log(var_x0 + self.var_eps)
 
         if return_experts:
-            return x0, alpha, expert_outputs, logits
-        return x0, alpha
+            return (
+                mu_x0,
+                logvar_x0,
+                var_x0,
+                alpha,
+                expert_mu,
+                expert_logvar,
+                logits,
+            )
+        return mu_x0, logvar_x0, var_x0, alpha
