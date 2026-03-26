@@ -99,6 +99,7 @@ class SourceMoE(nn.Module):
     hidden_channels: int
     out_channels: int
     tau: float
+    soft_moe: bool
     var_eps: float
     logvar_min: float
     logvar_max: float
@@ -150,7 +151,16 @@ class SourceMoE(nn.Module):
         expert_logvar = jnp.stack(expert_logvar, axis=1)
         expert_var = jnp.exp(expert_logvar)
 
-        alpha_full = alpha[:, :, None, None, None]
+        if self.soft_moe:
+            alpha_mix = alpha
+        else:
+            alpha_mix = jax.nn.one_hot(
+                jnp.argmax(alpha, axis=-1),
+                self.num_modes,
+                dtype=alpha.dtype,
+            )
+
+        alpha_full = alpha_mix[:, :, None, None, None]
         mu_x0 = jnp.sum(expert_mu * alpha_full, axis=1)
         second_moment = jnp.sum(alpha_full * (expert_var + expert_mu ** 2), axis=1)
         var_x0 = jnp.maximum(second_moment - mu_x0 ** 2, self.var_eps)

@@ -72,6 +72,7 @@ model_config = ml_collections.ConfigDict({
     'train_type': 'shortcut',  # or naive, naive-moe-source, khoat-fm.
     'gmm_stats_path': '',
     'gmm_num_modes': 4,
+    'source_soft_moe': 1,
     'source_condition_dim': 16,
     'source_hidden_channels': 64,
     'source_tau': 2.0,
@@ -214,6 +215,7 @@ def main(_):
             hidden_channels=FLAGS.model['source_hidden_channels'],
             out_channels=example_obs_shape[-1],
             tau=FLAGS.model['source_tau'],
+            soft_moe=bool(FLAGS.model['source_soft_moe']),
             var_eps=FLAGS.model['source_var_eps'],
             logvar_min=FLAGS.model['source_logvar_min'],
             logvar_max=FLAGS.model['source_logvar_max'],
@@ -352,8 +354,8 @@ def main(_):
         if FLAGS.model['train_type'] == 'naive-moe-source':
 
             def loss_fn(grad_params):
-                label_key, time_key, z_key, x0_key = jax.random.split(
-                    targets_key, 4)
+                label_key, time_key, z_key, mode_key, x0_key = jax.random.split(
+                    targets_key, 5)
 
                 labels_dropout = jax.random.bernoulli(
                     label_key,
@@ -388,10 +390,20 @@ def main(_):
                     gmm_state['var'],
                 )
                 q = jax.lax.stop_gradient(q)
+                sampled_modes = jax.random.categorical(
+                    mode_key,
+                    jnp.log(jnp.maximum(q, 1e-8)),
+                    axis=-1,
+                )
+                condition_weights = jax.nn.one_hot(
+                    sampled_modes,
+                    FLAGS.model['gmm_num_modes'],
+                    dtype=jnp.float32,
+                )
                 z = jax.random.normal(z_key, images.shape)
                 mu_x0, logvar_x0, var_x0, alpha, expert_mu, expert_logvar, router_logits = train_state.call_source(
                     z,
-                    q,
+                    condition_weights,
                     params=grad_params,
                     return_experts=True,
                 )

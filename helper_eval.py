@@ -91,7 +91,7 @@ def eval_model(
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
                 return latents
-            z_key, x0_key = jax.random.split(sample_key)
+            z_key, mode_key, x0_key = jax.random.split(sample_key, 3)
             flat_latents = flatten_latents(latents)
             q = posterior_from_stats(
                 flat_latents,
@@ -102,9 +102,19 @@ def eval_model(
                 gmm_state['mu'],
                 gmm_state['var'],
             )
+            sampled_modes = jax.random.categorical(
+                mode_key,
+                jnp.log(jnp.maximum(q, 1e-8)),
+                axis=-1,
+            )
+            condition_weights = jax.nn.one_hot(
+                sampled_modes,
+                FLAGS.model['gmm_num_modes'],
+                dtype=jnp.float32,
+            )
             z = jax.random.normal(z_key, latents.shape)
-            z, q = shard_data(z, q)
-            mu_x0, logvar_x0, _, _ = call_source(train_state, z, q)
+            z, condition_weights = shard_data(z, condition_weights)
+            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition_weights)
             x0_key = shard_data(jax.random.normal(x0_key, latents.shape))
             return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
 
