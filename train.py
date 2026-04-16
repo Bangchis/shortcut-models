@@ -1,4 +1,6 @@
 from typing import Any
+import json
+import os
 import jax.numpy as jnp
 from absl import app, flags
 from functools import partial
@@ -41,6 +43,11 @@ flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
+flags.DEFINE_string('metrics_output_path', None, 'Optional JSON path for final metrics.')
+flags.DEFINE_string('final_save_dir', None, 'Optional final checkpoint path.')
+flags.DEFINE_integer('run_final_inference', 0, 'Whether to run final inference after training.')
+flags.DEFINE_integer('dump_source_stats', 0, 'Whether inference should dump source/data stats.')
+flags.DEFINE_integer('source_stats_samples', 4096, 'How many samples to collect for source stats dumps.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -113,12 +120,38 @@ def get_backbone_params(params):
         return params['backbone']
     return params
 
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _write_metrics_json(path, payload):
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(_json_ready(payload), f, indent=2, sort_keys=True)
+
 ##############################################
 # Training Code.
 ##############################################
 
 
 def main(_):
+    if FLAGS.mode == 'moe1-ablation':
+        from moe1_ablation import run as run_moe1_ablation
+        run_moe1_ablation(FLAGS)
+        return
 
     np.random.seed(FLAGS.seed)
     if FLAGS.model.train_type == 'naive-moe-source':
@@ -460,6 +493,8 @@ def main(_):
                     'router/entropy_mean': loss_entropy,
                     'posterior/q_entropy_mean': jnp.mean(
                         -jnp.sum(q * jnp.log(jnp.maximum(q, 1e-8)), axis=-1)),
+                    'q_alpha_agreement': jnp.mean(
+                        jnp.argmax(q, axis=-1) == jnp.argmax(alpha, axis=-1)),
                     'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
                     'router/logit_norm': jnp.sqrt(jnp.mean(jnp.square(router_logits))),
                     'dropped_ratio': jnp.mean(
@@ -576,6 +611,27 @@ def main(_):
     # Train Loop
     ###################################
 
+    def summarize_moe_metrics(metric_dict):
+        summary = {}
+        if FLAGS.model['train_type'] != 'naive-moe-source':
+            return summary
+        usage_keys = [k for k in metric_dict if k.startswith('router/argmax_freq_')]
+        soft_usage_keys = [k for k in metric_dict if k.startswith('router/usage_mean_')]
+        summary['max_usage'] = max((float(metric_dict[k]) for k in usage_keys), default=0.0)
+        summary['max_soft_usage'] = max((float(metric_dict[k]) for k in soft_usage_keys), default=0.0)
+        for key in (
+            'router/entropy_mean',
+            'q_alpha_agreement',
+            'source/var_mean',
+            'source/var_min',
+            'source/mu_x0_norm',
+        ):
+            if key in metric_dict:
+                summary[key] = float(metric_dict[key])
+        return summary
+
+    last_summary_metrics = None
+
     for i in tqdm.tqdm(range(1 + start_step, FLAGS.max_steps + 1 + start_step),
                        smoothing=0.1,
                        dynamic_ncols=True):
@@ -608,8 +664,24 @@ def main(_):
                 lambda x: x.mean(), valid_update_info)
             train_metrics['training/loss_valid'] = valid_update_info['loss']
 
+            valid_moe_summary = summarize_moe_metrics(valid_update_info)
+            last_summary_metrics = {
+                'step': int(i),
+                'train_loss': float(update_info['loss']),
+                'valid_loss': float(valid_update_info['loss']),
+                'lr': float(update_info['lr']),
+                **valid_moe_summary,
+            }
+
             if jax.process_index() == 0:
-                wandb.log(train_metrics, step=i)
+                summary_metrics = {
+                    'summary/train_loss': float(update_info['loss']),
+                    'summary/valid_loss': float(valid_update_info['loss']),
+                    'summary/lr': float(update_info['lr']),
+                }
+                for key, value in valid_moe_summary.items():
+                    summary_metrics[f'summary/{key.replace("/", "_")}'] = float(value)
+                wandb.log({**train_metrics, **summary_metrics}, step=i)
 
         if FLAGS.model['train_type'] == 'progressive':
             num_sections = np.log2(
@@ -633,6 +705,49 @@ def main(_):
                 cp.save()
                 del cp
             del train_state_gather
+
+    final_inference_metrics = None
+    if FLAGS.run_final_inference:
+        if FLAGS.fid_stats is None:
+            raise ValueError("--fid_stats is required when --run_final_inference=1.")
+        final_inference_metrics = do_inference(
+            FLAGS,
+            train_state,
+            int(train_state.step),
+            dataset,
+            dataset_valid,
+            shard_data,
+            vae_encode,
+            vae_decode,
+            update,
+            get_fid_activations,
+            imagenet_labels,
+            visualize_labels,
+            fid_from_stats,
+            truth_fid_stats,
+            gmm_state,
+        )
+
+    if FLAGS.final_save_dir is not None:
+        train_state_gather = jax.experimental.multihost_utils.process_allgather(train_state)
+        if jax.process_index() == 0:
+            cp = Checkpoint(FLAGS.final_save_dir, parallel=False)
+            cp.train_state = train_state_gather
+            cp.save()
+            del cp
+        del train_state_gather
+
+    if jax.process_index() == 0 and FLAGS.metrics_output_path:
+        _write_metrics_json(
+            FLAGS.metrics_output_path,
+            {
+                'train': last_summary_metrics or {},
+                'inference': final_inference_metrics or {},
+                'mode': FLAGS.mode,
+                'train_type': FLAGS.model['train_type'],
+                'max_steps': int(FLAGS.max_steps),
+            },
+        )
 
 
 if __name__ == '__main__':

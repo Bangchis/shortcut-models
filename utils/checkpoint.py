@@ -67,8 +67,9 @@ class Checkpoint:
             with tf.io.gfile.GFile(filename, 'wb') as f:
                 f.write(content)
         else:
-            os.makedirs(filename, exist_ok=True)
-            tmp = parent_dir(filename) + '/' + name(filename) + '.tmp'
+            local_dir = os.path.dirname(filename) or '.'
+            os.makedirs(local_dir, exist_ok=True)
+            tmp = filename + '.tmp'
             with open(tmp, 'wb') as f:
                 f.write(content)
             shutil.move(tmp, filename)

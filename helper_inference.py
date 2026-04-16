@@ -6,8 +6,11 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 import os
+import json
+import time
 from functools import partial
 from absl import app, flags
+from gmm_utils import flatten_latents, posterior_from_stats
 
 flags.DEFINE_integer('inference_timesteps', 128, 'Number of timesteps for inference.')
 flags.DEFINE_integer('inference_generations', 4096, 'Number of generations for inference.')
@@ -30,6 +33,26 @@ def do_inference(
     truth_fid_stats,
     gmm_state=None,
 ):
+    def _json_ready(value):
+        if isinstance(value, dict):
+            return {str(k): _json_ready(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_ready(v) for v in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        return value
+
+    def _write_metrics(path, payload):
+        if not path:
+            return
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(_json_ready(payload), f, indent=2, sort_keys=True)
+
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
@@ -87,6 +110,88 @@ def do_inference(
             mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition)
             x0_key = shard_data(jax.random.normal(x0_key, images_shape))
             return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
+
+        def sample_source_posterior(sample_key, latents):
+            if FLAGS.model.train_type != 'naive-moe-source':
+                return latents, None
+            z_key, mode_key, x0_key = jax.random.split(sample_key, 3)
+            flat_latents = flatten_latents(latents)
+            q = posterior_from_stats(
+                flat_latents,
+                gmm_state['mean'],
+                gmm_state['std'],
+                float(np.asarray(gmm_state.get('standardize_eps', np.array(1e-6, dtype=np.float32)))),
+                gmm_state['log_pi'],
+                gmm_state['mu'],
+                gmm_state['var'],
+            )
+            sampled_modes = jax.random.categorical(
+                mode_key,
+                jnp.log(jnp.maximum(q, 1e-8)),
+                axis=-1,
+            )
+            condition_weights = jax.nn.one_hot(
+                sampled_modes,
+                FLAGS.model['gmm_num_modes'],
+                dtype=jnp.float32,
+            )
+            z = jax.random.normal(z_key, latents.shape)
+            z, condition_weights = shard_data(z, condition_weights)
+            mu_x0, logvar_x0, _, alpha = call_source(train_state, z, condition_weights)
+            x0_key = shard_data(jax.random.normal(x0_key, latents.shape))
+            x0 = mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
+            stats = {
+                'q_posterior': np.array(q),
+                'alpha_posterior': np.array(jax.experimental.multihost_utils.process_allgather(alpha)[0]),
+                'conditioned_mode': np.array(sampled_modes),
+            }
+            return x0, stats
+
+        def dump_source_stats_if_needed():
+            if not FLAGS.dump_source_stats or FLAGS.save_dir is None:
+                return None
+            os.makedirs(FLAGS.save_dir, exist_ok=True)
+            num_needed = max(int(FLAGS.source_stats_samples), images_shape[0])
+            x1_chunks = []
+            x0_posterior_chunks = []
+            q_chunks = []
+            alpha_chunks = []
+            mode_chunks = []
+            gathered = 0
+            stats_key = jax.random.PRNGKey(1701 + jax.process_index())
+            while gathered < num_needed:
+                batch_images_local, _ = next(dataset_valid)
+                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                    nonlocal_key = jax.random.fold_in(stats_key, gathered)
+                    batch_images_local = vae_encode(nonlocal_key, batch_images_local)
+                batch_take = min(num_needed - gathered, batch_images_local.shape[0])
+                batch_latents = batch_images_local[:batch_take]
+                x1_chunks.append(np.array(batch_latents))
+                x0_posterior, posterior_stats = sample_source_posterior(
+                    jax.random.fold_in(stats_key, gathered + 1),
+                    batch_latents,
+                )
+                if posterior_stats is not None:
+                    x0_posterior_chunks.append(
+                        np.array(jax.experimental.multihost_utils.process_allgather(x0_posterior)[0][:batch_take])
+                    )
+                    q_chunks.append(posterior_stats['q_posterior'][:batch_take])
+                    alpha_chunks.append(posterior_stats['alpha_posterior'][:batch_take])
+                    mode_chunks.append(posterior_stats['conditioned_mode'][:batch_take])
+                gathered += batch_take
+            payload = {
+                'x1_data': np.concatenate(x1_chunks, axis=0)[:num_needed],
+                'x0_prior': np.concatenate(x0, axis=0)[:num_needed] if x0 else np.zeros((0,)),
+                'x1_final': np.concatenate(x1, axis=0)[:num_needed] if x1 else np.zeros((0,)),
+                'labels': np.concatenate(lab, axis=0)[:num_needed] if lab else np.zeros((0,)),
+            }
+            if x0_posterior_chunks:
+                payload['x0_posterior'] = np.concatenate(x0_posterior_chunks, axis=0)[:num_needed]
+                payload['q_posterior'] = np.concatenate(q_chunks, axis=0)[:num_needed]
+                payload['alpha_posterior'] = np.concatenate(alpha_chunks, axis=0)[:num_needed]
+                payload['conditioned_mode'] = np.concatenate(mode_chunks, axis=0)[:num_needed]
+            np.savez(os.path.join(FLAGS.save_dir, 'source_stats.npz'), **payload)
+            return os.path.join(FLAGS.save_dir, 'source_stats.npz')
         
         if FLAGS.mode == 'interpolate':
             seed = 5
@@ -117,12 +222,14 @@ def do_inference(
         x_render = []
         activations = []
         images_shape = batch_images.shape
+        generation_time = 0.0
         print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
         for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
             key = jax.random.PRNGKey(42)
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
+            batch_start = time.perf_counter()
             x = sample_source_prior(eps_key)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             labels = shard_data(labels)
@@ -163,6 +270,8 @@ def do_inference(
                     x = x1pred * (t+delta_t) + eps * (1-t-delta_t)
                 else:
                     x = x + v * delta_t # Euler sampling.
+            x = jax.block_until_ready(x)
+            generation_time += time.perf_counter() - batch_start
             x1.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             lab.append(np.array(jax.experimental.multihost_utils.process_allgather(labels)))
             if FLAGS.model.use_stable_vae:
@@ -185,7 +294,27 @@ def do_inference(
             print(f"FID is {fid}")
             print(f"FID is {fid}")
             print(f"FID is {fid}")
-
+            latency = generation_time / max(num_generations, 1)
+            throughput = num_generations / max(generation_time, 1e-8)
+            source_stats_path = dump_source_stats_if_needed()
+            summary = {
+                'fid128_4096': float(fid),
+                'denoise_timesteps': int(denoise_timesteps),
+                'num_generations': int(num_generations),
+                'latency_128': float(latency),
+                'throughput_128': float(throughput),
+                'source_stats_path': source_stats_path,
+            }
+            if wandb.run is not None and step is not None:
+                wandb.log(
+                    {
+                        'final/fid128_4096': float(fid),
+                        'final/latency_128': float(latency),
+                        'final/throughput_128': float(throughput),
+                    },
+                    step=int(step),
+                )
+            _write_metrics(FLAGS.metrics_output_path, summary)
 
             if FLAGS.save_dir is not None:
                 os.makedirs(FLAGS.save_dir, exist_ok=True)
@@ -199,3 +328,5 @@ def do_inference(
                 # np.save(FLAGS.save_dir + f'/x0.npy', x0)
                 # np.save(FLAGS.save_dir + f'/x1.npy', x1)
                 # np.save(FLAGS.save_dir + f'/lab.npy', lab)
+            return summary
+        return {}

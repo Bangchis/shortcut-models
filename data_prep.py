@@ -1,14 +1,20 @@
 import os
+import json
 
 from absl import app, flags
 from ml_collections import config_flags
 import ml_collections
 import jax
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from gmm_utils import (
+    diag_gmm_log_prob,
     fit_diag_gmm,
     flatten_latents,
+    standardize_latents,
     save_gmm_stats,
 )
 from utils.datasets import get_dataset, get_num_examples
@@ -42,6 +48,10 @@ flags.DEFINE_float('gmm_weight_prior', 1e-2, 'Pseudo-count added to each mixture
 flags.DEFINE_integer('gmm_kmeanspp_init', 1, 'Whether to use kmeans++-style initialization.')
 flags.DEFINE_integer('gmm_em_chunk_size', 1024, 'Chunk size for E-step/M-step accumulation.')
 flags.DEFINE_integer('gmm_keep_latent_cache', 0, 'Whether to keep the latent cache file after fitting.')
+flags.DEFINE_integer('gmm_valid_samples', -1, 'How many validation latents to use. -1 means full split.')
+flags.DEFINE_integer('gmm_visual_subset', 2048, 'How many points to use for PCA/t-SNE visualizations.')
+flags.DEFINE_string('metrics_output_path', None, 'Optional JSON path for GMM metrics.')
+flags.DEFINE_string('figures_dir', None, 'Optional directory to save diagnostic figures.')
 
 
 wandb_config = default_wandb_config()
@@ -57,6 +67,62 @@ def _resolve_cache_path():
         return FLAGS.gmm_latent_cache_path
     base, _ = os.path.splitext(FLAGS.gmm_save_path)
     return base + '_latents.npy'
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _write_json(path, payload):
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(_json_ready(payload), f, indent=2, sort_keys=True)
+
+
+def _collect_latents(dataset, target_examples, vae_encode, vae_rng):
+    latents = []
+    count = 0
+    while target_examples < 0 or count < target_examples:
+        try:
+            batch_images, _ = next(dataset)
+        except StopIteration:
+            break
+        vae_rng, vae_key = jax.random.split(vae_rng)
+        batch_latents = vae_encode(vae_key, batch_images)
+        batch_flat = np.asarray(jax.device_get(flatten_latents(batch_latents)), dtype=np.float32)
+        if target_examples >= 0:
+            take = min(target_examples - count, batch_flat.shape[0])
+            if take <= 0:
+                break
+            batch_flat = batch_flat[:take]
+        latents.append(batch_flat)
+        count += batch_flat.shape[0]
+    if not latents:
+        return np.zeros((0, 0), dtype=np.float32), vae_rng
+    return np.concatenate(latents, axis=0), vae_rng
+
+
+def _save_figure(fig, figures_dir, name):
+    if not figures_dir:
+        return None
+    os.makedirs(figures_dir, exist_ok=True)
+    path = os.path.join(figures_dir, f'{name}.png')
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
 
 
 def main(_):
@@ -87,6 +153,14 @@ def main(_):
         FLAGS.dataset_name,
         FLAGS.batch_size,
         True,
+        debug_overfit=False,
+        data_dir=FLAGS.tfds_data_dir,
+        repeat=False,
+    )
+    dataset_valid = get_dataset(
+        FLAGS.dataset_name,
+        FLAGS.batch_size,
+        False,
         debug_overfit=False,
         data_dir=FLAGS.tfds_data_dir,
         repeat=False,
@@ -190,6 +264,134 @@ def main(_):
     save_gmm_stats(FLAGS.gmm_save_path, stats_to_save)
     print(f"Saved GMM stats to {FLAGS.gmm_save_path}")
 
+    valid_latents, vae_rng = _collect_latents(
+        dataset_valid,
+        FLAGS.gmm_valid_samples,
+        vae_encode,
+        vae_rng,
+    )
+    if valid_latents.shape[0] == 0:
+        raise ValueError("No validation latents were extracted for GMM evaluation.")
+
+    valid_latents_std = standardize_latents(
+        valid_latents,
+        stats_to_save['mean'],
+        stats_to_save['std'],
+        FLAGS.gmm_standardize_eps,
+    )
+    train_latents_std = np.asarray(latent_cache[:min(target_examples, max(FLAGS.gmm_visual_subset, 1))], dtype=np.float32)
+
+    log_pi = jax.numpy.asarray(np.log(np.maximum(stats_to_save['pi'], 1e-8)), dtype=jax.numpy.float32)
+    mu_device = jax.numpy.asarray(stats_to_save['mu'], dtype=jax.numpy.float32)
+    var_device = jax.numpy.asarray(stats_to_save['var'], dtype=jax.numpy.float32)
+
+    def _mean_nll(latents_std):
+        chunk = jax.numpy.asarray(latents_std, dtype=jax.numpy.float32)
+        log_prob = diag_gmm_log_prob(chunk, log_pi, mu_device, var_device)
+        log_norm = jax.scipy.special.logsumexp(log_prob, axis=-1)
+        return float(-np.mean(np.asarray(jax.device_get(log_norm))))
+
+    valid_log_prob = np.asarray(jax.device_get(diag_gmm_log_prob(
+        jax.numpy.asarray(valid_latents_std, dtype=jax.numpy.float32),
+        log_pi,
+        mu_device,
+        var_device,
+    )))
+    valid_log_norm = np.asarray(jax.device_get(jax.scipy.special.logsumexp(valid_log_prob, axis=-1, keepdims=True)))
+    valid_q = np.exp(valid_log_prob - valid_log_norm)
+
+    occupancy = stats_to_save['final_counts'] / np.maximum(np.sum(stats_to_save['final_counts']), 1e-8)
+    occupancy_entropy = float(-np.sum(occupancy * np.log(np.maximum(occupancy, 1e-8))))
+    posterior_entropy = -np.sum(valid_q * np.log(np.maximum(valid_q, 1e-8)), axis=-1)
+    q_sorted = np.sort(valid_q, axis=-1)
+    posterior_margin = q_sorted[:, -1] - q_sorted[:, -2] if valid_q.shape[1] > 1 else q_sorted[:, -1]
+    pairwise_center_distance = np.linalg.norm(
+        stats_to_save['mu'][:, None, :] - stats_to_save['mu'][None, :, :],
+        axis=-1,
+    )
+    gmm_metrics = {
+        'gmm_num_modes': int(FLAGS.gmm_num_modes),
+        'train_nll': float(stats_to_save['nll_trace'][-1]),
+        'valid_nll': _mean_nll(valid_latents_std),
+        'dead_component_count': int(np.sum(stats_to_save['final_counts'] < 1.0)),
+        'max_component_fraction': float(np.max(occupancy)),
+        'occupancy_entropy': occupancy_entropy,
+        'posterior_entropy_mean': float(np.mean(posterior_entropy)),
+        'posterior_top1_margin_mean': float(np.mean(posterior_margin)),
+        'var_floor_hit_rate': float(np.mean(stats_to_save['var'] <= (FLAGS.gmm_var_floor * 1.0001))),
+        'n_train_used': int(target_examples),
+        'n_valid_used': int(valid_latents.shape[0]),
+        'gmm_save_path': FLAGS.gmm_save_path,
+    }
+
+    figure_paths = {}
+    figures_dir = FLAGS.figures_dir
+    if figures_dir:
+        os.makedirs(figures_dir, exist_ok=True)
+        subset_n = min(FLAGS.gmm_visual_subset, valid_latents_std.shape[0], train_latents_std.shape[0])
+        if subset_n > 1:
+            plot_points = np.concatenate(
+                [train_latents_std[:subset_n], valid_latents_std[:subset_n], stats_to_save['mu']],
+                axis=0,
+            )
+            labels = np.concatenate(
+                [
+                    np.full((subset_n,), -2, dtype=np.int32),
+                    np.argmax(valid_q[:subset_n], axis=-1).astype(np.int32),
+                    np.full((stats_to_save['mu'].shape[0],), -1, dtype=np.int32),
+                ],
+                axis=0,
+            )
+            pca = PCA(n_components=2, random_state=0)
+            coords = pca.fit_transform(plot_points)
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ax.scatter(coords[:subset_n, 0], coords[:subset_n, 1], s=6, alpha=0.2, label='train')
+            valid_coords = coords[subset_n:2 * subset_n]
+            ax.scatter(valid_coords[:, 0], valid_coords[:, 1], c=labels[subset_n:2 * subset_n], s=8, cmap='tab20', alpha=0.6, label='valid')
+            center_coords = coords[2 * subset_n:]
+            ax.scatter(center_coords[:, 0], center_coords[:, 1], c='black', s=80, marker='x', label='centers')
+            ax.set_title(f'PCA GMM K={FLAGS.gmm_num_modes}')
+            ax.legend(loc='best')
+            figure_paths['pca'] = _save_figure(fig, figures_dir, 'pca')
+
+            tsne_subset = min(1024, subset_n)
+            tsne_input = np.concatenate([valid_latents_std[:tsne_subset], stats_to_save['mu']], axis=0)
+            tsne = TSNE(n_components=2, random_state=0, init='pca', learning_rate='auto')
+            tsne_coords = tsne.fit_transform(tsne_input)
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ax.scatter(tsne_coords[:tsne_subset, 0], tsne_coords[:tsne_subset, 1],
+                       c=np.argmax(valid_q[:tsne_subset], axis=-1), s=10, cmap='tab20', alpha=0.7)
+            ax.scatter(tsne_coords[tsne_subset:, 0], tsne_coords[tsne_subset:, 1], c='black', s=80, marker='x')
+            ax.set_title(f't-SNE GMM K={FLAGS.gmm_num_modes}')
+            figure_paths['tsne'] = _save_figure(fig, figures_dir, 'tsne')
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.bar(np.arange(occupancy.shape[0]), occupancy)
+        ax.set_title('Component Occupancy')
+        ax.set_xlabel('Component')
+        ax.set_ylabel('Fraction')
+        figure_paths['occupancy'] = _save_figure(fig, figures_dir, 'occupancy')
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(posterior_entropy, bins=40)
+        ax.set_title('Posterior Entropy')
+        ax.set_xlabel('Entropy')
+        figure_paths['posterior_entropy'] = _save_figure(fig, figures_dir, 'posterior_entropy')
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(pairwise_center_distance, cmap='viridis')
+        ax.set_title('Center Distance Heatmap')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        figure_paths['center_distance'] = _save_figure(fig, figures_dir, 'center_distance')
+
+    _write_json(
+        FLAGS.metrics_output_path,
+        {
+            **gmm_metrics,
+            'figure_paths': figure_paths,
+        },
+    )
+
     if jax.process_index() == 0:
         import wandb
 
@@ -208,6 +410,11 @@ def main(_):
             'latent/std_mean': float(np.mean(std)),
             'latent/mean_abs': float(np.mean(np.abs(mean))),
         }, step=FLAGS.gmm_em_iters + 1)
+        wandb.log({f'gmm_eval/{k}': v for k, v in gmm_metrics.items() if isinstance(v, (int, float))},
+                  step=FLAGS.gmm_em_iters + 2)
+        for fig_name, fig_path in figure_paths.items():
+            if fig_path:
+                wandb.log({f'gmm_fig/{fig_name}': wandb.Image(fig_path)}, step=FLAGS.gmm_em_iters + 2)
 
     if not FLAGS.gmm_keep_latent_cache and os.path.exists(cache_path):
         os.remove(cache_path)
