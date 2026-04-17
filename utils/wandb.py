@@ -38,11 +38,17 @@ def default_wandb_config():
 
     config.unique_identifier = ""  # Unique identifier for run (will be automatically generated unless provided)
     config.random_delay = 0  # Random delay for wandb.init (in seconds)
+    config.service_wait = 300
+    config.start_method = 'thread'
+    config.disable_stats = True
+    config.save_code = False
     return config
 
 
 def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=None, name=None,
-    unique_identifier="", offline=False, random_delay=0, run_id='None', **additional_init_kwargs):
+    unique_identifier="", offline=False, random_delay=0, run_id='None',
+    service_wait=300, start_method='thread', disable_stats=True, save_code=False,
+    **additional_init_kwargs):
     if "exp_descriptor" in additional_init_kwargs:
         # Remove deprecated exp_descriptor
         additional_init_kwargs.pop("exp_descriptor")
@@ -76,14 +82,17 @@ def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=Non
         wandb_output_dir = tempfile.mkdtemp()
     print(wandb_output_dir)
     tags = [group] if group is not None else None
+    os.environ.setdefault("WANDB__SERVICE_WAIT", str(service_wait))
 
     init_kwargs = dict(
         config=hyperparam_dict, project=project, entity=entity, tags=tags, group=group, dir=wandb_output_dir,
         id=experiment_id, name=name, settings=wandb.Settings(
-            start_method="thread",
-            _disable_stats=False,
+            start_method=start_method,
+            _disable_stats=disable_stats,
+            _service_wait=service_wait,
         ), mode="offline" if offline else "online", save_code=True,
     )
+    init_kwargs["save_code"] = save_code
     init_kwargs.update(additional_init_kwargs)
 
     if run_id != 'None': # Resume a run

@@ -130,7 +130,14 @@ def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_grou
     if flags.wandb.entity:
         args.append(f'--wandb.entity={flags.wandb.entity}')
     args.append(f'--wandb.offline={_sanitize_flag_value(flags.wandb.offline)}')
-    _extend_config_flags(args, 'model', flags.model.to_dict())
+    if hasattr(flags.wandb, 'service_wait'):
+        args.append(f'--wandb.service_wait={_sanitize_flag_value(flags.wandb.service_wait)}')
+    if hasattr(flags.wandb, 'start_method'):
+        args.append(f'--wandb.start_method={_sanitize_flag_value(flags.wandb.start_method)}')
+    if hasattr(flags.wandb, 'disable_stats'):
+        args.append(f'--wandb.disable_stats={_sanitize_flag_value(flags.wandb.disable_stats)}')
+    if hasattr(flags.wandb, 'save_code'):
+        args.append(f'--wandb.save_code={_sanitize_flag_value(flags.wandb.save_code)}')
     return args
 
 
@@ -139,7 +146,9 @@ def _run_train_screen(flags, run_name, group, run_dir, max_steps, model_override
     metrics_path = run_dir / 'metrics.json'
     save_dir = run_dir / 'artifacts'
     args = _base_train_args(flags, metrics_path, save_dir, max_steps, group, run_name)
-    _extend_config_flags(args, 'model', model_overrides)
+    combined_model_overrides = dict(flags.model.to_dict())
+    combined_model_overrides.update(model_overrides)
+    _extend_config_flags(args, 'model', combined_model_overrides)
     if dump_source_stats:
         args.append('--dump_source_stats=1')
         args.append('--source_stats_samples=4096')
@@ -501,6 +510,10 @@ def _save_source_diagnostics(moe_npz_path, naive_npz_path, output_dir):
 
 
 def _log_summary_run(flags, group, name, summary_metrics, image_paths=None, config=None):
+    os.environ.setdefault(
+        'WANDB__SERVICE_WAIT',
+        str(getattr(flags.wandb, 'service_wait', 300)),
+    )
     run = wandb.init(
         project=PROJECT_NAME,
         entity=flags.wandb.entity,
@@ -509,6 +522,11 @@ def _log_summary_run(flags, group, name, summary_metrics, image_paths=None, conf
         config=config or {},
         mode='offline' if flags.wandb.offline else 'online',
         save_code=False,
+        settings=wandb.Settings(
+            start_method=getattr(flags.wandb, 'start_method', 'thread'),
+            _disable_stats=getattr(flags.wandb, 'disable_stats', True),
+            _service_wait=getattr(flags.wandb, 'service_wait', 300),
+        ),
         reinit=True,
     )
     for key, value in summary_metrics.items():
