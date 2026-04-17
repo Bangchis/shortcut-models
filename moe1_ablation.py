@@ -125,7 +125,7 @@ def _base_model_overrides(flags):
     return overrides
 
 
-def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_group, wandb_name):
+def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_group, wandb_name, save_x_render=True):
     log_interval = max(1, min(int(flags.log_interval), int(max_steps)))
     args = [
         sys.executable,
@@ -136,12 +136,13 @@ def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_grou
         '--mode=train',
         '--run_final_inference=1',
         f'--log_interval={log_interval}',
-        f'--eval_interval={max_steps + 1}',
-        f'--save_interval={max_steps + 1}',
+        f'--eval_interval={max_steps + 2}',
+        f'--save_interval={max_steps + 2}',
         f'--save_dir={save_dir}',
         f'--metrics_output_path={metrics_output_path}',
         f'--inference_timesteps=128',
         f'--inference_generations=4096',
+        f'--save_x_render={_sanitize_flag_value(save_x_render)}',
         f'--wandb.project={flags.wandb.project}',
         f'--wandb.group={wandb_group}',
         f'--wandb.name={wandb_name}',
@@ -164,11 +165,19 @@ def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_grou
     return args
 
 
-def _run_train_screen(flags, run_name, group, run_dir, max_steps, model_overrides, dump_source_stats=False, final_save=False):
+def _run_train_screen(flags, run_name, group, run_dir, max_steps, model_overrides, dump_source_stats=False, final_save=False, save_x_render=True):
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / 'metrics.json'
     save_dir = run_dir / 'artifacts'
-    args = _base_train_args(flags, metrics_path, save_dir, max_steps, group, run_name)
+    args = _base_train_args(
+        flags,
+        metrics_path,
+        save_dir,
+        max_steps,
+        group,
+        run_name,
+        save_x_render=save_x_render,
+    )
     combined_model_overrides = dict(flags.model.to_dict())
     combined_model_overrides.update(model_overrides)
     _extend_config_flags(args, 'model', combined_model_overrides)
@@ -706,6 +715,7 @@ def run(flags):
             'fid_stats': flags.fid_stats,
         },
     )
+    cleanup_immediately = not bool(flags.wandb.offline)
 
     # Phase 1A
     phase1a_dir = root / 'phase1a_gmm'
@@ -734,17 +744,19 @@ def run(flags):
                 phase1b_dir / f'K{row["gmm_num_modes"]:02d}',
                 10000,
                 overrides,
+                save_x_render=False,
             )
-        phase1b_rows.append(
-            _decorate_run_row(
-                phase1b_row,
-                phase='phase1b',
-                **{
-                    'phase1b/gmm_num_modes': row['gmm_num_modes'],
-                    'phase1b/is_winner': False,
-                },
-            )
+        phase1b_row = _decorate_run_row(
+            phase1b_row,
+            phase='phase1b',
+            **{
+                'phase1b/gmm_num_modes': row['gmm_num_modes'],
+                'phase1b/is_winner': False,
+            },
         )
+        phase1b_rows.append(phase1b_row)
+        if cleanup_immediately:
+            _cleanup_run_artifacts(phase1b_row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
     phase1_winner = _select_phase1_winner(phase1b_rows)
     _decorate_run_row(phase1_winner, **{'phase1b/is_winner': True})
     _write_json(phase1b_dir / 'ranking.json', {'all': phase1b_rows, 'winner': phase1_winner})
@@ -771,21 +783,23 @@ def run(flags):
             phase2_dir / run_name,
             10000,
             run_overrides,
+            save_x_render=False,
         )
-        phase2_rows.append(
-            _decorate_run_row(
-                row,
-                phase='phase2',
-                phase2_group=group_name,
-                **{
-                    'phase2/group': group_name,
-                    'phase2/is_group_winner': False,
-                    'phase2/is_composed': False,
-                    'phase2/is_phase2_fallback_winner': False,
-                    'phase2/is_selected': False,
-                },
-            )
+        row = _decorate_run_row(
+            row,
+            phase='phase2',
+            phase2_group=group_name,
+            **{
+                'phase2/group': group_name,
+                'phase2/is_group_winner': False,
+                'phase2/is_composed': False,
+                'phase2/is_phase2_fallback_winner': False,
+                'phase2/is_selected': False,
+            },
         )
+        phase2_rows.append(row)
+        if cleanup_immediately:
+            _cleanup_run_artifacts(row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
 
     best_balance = _select_group_winner(phase2_rows, 'balance')
     best_entropy = _select_group_winner(phase2_rows, 'entropy')
@@ -813,6 +827,7 @@ def run(flags):
         phase2_dir / 'M17_Composed',
         10000,
         composed_overrides,
+        save_x_render=False,
     )
     composed_row = _decorate_run_row(
         composed_row,
@@ -826,6 +841,8 @@ def run(flags):
             'phase2/is_selected': False,
         },
     )
+    if cleanup_immediately:
+        _cleanup_run_artifacts(composed_row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
 
     default_row = next(row for row in phase2_rows if row['run_name'] == 'M00_Default')
     composed_pass = (
@@ -1156,12 +1173,11 @@ def run(flags):
     )
 
     # Cleanup
-    for row in phase1b_rows:
-        _cleanup_run_artifacts(row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
-    for row in phase2_rows:
-        _cleanup_run_artifacts(row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
-    _cleanup_run_artifacts(composed_row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
-    keep_moe_ckpt = final_selected['run_name'] == 'P3_Final_Top1MoE'
-    keep_naive_ckpt = final_selected['run_name'] == 'P3_Final_NaiveRef'
-    _cleanup_run_artifacts(phase3_dir / 'Top1_MoE', keep_metrics=True, keep_figures=False, keep_checkpoint=keep_moe_ckpt)
-    _cleanup_run_artifacts(phase3_dir / 'Naive_Reference', keep_metrics=True, keep_figures=False, keep_checkpoint=keep_naive_ckpt)
+    if cleanup_immediately:
+        for row in phase1b_rows:
+            _cleanup_run_artifacts(row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
+        for row in phase2_rows:
+            _cleanup_run_artifacts(row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
+        _cleanup_run_artifacts(composed_row['run_dir'], keep_metrics=True, keep_figures=False, keep_checkpoint=False)
+        _cleanup_run_artifacts(phase3_dir / 'Top1_MoE', keep_metrics=True, keep_figures=False, keep_checkpoint=False)
+        _cleanup_run_artifacts(phase3_dir / 'Naive_Reference', keep_metrics=True, keep_figures=False, keep_checkpoint=False)

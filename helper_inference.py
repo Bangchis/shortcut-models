@@ -15,6 +15,7 @@ from gmm_utils import flatten_latents, posterior_from_stats
 flags.DEFINE_integer('inference_timesteps', 128, 'Number of timesteps for inference.')
 flags.DEFINE_integer('inference_generations', 4096, 'Number of generations for inference.')
 flags.DEFINE_float('inference_cfg_scale', 1.0, 'CFG scale for inference.')
+flags.DEFINE_integer('save_x_render', 1, 'Whether to save rendered inference grid to save_dir/x_render.npy.')
 
 def do_inference(
     FLAGS,
@@ -215,6 +216,7 @@ def do_inference(
         denoise_timesteps = FLAGS.inference_timesteps
         num_generations = FLAGS.inference_generations
         cfg_scale = FLAGS.inference_cfg_scale
+        should_save_x_render = bool(FLAGS.save_x_render)
         alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
         x0 = []
         x1 = []
@@ -276,7 +278,7 @@ def do_inference(
             lab.append(np.array(jax.experimental.multihost_utils.process_allgather(labels)))
             if FLAGS.model.use_stable_vae:
                 x = vae_decode(x) # Image is in [-1, 1] space.
-                if num_generations < 10000:
+                if should_save_x_render and num_generations < 10000:
                     x_render.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
             x = jnp.clip(x, -1, 1)
@@ -318,8 +320,9 @@ def do_inference(
 
             if FLAGS.save_dir is not None:
                 os.makedirs(FLAGS.save_dir, exist_ok=True)
-                x_render = np.concatenate(x_render, axis=0)
-                np.save(FLAGS.save_dir + f'/x_render.npy', x_render)
+                if should_save_x_render and x_render:
+                    x_render = np.concatenate(x_render, axis=0)
+                    np.save(FLAGS.save_dir + f'/x_render.npy', x_render)
 
                 # x0 = np.concatenate(x0, axis=0)
                 # x1 = np.concatenate(x1, axis=0)
