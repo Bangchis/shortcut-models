@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import jax
@@ -16,12 +17,13 @@ from sklearn.manifold import TSNE
 from utils.stable_vae import StableVAE
 
 
-PROJECT_NAME = 'moe1-ablation-celeba256'
+DEFAULT_PROJECT_BASENAME = 'moe1-ablation-celeba256'
 PHASE1_GROUP = 'Phase_1A_GMM'
 PHASE1B_GROUP = 'Phase_1B_Screen'
 PHASE2_GROUP = 'Phase_2_Sweep'
 PHASE2_COMPOSED_GROUP = 'Phase_2_Composed'
 PHASE3_GROUP = 'Phase_3_Final'
+SUMMARY_GROUP = 'Ablation_Summary'
 ROOT_DIR = Path(__file__).resolve().parent
 
 
@@ -87,6 +89,27 @@ def _extend_config_flags(args, prefix, values):
         args.append(f'--{prefix}.{key}={_sanitize_flag_value(value)}')
 
 
+def _sanitize_project_name(text):
+    text = str(text).strip().replace('/', '-').replace('_', '-').replace(' ', '-')
+    allowed = ''.join(ch if (ch.isalnum() or ch == '-') else '-' for ch in text.lower())
+    while '--' in allowed:
+        allowed = allowed.replace('--', '-')
+    return allowed.strip('-') or DEFAULT_PROJECT_BASENAME
+
+
+def _make_ablation_run_id():
+    return datetime.now().strftime('dt-%Y%m%d-%H%M%S')
+
+
+def _resolve_project_name(flags, run_id):
+    base = getattr(flags.wandb, 'project', None)
+    if not base or base == 'shortcut':
+        base = DEFAULT_PROJECT_BASENAME
+    base = _sanitize_project_name(base)
+    dataset = _sanitize_project_name(flags.dataset_name)
+    return f'{base}-{dataset}-{run_id}'
+
+
 def _base_model_overrides(flags):
     overrides = flags.model.to_dict()
     overrides.update({
@@ -119,7 +142,7 @@ def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_grou
         f'--metrics_output_path={metrics_output_path}',
         f'--inference_timesteps=128',
         f'--inference_generations=4096',
-        f'--wandb.project={PROJECT_NAME}',
+        f'--wandb.project={flags.wandb.project}',
         f'--wandb.group={wandb_group}',
         f'--wandb.name={wandb_name}',
     ]
@@ -188,7 +211,7 @@ def _run_gmm(flags, phase_dir, num_modes):
         f'--gmm_save_path={gmm_path}',
         f'--metrics_output_path={metrics_path}',
         f'--figures_dir={figures_dir}',
-        f'--wandb.project={PROJECT_NAME}',
+        f'--wandb.project={flags.wandb.project}',
         f'--wandb.group={PHASE1_GROUP}',
         f'--wandb.name={run_name}',
         f'--wandb.offline={_sanitize_flag_value(flags.wandb.offline)}',
@@ -515,7 +538,7 @@ def _log_summary_run(flags, group, name, summary_metrics, image_paths=None, conf
         str(getattr(flags.wandb, 'service_wait', 300)),
     )
     run = wandb.init(
-        project=PROJECT_NAME,
+        project=flags.wandb.project,
         entity=flags.wandb.entity,
         group=group,
         name=name,
@@ -563,17 +586,138 @@ def _cleanup_run_artifacts(run_dir, keep_metrics=True, keep_figures=True, keep_c
                 pass
 
 
+def _phase1a_summary_rows(rows, top3):
+    top3_names = {row['run_name'] for row in top3}
+    summary = []
+    for row in rows:
+        summary.append({
+            'run_name': row['run_name'],
+            'K': row['gmm_num_modes'],
+            'valid_nll': row['valid_nll'],
+            'dead_components': row['dead_component_count'],
+            'max_component_fraction': row['max_component_fraction'],
+            'top3': 'yes' if row['run_name'] in top3_names else '',
+            'valid': 'yes' if row['valid'] else 'no',
+        })
+    return summary
+
+
+def _phase1b_summary_rows(rows, winner):
+    winner_name = winner['run_name']
+    summary = []
+    for row in rows:
+        summary.append({
+            'run_name': row['run_name'],
+            'gmm_num_modes': row.get('phase1b/gmm_num_modes'),
+            'fid128_4096': row.get('fid128_4096'),
+            'valid_loss': row.get('valid_loss'),
+            'max_usage': row.get('max_usage'),
+            'winner': 'yes' if row['run_name'] == winner_name else '',
+            'valid': 'yes' if row['valid'] else 'no',
+        })
+    return summary
+
+
+def _master_summary_rows(run_id, project_name, phase1_winner, best_balance, best_entropy, best_variance,
+                         composed_row, phase2_selected, phase3_selected, phase3_naive, final_selected):
+    return [
+        {
+            'stage': 'phase1',
+            'item': 'winning_gmm',
+            'run_name': phase1_winner['run_name'],
+            'detail': f"K={phase1_winner['model_overrides']['gmm_num_modes']}",
+            'fid128_4096': phase1_winner.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase2',
+            'item': 'best_balance',
+            'run_name': best_balance['run_name'],
+            'detail': f"balance={best_balance['model_overrides']['loss_balance_weight']}",
+            'fid128_4096': best_balance.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase2',
+            'item': 'best_entropy',
+            'run_name': best_entropy['run_name'],
+            'detail': f"entropy={best_entropy['model_overrides']['loss_entropy_weight']}",
+            'fid128_4096': best_entropy.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase2',
+            'item': 'best_variance',
+            'run_name': best_variance['run_name'],
+            'detail': (
+                f"var_w={best_variance['model_overrides'].get('source_var_weight', 1.0)}, "
+                f"target={best_variance['model_overrides'].get('source_var_target_std', 1.0)}"
+            ),
+            'fid128_4096': best_variance.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase2',
+            'item': 'composed',
+            'run_name': composed_row['run_name'],
+            'detail': f"selected={phase2_selected['run_name'] == composed_row['run_name']}",
+            'fid128_4096': composed_row.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase2',
+            'item': 'phase2_selected',
+            'run_name': phase2_selected['run_name'],
+            'detail': f"project={project_name}",
+            'fid128_4096': phase2_selected.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase3',
+            'item': 'top1_moe',
+            'run_name': phase3_selected['run_name'],
+            'detail': f"run_id={run_id}",
+            'fid128_4096': phase3_selected.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase3',
+            'item': 'naive_reference',
+            'run_name': phase3_naive['run_name'],
+            'detail': '',
+            'fid128_4096': phase3_naive.get('fid128_4096'),
+        },
+        {
+            'stage': 'phase3',
+            'item': 'final_winner',
+            'run_name': final_selected['run_name'],
+            'detail': '',
+            'fid128_4096': final_selected.get('fid128_4096'),
+        },
+    ]
+
+
 def run(flags):
     if not flags.fid_stats:
         raise ValueError('--fid_stats is required for mode=moe1-ablation.')
-    root = Path('/kaggle/working/moe1_ablation')
+    ablation_run_id = _make_ablation_run_id()
+    flags.wandb.project = _resolve_project_name(flags, ablation_run_id)
+    root = Path('/kaggle/working/moe1_ablation') / ablation_run_id
     root.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        root / 'ablation_context.json',
+        {
+            'ablation_run_id': ablation_run_id,
+            'wandb_project': flags.wandb.project,
+            'dataset_name': flags.dataset_name,
+            'fid_stats': flags.fid_stats,
+        },
+    )
 
     # Phase 1A
     phase1a_dir = root / 'phase1a_gmm'
     gmm_rows = [_run_gmm(flags, phase1a_dir, k) for k in [2, 4, 8, 16, 24, 32]]
     top3_gmms = _select_top3_gmms(gmm_rows)
     _write_json(phase1a_dir / 'ranking.json', {'all': gmm_rows, 'top3': top3_gmms})
+    phase1a_summary_table = _make_table_png(
+        _phase1a_summary_rows(gmm_rows, top3_gmms),
+        ['run_name', 'K', 'valid_nll', 'dead_components', 'max_component_fraction', 'top3', 'valid'],
+        'Phase 1A GMM Summary',
+        phase1a_dir / 'phase1a_summary.png',
+    )
 
     # Phase 1B
     phase1b_dir = root / 'phase1b_screen'
@@ -604,6 +748,12 @@ def run(flags):
     phase1_winner = _select_phase1_winner(phase1b_rows)
     _decorate_run_row(phase1_winner, **{'phase1b/is_winner': True})
     _write_json(phase1b_dir / 'ranking.json', {'all': phase1b_rows, 'winner': phase1_winner})
+    phase1b_summary_table = _make_table_png(
+        _phase1b_summary_rows(phase1b_rows, phase1_winner),
+        ['run_name', 'gmm_num_modes', 'fid128_4096', 'valid_loss', 'max_usage', 'winner', 'valid'],
+        'Phase 1B Downstream Summary',
+        phase1b_dir / 'phase1b_summary.png',
+    )
 
     # Phase 2
     phase2_dir = root / 'phase2_sweep'
@@ -927,6 +1077,36 @@ def run(flags):
             'winner': final_selected['run_name'],
         },
     )
+    master_summary_rows = _master_summary_rows(
+        ablation_run_id,
+        flags.wandb.project,
+        phase1_winner,
+        best_balance,
+        best_entropy,
+        best_variance,
+        composed_row,
+        phase2_selected,
+        phase3_selected,
+        phase3_naive,
+        final_selected,
+    )
+    master_summary_table = _make_table_png(
+        master_summary_rows,
+        ['stage', 'item', 'run_name', 'detail', 'fid128_4096'],
+        'moe1-ablation Master Summary',
+        root / 'master_summary.png',
+    )
+    _write_json(
+        root / 'master_summary.json',
+        {
+            'ablation_run_id': ablation_run_id,
+            'wandb_project': flags.wandb.project,
+            'phase1_winner': phase1_winner,
+            'phase2_summary': phase2_summary,
+            'phase3_winner': final_selected['run_name'],
+            'rows': master_summary_rows,
+        },
+    )
     _log_summary_run(
         flags,
         PHASE3_GROUP,
@@ -935,9 +1115,44 @@ def run(flags):
             'phase3/moe_fid128_4096': phase3_selected['fid128_4096'],
             'phase3/naive_fid128_4096': phase3_naive['fid128_4096'],
             'phase3/winner': final_selected['run_name'],
+            'ablation/run_id': ablation_run_id,
+            'ablation/project_name': flags.wandb.project,
         },
-        image_paths=image_paths,
+        image_paths={
+            **image_paths,
+            'phase1a_summary': str(phase1a_summary_table),
+            'phase1b_summary': str(phase1b_summary_table),
+            'master_summary': str(master_summary_table),
+        },
         config={'selected_phase2_run': phase2_selected['run_name']},
+    )
+    _log_summary_run(
+        flags,
+        SUMMARY_GROUP,
+        'Ablation_Master_Summary',
+        {
+            'ablation/run_id': ablation_run_id,
+            'ablation/project_name': flags.wandb.project,
+            'phase1/winning_gmm': phase1_winner['run_name'],
+            'phase2/final_selected_config': phase2_selected['run_name'],
+            'phase3/final_winner': final_selected['run_name'],
+        },
+        image_paths={
+            'phase1a_summary': str(phase1a_summary_table),
+            'phase1b_summary': str(phase1b_summary_table),
+            'phase2_summary': str(summary_table),
+            'phase2_composed_config': str(composed_config_table),
+            'phase2_default_vs_composed': str(default_vs_composed_table),
+            'phase3_final_compare': str(phase3_compare_table),
+            'master_summary': str(master_summary_table),
+        },
+        config={
+            'ablation_run_id': ablation_run_id,
+            'wandb_project': flags.wandb.project,
+            'phase1_winner': phase1_winner['run_name'],
+            'phase2_selected': phase2_selected['run_name'],
+            'phase3_winner': final_selected['run_name'],
+        },
     )
 
     # Cleanup

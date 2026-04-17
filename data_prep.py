@@ -299,10 +299,22 @@ def main(_):
     )))
     valid_log_norm = np.asarray(jax.device_get(jax.scipy.special.logsumexp(valid_log_prob, axis=-1, keepdims=True)))
     valid_q = np.exp(valid_log_prob - valid_log_norm)
+    train_vis_log_prob = np.asarray(jax.device_get(diag_gmm_log_prob(
+        jax.numpy.asarray(train_latents_std, dtype=jax.numpy.float32),
+        log_pi,
+        mu_device,
+        var_device,
+    )))
+    train_vis_log_norm = np.asarray(
+        jax.device_get(jax.scipy.special.logsumexp(train_vis_log_prob, axis=-1, keepdims=True))
+    )
+    train_vis_q = np.exp(train_vis_log_prob - train_vis_log_norm)
 
     occupancy = stats_to_save['final_counts'] / np.maximum(np.sum(stats_to_save['final_counts']), 1e-8)
     occupancy_entropy = float(-np.sum(occupancy * np.log(np.maximum(occupancy, 1e-8))))
     posterior_entropy = -np.sum(valid_q * np.log(np.maximum(valid_q, 1e-8)), axis=-1)
+    max_entropy = float(np.log(max(FLAGS.gmm_num_modes, 1))) if FLAGS.gmm_num_modes > 1 else 1.0
+    posterior_entropy_normalized = posterior_entropy / max(max_entropy, 1e-8)
     q_sorted = np.sort(valid_q, axis=-1)
     posterior_margin = q_sorted[:, -1] - q_sorted[:, -2] if valid_q.shape[1] > 1 else q_sorted[:, -1]
     pairwise_center_distance = np.linalg.norm(
@@ -317,6 +329,13 @@ def main(_):
         'max_component_fraction': float(np.max(occupancy)),
         'occupancy_entropy': occupancy_entropy,
         'posterior_entropy_mean': float(np.mean(posterior_entropy)),
+        'posterior_entropy_std': float(np.std(posterior_entropy)),
+        'posterior_entropy_min': float(np.min(posterior_entropy)),
+        'posterior_entropy_max': float(np.max(posterior_entropy)),
+        'posterior_entropy_p05': float(np.percentile(posterior_entropy, 5)),
+        'posterior_entropy_p50': float(np.percentile(posterior_entropy, 50)),
+        'posterior_entropy_p95': float(np.percentile(posterior_entropy, 95)),
+        'posterior_entropy_normalized_mean': float(np.mean(posterior_entropy_normalized)),
         'posterior_top1_margin_mean': float(np.mean(posterior_margin)),
         'var_floor_hit_rate': float(np.mean(stats_to_save['var'] <= (FLAGS.gmm_var_floor * 1.0001))),
         'n_train_used': int(target_examples),
@@ -330,39 +349,117 @@ def main(_):
         os.makedirs(figures_dir, exist_ok=True)
         subset_n = min(FLAGS.gmm_visual_subset, valid_latents_std.shape[0], train_latents_std.shape[0])
         if subset_n > 1:
+            train_labels = np.argmax(train_vis_q[:subset_n], axis=-1).astype(np.int32)
+            valid_labels = np.argmax(valid_q[:subset_n], axis=-1).astype(np.int32)
             plot_points = np.concatenate(
                 [train_latents_std[:subset_n], valid_latents_std[:subset_n], stats_to_save['mu']],
-                axis=0,
-            )
-            labels = np.concatenate(
-                [
-                    np.full((subset_n,), -2, dtype=np.int32),
-                    np.argmax(valid_q[:subset_n], axis=-1).astype(np.int32),
-                    np.full((stats_to_save['mu'].shape[0],), -1, dtype=np.int32),
-                ],
                 axis=0,
             )
             pca = PCA(n_components=2, random_state=0)
             coords = pca.fit_transform(plot_points)
             fig, ax = plt.subplots(figsize=(7, 6))
-            ax.scatter(coords[:subset_n, 0], coords[:subset_n, 1], s=6, alpha=0.2, label='train')
+            ax.scatter(
+                coords[:subset_n, 0],
+                coords[:subset_n, 1],
+                c=train_labels,
+                cmap='tab20',
+                s=8,
+                alpha=0.20,
+                marker='o',
+                label='train',
+            )
             valid_coords = coords[subset_n:2 * subset_n]
-            ax.scatter(valid_coords[:, 0], valid_coords[:, 1], c=labels[subset_n:2 * subset_n], s=8, cmap='tab20', alpha=0.6, label='valid')
+            ax.scatter(
+                valid_coords[:, 0],
+                valid_coords[:, 1],
+                c=valid_labels,
+                cmap='tab20',
+                s=14,
+                alpha=0.65,
+                marker='^',
+                label='valid',
+            )
             center_coords = coords[2 * subset_n:]
-            ax.scatter(center_coords[:, 0], center_coords[:, 1], c='black', s=80, marker='x', label='centers')
+            ax.scatter(
+                center_coords[:, 0],
+                center_coords[:, 1],
+                c=np.arange(stats_to_save['mu'].shape[0]),
+                cmap='tab20',
+                s=90,
+                marker='X',
+                edgecolors='black',
+                linewidths=0.8,
+                label='centers',
+            )
             ax.set_title(f'PCA GMM K={FLAGS.gmm_num_modes}')
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            ax.text(
+                0.02,
+                0.98,
+                'Color = cluster, marker = split',
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=9,
+                bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.8, edgecolor='none'),
+            )
             ax.legend(loc='best')
             figure_paths['pca'] = _save_figure(fig, figures_dir, 'pca')
 
             tsne_subset = min(1024, subset_n)
-            tsne_input = np.concatenate([valid_latents_std[:tsne_subset], stats_to_save['mu']], axis=0)
+            train_tsne_labels = train_labels[:tsne_subset]
+            valid_tsne_labels = valid_labels[:tsne_subset]
+            tsne_input = np.concatenate(
+                [train_latents_std[:tsne_subset], valid_latents_std[:tsne_subset], stats_to_save['mu']],
+                axis=0,
+            )
             tsne = TSNE(n_components=2, random_state=0, init='pca', learning_rate='auto')
             tsne_coords = tsne.fit_transform(tsne_input)
             fig, ax = plt.subplots(figsize=(7, 6))
-            ax.scatter(tsne_coords[:tsne_subset, 0], tsne_coords[:tsne_subset, 1],
-                       c=np.argmax(valid_q[:tsne_subset], axis=-1), s=10, cmap='tab20', alpha=0.7)
-            ax.scatter(tsne_coords[tsne_subset:, 0], tsne_coords[tsne_subset:, 1], c='black', s=80, marker='x')
+            ax.scatter(
+                tsne_coords[:tsne_subset, 0],
+                tsne_coords[:tsne_subset, 1],
+                c=train_tsne_labels,
+                cmap='tab20',
+                s=8,
+                alpha=0.20,
+                marker='o',
+                label='train',
+            )
+            ax.scatter(
+                tsne_coords[tsne_subset:2 * tsne_subset, 0],
+                tsne_coords[tsne_subset:2 * tsne_subset, 1],
+                c=valid_tsne_labels,
+                cmap='tab20',
+                s=14,
+                alpha=0.65,
+                marker='^',
+                label='valid',
+            )
+            ax.scatter(
+                tsne_coords[2 * tsne_subset:, 0],
+                tsne_coords[2 * tsne_subset:, 1],
+                c=np.arange(stats_to_save['mu'].shape[0]),
+                cmap='tab20',
+                s=90,
+                marker='X',
+                edgecolors='black',
+                linewidths=0.8,
+                label='centers',
+            )
             ax.set_title(f't-SNE GMM K={FLAGS.gmm_num_modes}')
+            ax.text(
+                0.02,
+                0.98,
+                'Color = cluster, marker = split',
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=9,
+                bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.8, edgecolor='none'),
+            )
+            ax.legend(loc='best')
             figure_paths['tsne'] = _save_figure(fig, figures_dir, 'tsne')
 
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -373,10 +470,49 @@ def main(_):
         figure_paths['occupancy'] = _save_figure(fig, figures_dir, 'occupancy')
 
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(posterior_entropy, bins=40)
+        ax.hist(posterior_entropy, bins=40, range=(0.0, max_entropy))
         ax.set_title('Posterior Entropy')
         ax.set_xlabel('Entropy')
+        ax.set_ylabel('Count')
+        ax.set_xlim(0.0, max_entropy)
+        ax.axvline(float(np.mean(posterior_entropy)), color='red', linestyle='--', linewidth=1.5, label='mean')
+        ax.text(
+            0.02,
+            0.95,
+            (
+                f'min={np.min(posterior_entropy):.4f}\n'
+                f'p50={np.percentile(posterior_entropy, 50):.4f}\n'
+                f'max={np.max(posterior_entropy):.4f}\n'
+                f'max_theory=log(K)={max_entropy:.4f}'
+            ),
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.8, edgecolor='none'),
+        )
+        ax.legend(loc='upper right')
         figure_paths['posterior_entropy'] = _save_figure(fig, figures_dir, 'posterior_entropy')
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(posterior_entropy_normalized, bins=40, range=(0.0, 1.0))
+        ax.set_title('Normalized Posterior Entropy')
+        ax.set_xlabel('Entropy / log(K)')
+        ax.set_ylabel('Count')
+        ax.set_xlim(0.0, 1.0)
+        ax.axvline(float(np.mean(posterior_entropy_normalized)), color='red', linestyle='--', linewidth=1.5, label='mean')
+        ax.legend(loc='upper right')
+        figure_paths['posterior_entropy_normalized'] = _save_figure(fig, figures_dir, 'posterior_entropy_normalized')
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(posterior_margin, bins=40, range=(0.0, 1.0))
+        ax.set_title('Posterior Top-1 Margin')
+        ax.set_xlabel('q_max - q_second')
+        ax.set_ylabel('Count')
+        ax.set_xlim(0.0, 1.0)
+        ax.axvline(float(np.mean(posterior_margin)), color='red', linestyle='--', linewidth=1.5, label='mean')
+        ax.legend(loc='upper left')
+        figure_paths['posterior_top1_margin'] = _save_figure(fig, figures_dir, 'posterior_top1_margin')
 
         fig, ax = plt.subplots(figsize=(6, 5))
         im = ax.imshow(pairwise_center_distance, cmap='viridis')
