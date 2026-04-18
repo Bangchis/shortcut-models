@@ -48,6 +48,11 @@ flags.DEFINE_string('final_save_dir', None, 'Optional final checkpoint path.')
 flags.DEFINE_integer('run_final_inference', 0, 'Whether to run final inference after training.')
 flags.DEFINE_integer('dump_source_stats', 0, 'Whether inference should dump source/data stats.')
 flags.DEFINE_integer('source_stats_samples', 4096, 'How many samples to collect for source stats dumps.')
+flags.DEFINE_string(
+    'eval_fid_timesteps',
+    '1,4,32,128',
+    'Comma-separated denoise step counts to score in helper_eval.',
+)
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,

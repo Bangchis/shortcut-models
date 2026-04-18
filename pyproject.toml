@@ -40,3 +40,9 @@ dependencies = [
     "wandb>=0.19.11",
     "wheel>=0.45.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-xdist",
+]

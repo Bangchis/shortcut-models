@@ -1,21 +1,44 @@
+import json
+import os
+import time
+from functools import partial
+
 import jax
 import jax.experimental
-import wandb
 import jax.numpy as jnp
 import numpy as np
 import tqdm
-import matplotlib.pyplot as plt
-import os
-import json
-import time
-from functools import partial
-from absl import app, flags
+import wandb
+from absl import flags
+
 from gmm_utils import flatten_latents, posterior_from_stats
 
 flags.DEFINE_integer('inference_timesteps', 128, 'Number of timesteps for inference.')
 flags.DEFINE_integer('inference_generations', 4096, 'Number of generations for inference.')
 flags.DEFINE_float('inference_cfg_scale', 1.0, 'CFG scale for inference.')
 flags.DEFINE_integer('save_x_render', 1, 'Whether to save rendered inference grid to save_dir/x_render.npy.')
+flags.DEFINE_integer('dump_flow_viz', 0, 'Whether final inference should dump compact latent endpoints and ODE paths.')
+flags.DEFINE_integer('flow_viz_samples', 512, 'Number of samples to cache for latent endpoint/path visualization.')
+
+
+def _compress_latents(arr):
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return np.zeros((0,), dtype=np.float16)
+    return arr.astype(np.float16, copy=False)
+
+
+def _flow_viz_completed_steps(num_steps):
+    candidates = [0, 1, 2, 4, 8, 16, 32, 64, max(1, num_steps - 1), num_steps]
+    ordered = []
+    seen = set()
+    for value in candidates:
+        value = int(max(0, min(num_steps, value)))
+        if value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return ordered
+
 
 def do_inference(
     FLAGS,
@@ -55,7 +78,6 @@ def do_inference(
             json.dump(_json_ready(payload), f, indent=2, sort_keys=True)
 
     with jax.spmd_mode('allow_all'):
-        global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
         batch_images, batch_labels = next(dataset)
         valid_images, valid_labels = next(dataset_valid)
@@ -63,25 +85,15 @@ def do_inference(
             batch_images = vae_encode(key, batch_images)
             valid_images = vae_encode(key, valid_images)
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
-        labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
-        eps = jax.random.normal(key, batch_images.shape)
+        labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes'])
 
-        def process_img(img):
-            if FLAGS.model.use_stable_vae:
-                img = vae_decode(img[None])[0]
-            img = img * 0.5 + 0.5
-            img = jnp.clip(img, 0, 1)
-            img = np.array(img)
-            return img
-        
         @partial(jax.jit, static_argnums=(5,))
         def call_model(train_state, images, t, dt, labels, use_ema=True):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_model_ema
             else:
                 call_fn = train_state.call_model
-            output = call_fn(images, t, dt, labels, train=False)
-            return output
+            return call_fn(images, t, dt, labels, train=False)
 
         @partial(jax.jit, static_argnums=(3, 4))
         def call_source(train_state, latents, condition, return_experts=False, use_ema=True):
@@ -90,6 +102,8 @@ def do_inference(
             else:
                 call_fn = train_state.call_source
             return call_fn(latents, condition, return_experts=return_experts)
+
+        images_shape = batch_images.shape
 
         def sample_source_prior(sample_key):
             if FLAGS.model.train_type != 'naive-moe-source':
@@ -148,11 +162,29 @@ def do_inference(
             }
             return x0, stats
 
+        analysis_needed = 0
+        if FLAGS.dump_source_stats or FLAGS.dump_flow_viz:
+            analysis_needed = max(
+                int(getattr(FLAGS, 'source_stats_samples', 0)),
+                int(getattr(FLAGS, 'flow_viz_samples', 0) if FLAGS.dump_flow_viz else 0),
+                images_shape[0],
+            )
+        flow_viz_needed = int(getattr(FLAGS, 'flow_viz_samples', 0) if FLAGS.dump_flow_viz else 0)
+        flow_completed_steps = _flow_viz_completed_steps(int(FLAGS.inference_timesteps)) if flow_viz_needed > 0 else []
+        flow_step_set = {step_value for step_value in flow_completed_steps if step_value > 0}
+
+        prior_chunks = []
+        generated_chunks = []
+        label_chunks = []
+        flow_states_by_step = {step_value: [] for step_value in flow_completed_steps}
+        collected_analysis = 0
+        collected_flow = 0
+
         def dump_source_stats_if_needed():
-            if not FLAGS.dump_source_stats or FLAGS.save_dir is None:
+            if FLAGS.save_dir is None or not (FLAGS.dump_source_stats or FLAGS.dump_flow_viz):
                 return None
             os.makedirs(FLAGS.save_dir, exist_ok=True)
-            num_needed = max(int(FLAGS.source_stats_samples), images_shape[0])
+            num_needed = max(analysis_needed, images_shape[0])
             x1_chunks = []
             x0_posterior_chunks = []
             q_chunks = []
@@ -163,8 +195,8 @@ def do_inference(
             while gathered < num_needed:
                 batch_images_local, _ = next(dataset_valid)
                 if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                    nonlocal_key = jax.random.fold_in(stats_key, gathered)
-                    batch_images_local = vae_encode(nonlocal_key, batch_images_local)
+                    local_key = jax.random.fold_in(stats_key, gathered)
+                    batch_images_local = vae_encode(local_key, batch_images_local)
                 batch_take = min(num_needed - gathered, batch_images_local.shape[0])
                 batch_latents = batch_images_local[:batch_take]
                 x1_chunks.append(np.array(batch_latents))
@@ -180,50 +212,38 @@ def do_inference(
                     alpha_chunks.append(posterior_stats['alpha_posterior'][:batch_take])
                     mode_chunks.append(posterior_stats['conditioned_mode'][:batch_take])
                 gathered += batch_take
+
             payload = {
-                'x1_data': np.concatenate(x1_chunks, axis=0)[:num_needed],
-                'x0_prior': np.concatenate(x0, axis=0)[:num_needed] if x0 else np.zeros((0,)),
-                'x1_final': np.concatenate(x1, axis=0)[:num_needed] if x1 else np.zeros((0,)),
-                'labels': np.concatenate(lab, axis=0)[:num_needed] if lab else np.zeros((0,)),
+                'x1_data': _compress_latents(np.concatenate(x1_chunks, axis=0)[:num_needed]),
+                'x0_prior': _compress_latents(np.concatenate(prior_chunks, axis=0)[:num_needed]) if prior_chunks else np.zeros((0,), dtype=np.float16),
+                'x1_final': _compress_latents(np.concatenate(generated_chunks, axis=0)[:num_needed]) if generated_chunks else np.zeros((0,), dtype=np.float16),
+                'labels': np.concatenate(label_chunks, axis=0)[:num_needed] if label_chunks else np.zeros((0,), dtype=np.int32),
             }
             if x0_posterior_chunks:
-                payload['x0_posterior'] = np.concatenate(x0_posterior_chunks, axis=0)[:num_needed]
-                payload['q_posterior'] = np.concatenate(q_chunks, axis=0)[:num_needed]
-                payload['alpha_posterior'] = np.concatenate(alpha_chunks, axis=0)[:num_needed]
-                payload['conditioned_mode'] = np.concatenate(mode_chunks, axis=0)[:num_needed]
-            np.savez(os.path.join(FLAGS.save_dir, 'source_stats.npz'), **payload)
-            return os.path.join(FLAGS.save_dir, 'source_stats.npz')
-        
-        if FLAGS.mode == 'interpolate':
-            seed = 5
-            eps0 = jax.random.normal(jax.random.PRNGKey(seed), batch_images[0].shape)
-            eps1 = jax.random.normal(jax.random.PRNGKey(seed+1), batch_images[0].shape)
-            labels = jnp.ones(FLAGS.batch_size,).astype(jnp.int32) * 555
-            i = jnp.linspace(0, 1, FLAGS.batch_size)
-            i_neg = np.sqrt(1-i**2)
-            x = eps0[None] * i_neg[:, None, None, None] + eps1[None] * i[:, None, None, None]
-            t_vector = jnp.full((FLAGS.batch_size, ), 0)
-            dt_vector = jnp.zeros_like(t_vector)
-            cfg_scale = FLAGS.inference_cfg_scale
-            v = call_model(train_state, x, t_vector, dt_vector, labels)
-            x = x + v * 1.0
-            x = vae_decode(x) # Image is in [-1, 1] space.
-            x_render = np.array(jax.experimental.multihost_utils.process_allgather(x))
-            os.makedirs(FLAGS.save_dir, exist_ok=True)
-            np.save(FLAGS.save_dir + f'/x_render.npy', x_render)
-            breakpoint()
+                payload['x0_posterior'] = _compress_latents(np.concatenate(x0_posterior_chunks, axis=0)[:num_needed])
+                payload['q_posterior'] = np.concatenate(q_chunks, axis=0)[:num_needed].astype(np.float32, copy=False)
+                payload['alpha_posterior'] = np.concatenate(alpha_chunks, axis=0)[:num_needed].astype(np.float32, copy=False)
+                payload['conditioned_mode'] = np.concatenate(mode_chunks, axis=0)[:num_needed].astype(np.int32, copy=False)
+            if flow_viz_needed > 0 and flow_completed_steps:
+                path_chunks = []
+                for step_value in flow_completed_steps:
+                    if flow_states_by_step[step_value]:
+                        path_chunks.append(_compress_latents(np.concatenate(flow_states_by_step[step_value], axis=0)[:flow_viz_needed]))
+                if len(path_chunks) == len(flow_completed_steps) and path_chunks:
+                    payload['flow_path_states'] = np.stack(path_chunks, axis=1)
+                    payload['flow_path_times'] = (np.asarray(flow_completed_steps, dtype=np.float32) / float(FLAGS.inference_timesteps))
+                    payload['flow_path_completed_steps'] = np.asarray(flow_completed_steps, dtype=np.int32)
+            output_path = os.path.join(FLAGS.save_dir, 'source_stats.npz')
+            np.savez_compressed(output_path, **payload)
+            return output_path
 
         denoise_timesteps = FLAGS.inference_timesteps
         num_generations = FLAGS.inference_generations
         cfg_scale = FLAGS.inference_cfg_scale
         should_save_x_render = bool(FLAGS.save_x_render)
         alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
-        x0 = []
-        x1 = []
-        lab = []
         x_render = []
         activations = []
-        images_shape = batch_images.shape
         generation_time = 0.0
         print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
         for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
@@ -235,19 +255,31 @@ def do_inference(
             x = sample_source_prior(eps_key)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             labels = shard_data(labels)
-            x0_initial = x  # initial noise for ti==0 special-case
-            x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
+            x0_initial = x
+
+            batch_analysis_take = 0
+            batch_flow_take = 0
+            prior_batch = None
+            if analysis_needed > collected_analysis or flow_viz_needed > collected_flow:
+                prior_batch = np.array(jax.experimental.multihost_utils.process_allgather(x)[0])
+                if analysis_needed > collected_analysis:
+                    batch_analysis_take = min(analysis_needed - collected_analysis, prior_batch.shape[0])
+                    prior_chunks.append(prior_batch[:batch_analysis_take])
+                if flow_viz_needed > collected_flow:
+                    batch_flow_take = min(flow_viz_needed - collected_flow, prior_batch.shape[0])
+                    if batch_flow_take > 0:
+                        flow_states_by_step[0].append(prior_batch[:batch_flow_take])
+
             delta_t = 1.0 / denoise_timesteps
             for ti in range(denoise_timesteps):
-                t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
-                t_vector = jnp.full((images_shape[0], ), t)
+                t = ti / denoise_timesteps
+                t_vector = jnp.full((images_shape[0],), t)
                 if FLAGS.model.train_type in ('naive', 'naive-moe-source'):
                     dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
-                    dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow # Smallest dt.
-                else: # shortcut
+                    dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
+                else:
                     dt_flow = np.log2(denoise_timesteps).astype(jnp.int32)
                     dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
-                    # print(dt_base)
                 t_vector, dt_base = shard_data(t_vector, dt_base)
                 if cfg_scale == 1:
                     v = call_model(train_state, x, t_vector, dt_base, labels)
@@ -259,34 +291,45 @@ def do_inference(
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                 if FLAGS.model.train_type == 'khoat-fm':
-                    # Algorithm 1 Sampling Phase (linear schedule: d = delta_t)
                     if ti == 0:
-                        # x_d <- (1-alpha) x0 + alpha * d * v(x0, 0, d)
                         x = (1.0 - alpha) * x0_initial + alpha * (delta_t * v)
                     else:
-                        # x_{t+d} <- x_t + alpha * d * v(x_t, t, d)
                         x = x + alpha * (delta_t * v)
                 elif FLAGS.model.train_type == 'consistency':
                     eps = shard_data(jax.random.normal(jax.random.fold_in(eps_key, ti), images_shape))
-                    x1pred = x + v * (1-t)
-                    x = x1pred * (t+delta_t) + eps * (1-t-delta_t)
+                    x1pred = x + v * (1 - t)
+                    x = x1pred * (t + delta_t) + eps * (1 - t - delta_t)
                 else:
-                    x = x + v * delta_t # Euler sampling.
+                    x = x + v * delta_t
+
+                completed_step = ti + 1
+                if batch_flow_take > 0 and completed_step in flow_step_set:
+                    flow_states_by_step[completed_step].append(
+                        np.array(jax.experimental.multihost_utils.process_allgather(x)[0][:batch_flow_take])
+                    )
+
             x = jax.block_until_ready(x)
             generation_time += time.perf_counter() - batch_start
-            x1.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
-            lab.append(np.array(jax.experimental.multihost_utils.process_allgather(labels)))
+
+            if batch_analysis_take > 0:
+                generated_batch = np.array(jax.experimental.multihost_utils.process_allgather(x)[0])
+                label_batch = np.array(jax.experimental.multihost_utils.process_allgather(labels)[0])
+                generated_chunks.append(generated_batch[:batch_analysis_take])
+                label_chunks.append(label_batch[:batch_analysis_take])
+                collected_analysis += batch_analysis_take
+            if batch_flow_take > 0:
+                collected_flow += batch_flow_take
+
             if FLAGS.model.use_stable_vae:
-                x = vae_decode(x) # Image is in [-1, 1] space.
+                x = vae_decode(x)
                 if should_save_x_render and num_generations < 10000:
                     x_render.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
             x = jnp.clip(x, -1, 1)
-            acts = get_fid_activations(x)[..., 0, 0, :] # [devices, batch//devices, 2048]
+            acts = get_fid_activations(x)[..., 0, 0, :]
             acts = jax.experimental.multihost_utils.process_allgather(acts)
-            acts = np.array(acts)
-            activations.append(acts)
-        
+            activations.append(np.array(acts))
+
         if jax.process_index() == 0:
             activations = np.concatenate(activations, axis=0)
             activations = activations.reshape((-1, activations.shape[-1]))
@@ -321,15 +364,6 @@ def do_inference(
             if FLAGS.save_dir is not None:
                 os.makedirs(FLAGS.save_dir, exist_ok=True)
                 if should_save_x_render and x_render:
-                    x_render = np.concatenate(x_render, axis=0)
-                    np.save(FLAGS.save_dir + f'/x_render.npy', x_render)
-
-                # x0 = np.concatenate(x0, axis=0)
-                # x1 = np.concatenate(x1, axis=0)
-                # lab = np.concatenate(lab, axis=0)
-                # os.makedirs(FLAGS.save_dir, exist_ok=True)
-                # np.save(FLAGS.save_dir + f'/x0.npy', x0)
-                # np.save(FLAGS.save_dir + f'/x1.npy', x1)
-                # np.save(FLAGS.save_dir + f'/lab.npy', lab)
+                    np.save(os.path.join(FLAGS.save_dir, 'x_render.npy'), np.concatenate(x_render, axis=0))
             return summary
         return {}

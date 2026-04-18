@@ -8,6 +8,30 @@ import matplotlib.pyplot as plt
 from functools import partial
 from gmm_utils import flatten_latents, posterior_from_stats
 
+
+def _parse_eval_fid_timesteps(raw_value, max_denoise_timesteps):
+    values = []
+    for item in str(raw_value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if value > 0 and value <= int(max_denoise_timesteps):
+            values.append(value)
+    if not values:
+        values = [int(max_denoise_timesteps)]
+    ordered = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return ordered
+
+
 def eval_model(
     FLAGS,
     train_state,
@@ -209,9 +233,10 @@ def eval_model(
 
         print("Denoising at N steps")
 
-        denoise_timesteps_list = [1, 2, 4, 8, 16, 32]
-        if FLAGS.model.denoise_timesteps == 128:
-            denoise_timesteps_list.append(128)
+        denoise_timesteps_list = _parse_eval_fid_timesteps(
+            getattr(FLAGS, 'eval_fid_timesteps', FLAGS.model.denoise_timesteps),
+            FLAGS.model.denoise_timesteps,
+        )
         if FLAGS.model.cfg_scale != 0:
             denoise_timesteps_list.append('cfg')
         for denoise_timesteps in denoise_timesteps_list:
