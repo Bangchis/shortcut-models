@@ -49,6 +49,11 @@ flags.DEFINE_integer('run_final_inference', 0, 'Whether to run final inference a
 flags.DEFINE_integer('dump_source_stats', 0, 'Whether inference should dump source/data stats.')
 flags.DEFINE_integer('source_stats_samples', 4096, 'How many samples to collect for source stats dumps.')
 flags.DEFINE_string(
+    'train_metrics_level',
+    'full',
+    'Training diagnostics level: "summary" keeps ranking-critical metrics; "full" also logs heavy activation/expert diagnostics.',
+)
+flags.DEFINE_string(
     'eval_fid_timesteps',
     '1,4,32,128',
     'Comma-separated denoise step counts to score in helper_eval.',
@@ -96,6 +101,7 @@ model_config = ml_collections.ConfigDict({
     'source_logvar_min': -8.0,
     'source_logvar_max': 4.0,
     'source_zero_init': 1,
+    'source_dtype': 'float32',
 
     # ===== Khoat Flow Matching defaults =====
     'kfm_p_min': 0.20,          # P_min = 75%
@@ -147,6 +153,17 @@ def _write_metrics_json(path, payload):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(_json_ready(payload), f, indent=2, sort_keys=True)
 
+
+def _resolve_jax_dtype(dtype_name):
+    normalized = str(dtype_name).lower()
+    if normalized in ('bf16', 'bfloat16'):
+        return jnp.bfloat16
+    if normalized in ('fp32', 'float32'):
+        return jnp.float32
+    if normalized in ('fp16', 'float16'):
+        return jnp.float16
+    raise ValueError(f'Unsupported dtype: {dtype_name}')
+
 ##############################################
 # Training Code.
 ##############################################
@@ -157,6 +174,9 @@ def main(_):
         from moe1_ablation import run as run_moe1_ablation
         run_moe1_ablation(FLAGS)
         return
+
+    if FLAGS.train_metrics_level not in ('summary', 'full'):
+        raise ValueError('--train_metrics_level must be "summary" or "full".')
 
     np.random.seed(FLAGS.seed)
     if FLAGS.model.train_type == 'naive-moe-source':
@@ -258,6 +278,7 @@ def main(_):
             logvar_min=FLAGS.model['source_logvar_min'],
             logvar_max=FLAGS.model['source_logvar_max'],
             zero_init=bool(FLAGS.model['source_zero_init']),
+            dtype=_resolve_jax_dtype(FLAGS.model['source_dtype']),
         )
     else:
         source_model_def = None
@@ -373,6 +394,8 @@ def main(_):
     # Update Function
     ###################################
 
+    collect_full_train_diagnostics = FLAGS.train_metrics_level == 'full'
+
     @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
     def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1):
         new_rng, targets_key, dropout_key, perm_key = jax.random.split(
@@ -439,19 +462,23 @@ def main(_):
                     dtype=jnp.float32,
                 )
                 z = jax.random.normal(z_key, images.shape)
-                mu_x0, logvar_x0, var_x0, alpha, expert_mu, expert_logvar, router_logits = train_state.call_source(
+                source_out = train_state.call_source(
                     z,
                     condition_weights,
                     params=grad_params,
-                    return_experts=True,
+                    return_experts=collect_full_train_diagnostics,
                 )
+                if collect_full_train_diagnostics:
+                    mu_x0, logvar_x0, var_x0, alpha, expert_mu, expert_logvar, router_logits = source_out
+                else:
+                    mu_x0, logvar_x0, var_x0, alpha = source_out
                 x_0 = sample_diag_gaussian(x0_key, mu_x0, logvar_x0)
                 x_t = (1 - (1 - 1e-5) * t_full) * x_0 + t_full * images
                 v_t = images - (1 - 1e-5) * x_0
                 dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
                 dt_base = jnp.ones(images.shape[0], dtype=jnp.int32) * dt_flow
 
-                v_prime, logvars, activations = train_state.call_model(
+                model_out = train_state.call_model(
                     x_t,
                     t,
                     dt_base,
@@ -459,11 +486,23 @@ def main(_):
                     train=True,
                     rngs={'dropout': dropout_key},
                     params=grad_params,
-                    return_activations=True,
+                    return_activations=collect_full_train_diagnostics,
                 )
+                if collect_full_train_diagnostics:
+                    v_prime, logvars, activations = model_out
+                else:
+                    v_prime = model_out
                 mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
                 loss_fm = jnp.mean(mse_v)
                 alpha_mean = jnp.mean(alpha, axis=0)
+                hard_usage = jnp.mean(
+                    jax.nn.one_hot(
+                        jnp.argmax(alpha, axis=-1),
+                        FLAGS.model['gmm_num_modes'],
+                        dtype=jnp.float32,
+                    ),
+                    axis=0,
+                )
                 loss_balance = jnp.sum(
                     (alpha_mean - (1.0 / FLAGS.model['gmm_num_modes'])) ** 2)
                 entropy = -jnp.sum(
@@ -495,41 +534,46 @@ def main(_):
                     'source/var_mean': jnp.mean(var_x0),
                     'source/var_min': jnp.min(var_x0),
                     'source/var_max': jnp.max(var_x0),
+                    'max_usage': jnp.max(hard_usage),
+                    'max_soft_usage': jnp.max(alpha_mean),
                     'router/entropy_mean': loss_entropy,
                     'posterior/q_entropy_mean': jnp.mean(
                         -jnp.sum(q * jnp.log(jnp.maximum(q, 1e-8)), axis=-1)),
                     'q_alpha_agreement': jnp.mean(
                         jnp.argmax(q, axis=-1) == jnp.argmax(alpha, axis=-1)),
                     'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
-                    'router/logit_norm': jnp.sqrt(jnp.mean(jnp.square(router_logits))),
                     'dropped_ratio': jnp.mean(
                         labels_dropped == FLAGS.model['num_classes']),
-                    **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
                 }
 
-                expert_means = jnp.mean(expert_mu, axis=0).reshape(
-                    (FLAGS.model['gmm_num_modes'], -1))
-                expert_norms = jnp.linalg.norm(expert_means, axis=-1) + 1e-8
-                for idx in range(FLAGS.model['gmm_num_modes']):
-                    mu_i = expert_mu[:, idx]
-                    logvar_i = expert_logvar[:, idx]
-                    var_i = jnp.exp(logvar_i)
-                    weighted_mu_i = alpha[:, idx, None, None, None] * mu_i
-                    info[f'router/usage_mean_{idx}'] = alpha_mean[idx]
-                    info[f'router/argmax_freq_{idx}'] = jnp.mean(
-                        jnp.argmax(alpha, axis=-1) == idx)
-                    info[f'posterior/q_mean_{idx}'] = jnp.mean(q[:, idx])
-                    info[f'expert/mu_norm_{idx}'] = jnp.sqrt(
-                        jnp.mean(jnp.square(mu_i)))
-                    info[f'expert/logvar_mean_{idx}'] = jnp.mean(logvar_i)
-                    info[f'expert/var_mean_{idx}'] = jnp.mean(var_i)
-                    info[f'expert/weighted_mu_norm_{idx}'] = jnp.sqrt(
-                        jnp.mean(jnp.square(weighted_mu_i)))
-                for i in range(FLAGS.model['gmm_num_modes']):
-                    for j in range(i + 1, FLAGS.model['gmm_num_modes']):
-                        cosine = jnp.sum(expert_means[i] * expert_means[j])
-                        cosine /= expert_norms[i] * expert_norms[j]
-                        info[f'expert/cosine_{i}_{j}'] = cosine
+                if collect_full_train_diagnostics:
+                    info['router/logit_norm'] = jnp.sqrt(jnp.mean(jnp.square(router_logits)))
+                    info.update({
+                        'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v)))
+                        for k, v in activations.items()
+                    })
+                    expert_means = jnp.mean(expert_mu, axis=0).reshape(
+                        (FLAGS.model['gmm_num_modes'], -1))
+                    expert_norms = jnp.linalg.norm(expert_means, axis=-1) + 1e-8
+                    for idx in range(FLAGS.model['gmm_num_modes']):
+                        mu_i = expert_mu[:, idx]
+                        logvar_i = expert_logvar[:, idx]
+                        var_i = jnp.exp(logvar_i)
+                        weighted_mu_i = alpha[:, idx, None, None, None] * mu_i
+                        info[f'router/usage_mean_{idx}'] = alpha_mean[idx]
+                        info[f'router/argmax_freq_{idx}'] = hard_usage[idx]
+                        info[f'posterior/q_mean_{idx}'] = jnp.mean(q[:, idx])
+                        info[f'expert/mu_norm_{idx}'] = jnp.sqrt(
+                            jnp.mean(jnp.square(mu_i)))
+                        info[f'expert/logvar_mean_{idx}'] = jnp.mean(logvar_i)
+                        info[f'expert/var_mean_{idx}'] = jnp.mean(var_i)
+                        info[f'expert/weighted_mu_norm_{idx}'] = jnp.sqrt(
+                            jnp.mean(jnp.square(weighted_mu_i)))
+                    for i in range(FLAGS.model['gmm_num_modes']):
+                        for j in range(i + 1, FLAGS.model['gmm_num_modes']):
+                            cosine = jnp.sum(expert_means[i] * expert_means[j])
+                            cosine /= expert_norms[i] * expert_norms[j]
+                            info[f'expert/cosine_{i}_{j}'] = cosine
 
                 return loss, info
 
@@ -565,16 +609,32 @@ def main(_):
                     FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
 
             def loss_fn(grad_params):
-                v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={
-                                                                       'dropout': dropout_key}, params=grad_params, return_activations=True)
+                model_out = train_state.call_model(
+                    x_t,
+                    t,
+                    dt_base,
+                    labels,
+                    train=True,
+                    rngs={'dropout': dropout_key},
+                    params=grad_params,
+                    return_activations=collect_full_train_diagnostics,
+                )
+                if collect_full_train_diagnostics:
+                    v_prime, logvars, activations = model_out
+                else:
+                    v_prime = model_out
                 mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
                 loss = jnp.mean(mse_v)
 
                 info = {
                     'loss': loss,
                     'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
-                    **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
                 }
+                if collect_full_train_diagnostics:
+                    info.update({
+                        'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v)))
+                        for k, v in activations.items()
+                    })
 
                 if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
                     bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
@@ -590,16 +650,17 @@ def main(_):
             grads, train_state.opt_state, train_state.params)
         new_params = optax.apply_updates(train_state.params, updates)
 
-        info['grad_norm'] = optax.global_norm(grads)
-        info['update_norm'] = optax.global_norm(updates)
-        info['param_norm'] = optax.global_norm(new_params)
         info['lr'] = lr_schedule(train_state.step)
-        if FLAGS.model['train_type'] == 'naive-moe-source':
-            info['grad/source_total_norm'] = optax.global_norm(grads['source'])
-            info['grad/router_norm'] = optax.global_norm(grads['source']['router'])
-            for idx in range(FLAGS.model['gmm_num_modes']):
-                info[f'grad/expert_{idx}_norm'] = optax.global_norm(
-                    grads['source'][f'expert_{idx}'])
+        if collect_full_train_diagnostics:
+            info['grad_norm'] = optax.global_norm(grads)
+            info['update_norm'] = optax.global_norm(updates)
+            info['param_norm'] = optax.global_norm(new_params)
+            if FLAGS.model['train_type'] == 'naive-moe-source':
+                info['grad/source_total_norm'] = optax.global_norm(grads['source'])
+                info['grad/router_norm'] = optax.global_norm(grads['source']['router'])
+                for idx in range(FLAGS.model['gmm_num_modes']):
+                    info[f'grad/expert_{idx}_norm'] = optax.global_norm(
+                        grads['source'][f'expert_{idx}'])
 
         train_state = train_state.replace(
             rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
@@ -622,8 +683,18 @@ def main(_):
             return summary
         usage_keys = [k for k in metric_dict if k.startswith('router/argmax_freq_')]
         soft_usage_keys = [k for k in metric_dict if k.startswith('router/usage_mean_')]
-        summary['max_usage'] = max((float(metric_dict[k]) for k in usage_keys), default=0.0)
-        summary['max_soft_usage'] = max((float(metric_dict[k]) for k in soft_usage_keys), default=0.0)
+        summary['max_usage'] = float(
+            metric_dict.get(
+                'max_usage',
+                max((float(metric_dict[k]) for k in usage_keys), default=0.0),
+            )
+        )
+        summary['max_soft_usage'] = float(
+            metric_dict.get(
+                'max_soft_usage',
+                max((float(metric_dict[k]) for k in soft_usage_keys), default=0.0),
+            )
+        )
         for key in (
             'router/entropy_mean',
             'q_alpha_agreement',

@@ -29,6 +29,13 @@ SUMMARY_GROUP = 'Ablation_Summary'
 ROOT_DIR = Path(__file__).resolve().parent
 PHASE1_MIN_SURVIVORS = 3
 PHASE1_SCREEN_TOPK = 5
+PHASE1_GMM_K_LIST = [8, 16, 24, 32]
+PHASE2_MAX_STEPS = 5000
+ABLATION_FID_TIMESTEPS = 32
+ABLATION_FID_GENERATIONS = 1024
+FID_METRIC_KEY = f'fid{ABLATION_FID_TIMESTEPS}_{ABLATION_FID_GENERATIONS}'
+LATENCY_METRIC_KEY = f'latency_{ABLATION_FID_TIMESTEPS}'
+THROUGHPUT_METRIC_KEY = f'throughput_{ABLATION_FID_TIMESTEPS}'
 FLOW_VIZ_SAMPLES = 512
 PATH_PLOT_MAX_LINES = 256
 
@@ -88,6 +95,21 @@ def _sanitize_flag_value(value):
     return str(value)
 
 
+def _metric_value(row, key, default=None):
+    value = row.get(key)
+    if value is not None:
+        return value
+    for section_name in ('inference', 'train'):
+        section = row.get(section_name, {})
+        if isinstance(section, dict) and section.get(key) is not None:
+            return section[key]
+    return default
+
+
+def _fid_value(row, default=None):
+    return _metric_value(row, FID_METRIC_KEY, default)
+
+
 def _extend_config_flags(args, prefix, values):
     for key, value in values.items():
         if value is None:
@@ -127,6 +149,7 @@ def _base_model_overrides(flags):
         'loss_entropy_weight': 0.1,
         'source_var_weight': 1.0,
         'source_var_target_std': 1.0,
+        'source_dtype': 'bfloat16',
     })
     return overrides
 
@@ -146,9 +169,10 @@ def _base_train_args(flags, metrics_output_path, save_dir, max_steps, wandb_grou
         f'--save_interval={max_steps + 2}',
         f'--save_dir={save_dir}',
         f'--metrics_output_path={metrics_output_path}',
-        f'--inference_timesteps=128',
-        f'--inference_generations=4096',
-        '--eval_fid_timesteps=128',
+        f'--inference_timesteps={ABLATION_FID_TIMESTEPS}',
+        f'--inference_generations={ABLATION_FID_GENERATIONS}',
+        f'--eval_fid_timesteps={ABLATION_FID_TIMESTEPS}',
+        '--train_metrics_level=summary',
         f'--save_x_render={_sanitize_flag_value(save_x_render)}',
         f'--wandb.project={flags.wandb.project}',
         f'--wandb.group={wandb_group}',
@@ -270,7 +294,7 @@ def _is_valid_run(row):
     max_usage = float(train.get('max_usage', 0.0))
     var_x0_mean = float(train.get('source/var_mean', 1.0))
     var_x0_min = float(train.get('source/var_min', 1.0))
-    fid = row.get('inference', {}).get('fid128_4096')
+    fid = _fid_value(row)
     if fid is None or not np.isfinite(fid):
         return False
     if not np.isfinite(var_x0_mean) or not np.isfinite(var_x0_min):
@@ -286,7 +310,7 @@ def _is_valid_run(row):
 
 def _sort_run_key(row):
     return (
-        float(row.get('fid128_4096', row.get('inference', {}).get('fid128_4096', float('inf')))),
+        float(_fid_value(row, float('inf'))),
         float(row.get('valid_loss', row.get('train', {}).get('valid_loss', float('inf')))),
         float(row.get('max_usage', row.get('train', {}).get('max_usage', float('inf')))),
     )
@@ -295,7 +319,7 @@ def _sort_run_key(row):
 def _decorate_run_row(row, **metadata):
     train = row.get('train', {})
     inference = row.get('inference', {})
-    row['fid128_4096'] = inference.get('fid128_4096')
+    row[FID_METRIC_KEY] = inference.get(FID_METRIC_KEY)
     row['valid_loss'] = train.get('valid_loss')
     row['router_entropy_mean'] = train.get('router/entropy_mean')
     row['max_usage'] = train.get('max_usage')
@@ -1161,6 +1185,194 @@ def _log_summary_run(flags, group, name, summary_metrics, image_paths=None, conf
     run.finish()
 
 
+def _filter_image_paths(image_paths, keep_keys):
+    keep = set(keep_keys)
+    return {
+        key: value
+        for key, value in (image_paths or {}).items()
+        if key in keep and value and os.path.exists(value)
+    }
+
+
+def _filter_balanced_master_image_paths(image_paths, keep_keys):
+    detail_prefixes = ('phase1b_', 'phase2_')
+    detail_suffixes = (
+        '_source_grid',
+        '_source_posterior_grid',
+        '_generated_grid',
+        '_x_data_grid',
+        '_latent_pca_endpoints',
+        '_latent_tsne_endpoints',
+        '_latent_pca_paths',
+        '_latent_tsne_paths',
+    )
+    keep = set(keep_keys)
+    output = {}
+    for key, value in (image_paths or {}).items():
+        if not value or not os.path.exists(value):
+            continue
+        if key in keep or (key.startswith(detail_prefixes) and key.endswith(detail_suffixes)):
+            output[key] = value
+    return output
+
+
+def _compact_value(value):
+    if value is None:
+        return ''
+    if isinstance(value, (np.floating, float)):
+        if not np.isfinite(value):
+            return ''
+        return f'{float(value):.6g}'
+    if isinstance(value, (np.integer, int)):
+        return str(int(value))
+    return str(value)
+
+
+def _markdown_table(rows, columns, max_rows=None):
+    rows = rows[:max_rows] if max_rows is not None else rows
+    if not rows:
+        return '_No rows._'
+    header = '| ' + ' | '.join(columns) + ' |'
+    separator = '| ' + ' | '.join(['---'] * len(columns)) + ' |'
+    body = []
+    for row in rows:
+        body.append('| ' + ' | '.join(_compact_value(row.get(column)) for column in columns) + ' |')
+    return '\n'.join([header, separator, *body])
+
+
+def _write_analysis_packet(
+    root,
+    ablation_run_id,
+    project_name,
+    gmm_rows,
+    phase1_candidates,
+    phase1b_rows,
+    phase1_winner,
+    phase2_rows,
+    composed_row,
+    phase2_summary,
+    phase2_selected,
+    phase3_selected,
+    phase3_naive,
+    final_selected,
+    master_summary_rows,
+    latent_stats_summary_rows,
+    visualization_index_entries,
+):
+    phase1a_rows = _phase1a_summary_rows(gmm_rows, phase1_candidates)
+    phase1b_rows_full = _phase1b_full_rows(phase1b_rows, phase1_winner)
+    phase2_rows_full = _phase2_full_rows(phase2_rows, composed_row, phase2_selected)
+    phase3_rows = [
+        {
+            'role': 'best_moe1',
+            'run_name': phase3_selected['run_name'],
+            FID_METRIC_KEY: phase3_selected.get(FID_METRIC_KEY),
+            'valid_loss': phase3_selected.get('valid_loss'),
+            LATENCY_METRIC_KEY: phase3_selected.get('inference', {}).get(LATENCY_METRIC_KEY),
+            THROUGHPUT_METRIC_KEY: phase3_selected.get('inference', {}).get(THROUGHPUT_METRIC_KEY),
+        },
+        {
+            'role': 'naive_reference',
+            'run_name': phase3_naive['run_name'],
+            FID_METRIC_KEY: phase3_naive.get(FID_METRIC_KEY),
+            'valid_loss': phase3_naive.get('valid_loss'),
+            LATENCY_METRIC_KEY: phase3_naive.get('inference', {}).get(LATENCY_METRIC_KEY),
+            THROUGHPUT_METRIC_KEY: phase3_naive.get('inference', {}).get(THROUGHPUT_METRIC_KEY),
+        },
+    ]
+    payload = {
+        'meta': {
+            'ablation_run_id': ablation_run_id,
+            'wandb_project': project_name,
+            'fid_metric_key': FID_METRIC_KEY,
+            'fid_timesteps': ABLATION_FID_TIMESTEPS,
+            'fid_generations': ABLATION_FID_GENERATIONS,
+            'flow_viz_samples': FLOW_VIZ_SAMPLES,
+            'path_plot_max_lines': PATH_PLOT_MAX_LINES,
+        },
+        'winners': {
+            'phase1_winner': phase1_winner['run_name'],
+            'phase2_selected': phase2_selected['run_name'],
+            'phase3_winner': final_selected['run_name'],
+            'phase2_composed_status': phase2_summary['composed_status'],
+        },
+        'phase1a': phase1a_rows,
+        'phase1b': phase1b_rows_full,
+        'phase2': phase2_rows_full,
+        'phase3': phase3_rows,
+        'master_summary': master_summary_rows,
+        'latent_stats_summary': latent_stats_summary_rows,
+        'visualization_index': visualization_index_entries,
+    }
+    json_path = root / 'analysis_packet.json'
+    md_path = root / 'analysis_packet.md'
+    _write_json(json_path, payload)
+
+    md = [
+        '# moe1-ablation analysis packet',
+        '',
+        'Copy this whole file into chat when you want a post-run analysis.',
+        '',
+        '## Quick Context',
+        '',
+        f'- run_id: `{ablation_run_id}`',
+        f'- wandb_project: `{project_name}`',
+        f'- ranking_metric: `{FID_METRIC_KEY}`',
+        f'- fid_sampling: `{ABLATION_FID_TIMESTEPS}` ODE steps, `{ABLATION_FID_GENERATIONS}` images',
+        f'- phase1_winner: `{phase1_winner["run_name"]}`',
+        f'- phase2_selected: `{phase2_selected["run_name"]}`',
+        f'- phase2_composed_status: `{phase2_summary["composed_status"]}`',
+        f'- phase3_winner: `{final_selected["run_name"]}`',
+        '',
+        '## Master Summary',
+        '',
+        _markdown_table(master_summary_rows, ['stage', 'item', 'run_name', 'detail', FID_METRIC_KEY]),
+        '',
+        '## Phase 1A GMM Summary',
+        '',
+        _markdown_table(
+            phase1a_rows,
+            ['run_name', 'K', 'valid_nll', 'dead_components', 'max_component_fraction', 'selected_for_phase1b', 'valid'],
+        ),
+        '',
+        '## Phase 1B Full Screen',
+        '',
+        _markdown_table(
+            phase1b_rows_full,
+            ['run_name', 'gmm_num_modes', FID_METRIC_KEY, 'valid_loss', 'max_usage', 'max_soft_usage', 'q_alpha_agreement', 'var_x0_mean', 'var_x0_min', 'winner', 'valid'],
+        ),
+        '',
+        '## Phase 2 Full Sweep',
+        '',
+        _markdown_table(
+            phase2_rows_full,
+            ['run_name', 'phase2_group', FID_METRIC_KEY, 'valid_loss', 'max_usage', 'max_soft_usage', 'q_alpha_agreement', 'var_x0_mean', 'var_x0_min', 'group_winner', 'is_composed', 'is_selected', 'valid'],
+        ),
+        '',
+        '## Phase 3 Final Duel',
+        '',
+        _markdown_table(phase3_rows, ['role', 'run_name', FID_METRIC_KEY, 'valid_loss', LATENCY_METRIC_KEY, THROUGHPUT_METRIC_KEY]),
+        '',
+        '## Latent Stats Summary',
+        '',
+        _markdown_table(
+            latent_stats_summary_rows,
+            ['run_name', 'split', 'sample_count', 'mean_norm', 'variance_mean', 'avg_distance_to_data', 'straightness_ratio_mean', 'final_cluster_agreement_with_data'],
+        ),
+        '',
+        '## Visualization Index',
+        '',
+        _markdown_table(
+            _visualization_index_rows(visualization_index_entries),
+            ['stage', 'run_name', 'role', 'projection_types', 'cluster_source', 'cache_path'],
+        ),
+        '',
+        f'Full machine-readable packet: `{json_path}`',
+    ]
+    md_path.write_text('\n'.join(md) + '\n', encoding='utf-8')
+    return json_path, md_path
+
+
 def _cleanup_run_artifacts(
     run_dir,
     keep_metrics=True,
@@ -1226,7 +1438,7 @@ def _phase1b_summary_rows(rows, winner):
         summary.append({
             'run_name': row['run_name'],
             'gmm_num_modes': row.get('phase1b/gmm_num_modes'),
-            'fid128_4096': row.get('fid128_4096'),
+            FID_METRIC_KEY: row.get(FID_METRIC_KEY),
             'valid_loss': row.get('valid_loss'),
             'max_usage': row.get('max_usage'),
             'winner': 'yes' if row['run_name'] == winner_name else '',
@@ -1242,7 +1454,7 @@ def _phase1b_full_rows(rows, winner):
         full_rows.append({
             'run_name': row['run_name'],
             'gmm_num_modes': row.get('phase1b/gmm_num_modes'),
-            'fid128_4096': row.get('fid128_4096'),
+            FID_METRIC_KEY: row.get(FID_METRIC_KEY),
             'valid_loss': row.get('valid_loss'),
             'max_usage': row.get('max_usage'),
             'max_soft_usage': row.get('max_soft_usage'),
@@ -1263,7 +1475,7 @@ def _phase2_full_rows(rows, composed_row, phase2_selected):
         full_rows.append({
             'run_name': row['run_name'],
             'phase2_group': row.get('phase2_group'),
-            'fid128_4096': row.get('fid128_4096'),
+            FID_METRIC_KEY: row.get(FID_METRIC_KEY),
             'valid_loss': row.get('valid_loss'),
             'max_usage': row.get('max_usage'),
             'max_soft_usage': row.get('max_soft_usage'),
@@ -1329,21 +1541,21 @@ def _master_summary_rows(run_id, project_name, phase1_winner, best_balance, best
             'item': 'winning_gmm',
             'run_name': phase1_winner['run_name'],
             'detail': f"K={phase1_winner['model_overrides']['gmm_num_modes']}",
-            'fid128_4096': phase1_winner.get('fid128_4096'),
+            FID_METRIC_KEY: phase1_winner.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase2',
             'item': 'best_balance',
             'run_name': best_balance['run_name'],
             'detail': f"balance={best_balance['model_overrides']['loss_balance_weight']}",
-            'fid128_4096': best_balance.get('fid128_4096'),
+            FID_METRIC_KEY: best_balance.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase2',
             'item': 'best_entropy',
             'run_name': best_entropy['run_name'],
             'detail': f"entropy={best_entropy['model_overrides']['loss_entropy_weight']}",
-            'fid128_4096': best_entropy.get('fid128_4096'),
+            FID_METRIC_KEY: best_entropy.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase2',
@@ -1353,42 +1565,42 @@ def _master_summary_rows(run_id, project_name, phase1_winner, best_balance, best
                 f"var_w={best_variance['model_overrides'].get('source_var_weight', 1.0)}, "
                 f"target={best_variance['model_overrides'].get('source_var_target_std', 1.0)}"
             ),
-            'fid128_4096': best_variance.get('fid128_4096'),
+            FID_METRIC_KEY: best_variance.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase2',
             'item': 'composed',
             'run_name': composed_row['run_name'],
             'detail': f"selected={phase2_selected['run_name'] == composed_row['run_name']}",
-            'fid128_4096': composed_row.get('fid128_4096'),
+            FID_METRIC_KEY: composed_row.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase2',
             'item': 'phase2_selected',
             'run_name': phase2_selected['run_name'],
             'detail': f"project={project_name}",
-            'fid128_4096': phase2_selected.get('fid128_4096'),
+            FID_METRIC_KEY: phase2_selected.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase3',
             'item': 'top1_moe',
             'run_name': phase3_selected['run_name'],
             'detail': f"run_id={run_id}",
-            'fid128_4096': phase3_selected.get('fid128_4096'),
+            FID_METRIC_KEY: phase3_selected.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase3',
             'item': 'naive_reference',
             'run_name': phase3_naive['run_name'],
             'detail': '',
-            'fid128_4096': phase3_naive.get('fid128_4096'),
+            FID_METRIC_KEY: phase3_naive.get(FID_METRIC_KEY),
         },
         {
             'stage': 'phase3',
             'item': 'final_winner',
             'run_name': final_selected['run_name'],
             'detail': '',
-            'fid128_4096': final_selected.get('fid128_4096'),
+            FID_METRIC_KEY: final_selected.get(FID_METRIC_KEY),
         },
     ]
 
@@ -1413,7 +1625,7 @@ def run(flags):
 
     # Phase 1A
     phase1a_dir = root / 'phase1a_gmm'
-    gmm_rows = [_run_gmm(flags, phase1a_dir, k) for k in [2, 4, 8, 16, 24, 32]]
+    gmm_rows = [_run_gmm(flags, phase1a_dir, k) for k in PHASE1_GMM_K_LIST]
     phase1_candidates = _select_phase1_screen_gmms(gmm_rows)
     _write_json(
         phase1a_dir / 'ranking.json',
@@ -1470,7 +1682,7 @@ def run(flags):
     _write_json(phase1b_dir / 'ranking.json', {'all': phase1b_rows, 'winner': phase1_winner})
     phase1b_summary_table = _make_table_png(
         _phase1b_summary_rows(phase1b_rows, phase1_winner),
-        ['run_name', 'gmm_num_modes', 'fid128_4096', 'valid_loss', 'max_usage', 'winner', 'valid'],
+        ['run_name', 'gmm_num_modes', FID_METRIC_KEY, 'valid_loss', 'max_usage', 'winner', 'valid'],
         'Phase 1B Downstream Summary',
         phase1b_dir / 'phase1b_summary.png',
     )
@@ -1479,7 +1691,7 @@ def run(flags):
         [
             'run_name',
             'gmm_num_modes',
-            'fid128_4096',
+            FID_METRIC_KEY,
             'valid_loss',
             'max_usage',
             'max_soft_usage',
@@ -1507,7 +1719,7 @@ def run(flags):
             run_name,
             PHASE2_GROUP,
             phase2_dir / run_name,
-            10000,
+            PHASE2_MAX_STEPS,
             run_overrides,
             dump_source_stats=True,
             save_x_render=False,
@@ -1558,7 +1770,7 @@ def run(flags):
         'M17_Composed',
         PHASE2_COMPOSED_GROUP,
         phase2_dir / 'M17_Composed',
-        10000,
+        PHASE2_MAX_STEPS,
         composed_overrides,
         dump_source_stats=True,
         save_x_render=False,
@@ -1587,7 +1799,7 @@ def run(flags):
     default_row = next(row for row in phase2_rows if row['run_name'] == 'M00_Default')
     composed_pass = (
         composed_row['valid']
-        and composed_row['inference']['fid128_4096'] <= default_row['inference']['fid128_4096'] * 1.03
+        and composed_row['inference'][FID_METRIC_KEY] <= default_row['inference'][FID_METRIC_KEY] * 1.03
     )
     valid_phase2 = [row for row in phase2_rows if row['valid']]
     if not valid_phase2:
@@ -1625,30 +1837,30 @@ def run(flags):
             {
                 'winner_type': 'balance',
                 'run_name': best_balance['run_name'],
-                'fid128_4096': best_balance['fid128_4096'],
+                FID_METRIC_KEY: best_balance[FID_METRIC_KEY],
             },
             {
                 'winner_type': 'entropy',
                 'run_name': best_entropy['run_name'],
-                'fid128_4096': best_entropy['fid128_4096'],
+                FID_METRIC_KEY: best_entropy[FID_METRIC_KEY],
             },
             {
                 'winner_type': 'variance',
                 'run_name': best_variance['run_name'],
-                'fid128_4096': best_variance['fid128_4096'],
+                FID_METRIC_KEY: best_variance[FID_METRIC_KEY],
             },
             {
                 'winner_type': 'composed',
                 'run_name': composed_row['run_name'],
-                'fid128_4096': composed_row['fid128_4096'],
+                FID_METRIC_KEY: composed_row[FID_METRIC_KEY],
             },
             {
                 'winner_type': 'selected',
                 'run_name': phase2_selected['run_name'],
-                'fid128_4096': phase2_selected['fid128_4096'],
+                FID_METRIC_KEY: phase2_selected[FID_METRIC_KEY],
             },
         ],
-        ['winner_type', 'run_name', 'fid128_4096'],
+        ['winner_type', 'run_name', FID_METRIC_KEY],
         'Phase 2 Summary',
         phase2_dir / 'phase2_summary.png',
     )
@@ -1687,7 +1899,7 @@ def run(flags):
         [
             {
                 'run_name': default_row['run_name'],
-                'fid128_4096': default_row['fid128_4096'],
+                FID_METRIC_KEY: default_row[FID_METRIC_KEY],
                 'valid_loss': default_row['valid_loss'],
                 'max_usage': default_row['max_usage'],
                 'max_soft_usage': default_row['max_soft_usage'],
@@ -1696,7 +1908,7 @@ def run(flags):
             },
             {
                 'run_name': composed_row['run_name'],
-                'fid128_4096': composed_row['fid128_4096'],
+                FID_METRIC_KEY: composed_row[FID_METRIC_KEY],
                 'valid_loss': composed_row['valid_loss'],
                 'max_usage': composed_row['max_usage'],
                 'max_soft_usage': composed_row['max_soft_usage'],
@@ -1706,7 +1918,7 @@ def run(flags):
         ],
         [
             'run_name',
-            'fid128_4096',
+            FID_METRIC_KEY,
             'valid_loss',
             'max_usage',
             'max_soft_usage',
@@ -1721,7 +1933,7 @@ def run(flags):
         [
             'run_name',
             'phase2_group',
-            'fid128_4096',
+            FID_METRIC_KEY,
             'valid_loss',
             'max_usage',
             'max_soft_usage',
@@ -1803,7 +2015,7 @@ def run(flags):
     final_selected = min(
         [phase3_selected, phase3_naive],
         key=lambda row: (
-            row['fid128_4096'],
+            row[FID_METRIC_KEY],
             row['valid_loss'],
         ),
     )
@@ -1933,20 +2145,20 @@ def run(flags):
         [
             {
                 'run_name': phase3_selected['run_name'],
-                'fid128_4096': phase3_selected['fid128_4096'],
+                FID_METRIC_KEY: phase3_selected[FID_METRIC_KEY],
                 'valid_loss': phase3_selected['valid_loss'],
-                'latency_128': phase3_selected['inference'].get('latency_128'),
-                'throughput_128': phase3_selected['inference'].get('throughput_128'),
+                LATENCY_METRIC_KEY: phase3_selected['inference'].get(LATENCY_METRIC_KEY),
+                THROUGHPUT_METRIC_KEY: phase3_selected['inference'].get(THROUGHPUT_METRIC_KEY),
             },
             {
                 'run_name': phase3_naive['run_name'],
-                'fid128_4096': phase3_naive['fid128_4096'],
+                FID_METRIC_KEY: phase3_naive[FID_METRIC_KEY],
                 'valid_loss': phase3_naive['valid_loss'],
-                'latency_128': phase3_naive['inference'].get('latency_128'),
-                'throughput_128': phase3_naive['inference'].get('throughput_128'),
+                LATENCY_METRIC_KEY: phase3_naive['inference'].get(LATENCY_METRIC_KEY),
+                THROUGHPUT_METRIC_KEY: phase3_naive['inference'].get(THROUGHPUT_METRIC_KEY),
             },
         ],
-        ['run_name', 'fid128_4096', 'valid_loss', 'latency_128', 'throughput_128'],
+        ['run_name', FID_METRIC_KEY, 'valid_loss', LATENCY_METRIC_KEY, THROUGHPUT_METRIC_KEY],
         'Phase 3 Final Duel',
         figures_dir / 'phase3_final_compare.png',
     )
@@ -2010,7 +2222,7 @@ def run(flags):
     )
     master_summary_table = _make_table_png(
         master_summary_rows,
-        ['stage', 'item', 'run_name', 'detail', 'fid128_4096'],
+        ['stage', 'item', 'run_name', 'detail', FID_METRIC_KEY],
         'moe1-ablation Master Summary',
         root / 'master_summary.png',
     )
@@ -2026,24 +2238,76 @@ def run(flags):
             'rows': master_summary_rows,
         },
     )
+    analysis_packet_json, analysis_packet_md = _write_analysis_packet(
+        root,
+        ablation_run_id,
+        flags.wandb.project,
+        gmm_rows,
+        phase1_candidates,
+        phase1b_rows,
+        phase1_winner,
+        phase2_rows,
+        composed_row,
+        phase2_summary,
+        phase2_selected,
+        phase3_selected,
+        phase3_naive,
+        final_selected,
+        master_summary_rows,
+        latent_stats_summary_rows,
+        visualization_index_entries,
+    )
+    print(f'Analysis packet for copy/paste: {analysis_packet_md}')
+    final_viz_keys = {
+        'phase3_shared_latent_pca_endpoints',
+        'phase3_shared_latent_tsne_endpoints',
+        'phase3_shared_latent_pca_paths',
+        'phase3_shared_latent_tsne_paths',
+        'phase3_best_moe1_q_vs_alpha_heatmap',
+        'phase3_best_moe1_expert_usage_hist',
+    }
+    summary_table_keys = {
+        'phase1a_summary',
+        'phase1b_summary',
+        'phase1b_full_screen',
+        'phase2_summary',
+        'phase2_default_vs_composed',
+        'phase2_full_sweep',
+        'phase3_final_compare',
+        'latent_stats_summary',
+        'visualization_index',
+        'master_summary',
+    }
+    p3_summary_images = _filter_image_paths(
+        {
+            **image_paths,
+            'master_summary': str(master_summary_table),
+        },
+        {
+            'phase3_final_compare',
+            'latent_stats_summary',
+            'master_summary',
+            *final_viz_keys,
+        },
+    )
+    master_summary_images = _filter_balanced_master_image_paths(
+        {**master_image_paths, 'master_summary': str(master_summary_table)},
+        summary_table_keys | final_viz_keys,
+    )
     _log_summary_run(
         flags,
         PHASE3_GROUP,
         'P3_Final_Summary',
         {
-            'phase3/moe_fid128_4096': phase3_selected['fid128_4096'],
-            'phase3/naive_fid128_4096': phase3_naive['fid128_4096'],
+            f'phase3/moe_{FID_METRIC_KEY}': phase3_selected[FID_METRIC_KEY],
+            f'phase3/naive_{FID_METRIC_KEY}': phase3_naive[FID_METRIC_KEY],
             'phase3/winner': final_selected['run_name'],
             'ablation/run_id': ablation_run_id,
             'ablation/project_name': flags.wandb.project,
+            'analysis/packet_md': str(analysis_packet_md),
+            'analysis/packet_json': str(analysis_packet_json),
         },
-        image_paths={
-            **image_paths,
-            'phase1a_summary': str(phase1a_summary_table),
-            'phase1b_summary': str(phase1b_summary_table),
-            'phase1b_full_screen': str(phase1b_full_table),
-            'master_summary': str(master_summary_table),
-        },
+        image_paths=p3_summary_images,
         config={'selected_phase2_run': phase2_selected['run_name']},
     )
     _log_summary_run(
@@ -2056,8 +2320,10 @@ def run(flags):
             'phase1/winning_gmm': phase1_winner['run_name'],
             'phase2/final_selected_config': phase2_selected['run_name'],
             'phase3/final_winner': final_selected['run_name'],
+            'analysis/packet_md': str(analysis_packet_md),
+            'analysis/packet_json': str(analysis_packet_json),
         },
-        image_paths={**master_image_paths, 'master_summary': str(master_summary_table)},
+        image_paths=master_summary_images,
         config={
             'ablation_run_id': ablation_run_id,
             'wandb_project': flags.wandb.project,

@@ -1,3 +1,5 @@
+from typing import Any
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -18,23 +20,27 @@ def var_only_kld_loss(var, logvar, target_std=1.0, eps=1e-6):
 class ConditionProjector(nn.Module):
     condition_dim: int
     hidden_channels: int
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, condition_embedding):
-        x = nn.Dense(self.hidden_channels)(condition_embedding)
+        condition_embedding = condition_embedding.astype(self.dtype)
+        x = nn.Dense(self.hidden_channels, dtype=self.dtype)(condition_embedding)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_channels)(x)
+        x = nn.Dense(self.hidden_channels, dtype=self.dtype)(x)
         return x
 
 
 class SharedTrunk(nn.Module):
     hidden_channels: int
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, z):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(z)
+        z = z.astype(self.dtype)
+        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME', dtype=self.dtype)(z)
         x = nn.silu(x)
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(x)
+        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME', dtype=self.dtype)(x)
         x = nn.silu(x)
         return x
 
@@ -43,13 +49,15 @@ class Router(nn.Module):
     hidden_channels: int
     num_modes: int
     tau: float
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, features):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(features)
+        features = features.astype(self.dtype)
+        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME', dtype=self.dtype)(features)
         x = nn.silu(x)
         x = jnp.mean(x, axis=(1, 2))
-        logits = nn.Dense(self.num_modes)(x)
+        logits = nn.Dense(self.num_modes, dtype=self.dtype)(x).astype(jnp.float32)
         alpha = nn.softmax(logits / self.tau, axis=-1)
         return alpha, logits
 
@@ -60,10 +68,12 @@ class SourceExpert(nn.Module):
     zero_init: bool
     logvar_min: float
     logvar_max: float
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, features):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(features)
+        features = features.astype(self.dtype)
+        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME', dtype=self.dtype)(features)
         x = nn.silu(x)
         if self.zero_init:
             kernel_init = nn.initializers.zeros
@@ -79,16 +89,18 @@ class SourceExpert(nn.Module):
             padding='SAME',
             kernel_init=kernel_init,
             bias_init=mu_bias_init,
+            dtype=self.dtype,
             name='mu_head',
-        )(x)
+        )(x).astype(jnp.float32)
         logvar = nn.Conv(
             self.out_channels,
             (3, 3),
             padding='SAME',
             kernel_init=kernel_init,
             bias_init=logvar_bias_init,
+            dtype=self.dtype,
             name='logvar_head',
-        )(x)
+        )(x).astype(jnp.float32)
         logvar = jnp.clip(logvar, self.logvar_min, self.logvar_max)
         return mu, logvar
 
@@ -104,6 +116,7 @@ class SourceMoE(nn.Module):
     logvar_min: float
     logvar_max: float
     zero_init: bool = True
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, z, condition_weights, return_experts=False):
@@ -116,12 +129,14 @@ class SourceMoE(nn.Module):
         condition_bias = ConditionProjector(
             condition_dim=self.condition_dim,
             hidden_channels=self.hidden_channels,
+            dtype=self.dtype,
             name='condition_projector',
         )(condition_embedding)
         condition_bias = condition_bias[:, None, None, :]
 
         features = SharedTrunk(
             hidden_channels=self.hidden_channels,
+            dtype=self.dtype,
             name='shared_trunk',
         )(z)
         conditioned_features = features + condition_bias
@@ -130,6 +145,7 @@ class SourceMoE(nn.Module):
             hidden_channels=self.hidden_channels,
             num_modes=self.num_modes,
             tau=self.tau,
+            dtype=self.dtype,
             name='router',
         )(conditioned_features)
 
@@ -142,6 +158,7 @@ class SourceMoE(nn.Module):
                 zero_init=self.zero_init,
                 logvar_min=self.logvar_min,
                 logvar_max=self.logvar_max,
+                dtype=self.dtype,
                 name=f'expert_{idx}',
             )(conditioned_features)
             expert_mu.append(mu_j)

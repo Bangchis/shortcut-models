@@ -342,20 +342,23 @@ def do_inference(
             latency = generation_time / max(num_generations, 1)
             throughput = num_generations / max(generation_time, 1e-8)
             source_stats_path = dump_source_stats_if_needed()
+            fid_key = f'fid{int(denoise_timesteps)}_{int(num_generations)}'
+            latency_key = f'latency_{int(denoise_timesteps)}'
+            throughput_key = f'throughput_{int(denoise_timesteps)}'
             summary = {
-                'fid128_4096': float(fid),
+                fid_key: float(fid),
                 'denoise_timesteps': int(denoise_timesteps),
                 'num_generations': int(num_generations),
-                'latency_128': float(latency),
-                'throughput_128': float(throughput),
+                latency_key: float(latency),
+                throughput_key: float(throughput),
                 'source_stats_path': source_stats_path,
             }
             if wandb.run is not None and step is not None:
                 wandb.log(
                     {
-                        'final/fid128_4096': float(fid),
-                        'final/latency_128': float(latency),
-                        'final/throughput_128': float(throughput),
+                        f'final/{fid_key}': float(fid),
+                        f'final/{latency_key}': float(latency),
+                        f'final/{throughput_key}': float(throughput),
                     },
                     step=int(step),
                 )

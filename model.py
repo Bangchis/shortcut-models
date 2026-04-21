@@ -237,7 +237,7 @@ class DiT(nn.Module):
     def __call__(self, x, t, dt, y, train=False, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         print("DiT: Input of shape", x.shape, "dtype", x.dtype)
-        activations = {}
+        activations = {} if return_activations else None
 
         batch_size = x.shape[0]
         input_size = x.shape[1]
@@ -254,7 +254,8 @@ class DiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(None, self.hidden_size, num_patches)
         x = PatchEmbed(self.patch_size, self.hidden_size, tc=tc)(x) # (B, num_patches, hidden_size)
         print("DiT: After patch embed, shape is", x.shape, "dtype", x.dtype)
-        activations['patch_embed'] = x
+        if return_activations:
+            activations['patch_embed'] = x
 
         x = x + pos_embed
         x = x.astype(self.dtype)
@@ -263,19 +264,22 @@ class DiT(nn.Module):
         ye = LabelEmbedder(self.num_classes, self.hidden_size, tc=tc)(y) # (B, hidden_size)
         c = te + ye + dte
         
-        activations['pos_embed'] = pos_embed
-        activations['time_embed'] = te
-        activations['dt_embed'] = dte
-        activations['label_embed'] = ye
-        activations['conditioning'] = c
+        if return_activations:
+            activations['pos_embed'] = pos_embed
+            activations['time_embed'] = te
+            activations['dt_embed'] = dte
+            activations['label_embed'] = ye
+            activations['conditioning'] = c
 
         print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)
         print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
         for i in range(self.depth):
             x = DiTBlock(self.hidden_size, self.num_heads, tc, self.mlp_ratio, self.dropout, train)(x, c)
-            activations[f'dit_block_{i}'] = x
+            if return_activations:
+                activations[f'dit_block_{i}'] = x
         x = FinalLayer(self.patch_size, self.out_channels, self.hidden_size, tc)(x, c) # (B, num_patches, p*p*c)
-        activations['final_layer'] = x
+        if return_activations:
+            activations['final_layer'] = x
         # print("DiT: FinalLayer of shape", x.shape, "dtype", x.dtype)
         x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side, 
                             self.patch_size, self.patch_size, self.out_channels))
