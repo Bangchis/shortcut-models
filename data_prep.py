@@ -50,6 +50,7 @@ flags.DEFINE_integer('gmm_em_chunk_size', 1024, 'Chunk size for E-step/M-step ac
 flags.DEFINE_integer('gmm_keep_latent_cache', 0, 'Whether to keep the latent cache file after fitting.')
 flags.DEFINE_integer('gmm_valid_samples', -1, 'How many validation latents to use. -1 means full split.')
 flags.DEFINE_integer('gmm_visual_subset', 2048, 'How many points to use for PCA/t-SNE visualizations.')
+flags.DEFINE_string('gmm_wandb_level', 'full', 'GMM WandB logging level: "summary" or "full".')
 flags.DEFINE_string('metrics_output_path', None, 'Optional JSON path for GMM metrics.')
 flags.DEFINE_string('figures_dir', None, 'Optional directory to save diagnostic figures.')
 
@@ -531,26 +532,30 @@ def main(_):
     if jax.process_index() == 0:
         import wandb
 
-        for step, nll in enumerate(stats_to_save['nll_trace'], start=1):
+        if FLAGS.gmm_wandb_level not in ('summary', 'full'):
+            raise ValueError('--gmm_wandb_level must be "summary" or "full".')
+        if FLAGS.gmm_wandb_level == 'full':
+            for step, nll in enumerate(stats_to_save['nll_trace'], start=1):
+                wandb.log({
+                    'gmm/nll': float(nll),
+                    'gmm/var_min': float(stats_to_save['var_min_trace'][step - 1]),
+                    'gmm/var_max': float(stats_to_save['var_max_trace'][step - 1]),
+                }, step=step)
+            for idx in range(FLAGS.gmm_num_modes):
+                wandb.log({
+                    f'gmm/pi_{idx}': float(stats_to_save['pi'][idx]),
+                    f'gmm/N_{idx}': float(stats_to_save['final_counts'][idx]),
+                }, step=FLAGS.gmm_em_iters + 1)
             wandb.log({
-                'gmm/nll': float(nll),
-                'gmm/var_min': float(stats_to_save['var_min_trace'][step - 1]),
-                'gmm/var_max': float(stats_to_save['var_max_trace'][step - 1]),
-            }, step=step)
-        for idx in range(FLAGS.gmm_num_modes):
-            wandb.log({
-                f'gmm/pi_{idx}': float(stats_to_save['pi'][idx]),
-                f'gmm/N_{idx}': float(stats_to_save['final_counts'][idx]),
+                'latent/std_mean': float(np.mean(std)),
+                'latent/mean_abs': float(np.mean(np.abs(mean))),
             }, step=FLAGS.gmm_em_iters + 1)
-        wandb.log({
-            'latent/std_mean': float(np.mean(std)),
-            'latent/mean_abs': float(np.mean(np.abs(mean))),
-        }, step=FLAGS.gmm_em_iters + 1)
         wandb.log({f'gmm_eval/{k}': v for k, v in gmm_metrics.items() if isinstance(v, (int, float))},
                   step=FLAGS.gmm_em_iters + 2)
-        for fig_name, fig_path in figure_paths.items():
-            if fig_path:
-                wandb.log({f'gmm_fig/{fig_name}': wandb.Image(fig_path)}, step=FLAGS.gmm_em_iters + 2)
+        if FLAGS.gmm_wandb_level == 'full':
+            for fig_name, fig_path in figure_paths.items():
+                if fig_path:
+                    wandb.log({f'gmm_fig/{fig_name}': wandb.Image(fig_path)}, step=FLAGS.gmm_em_iters + 2)
 
     if not FLAGS.gmm_keep_latent_cache and os.path.exists(cache_path):
         os.remove(cache_path)

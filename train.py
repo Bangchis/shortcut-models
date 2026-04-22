@@ -58,6 +58,36 @@ flags.DEFINE_string(
     '1,4,32,128',
     'Comma-separated denoise step counts to score in helper_eval.',
 )
+flags.DEFINE_string(
+    'moe1_k_list',
+    '8,16,24,32',
+    'Comma-separated GMM mode counts for mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_root_dir',
+    '/kaggle/working/moe1_naive_k_ablation',
+    'Root output directory for mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_integer(
+    'moe1_train_naive_ref',
+    1,
+    'Whether mode=moe1-naive-k-ablation should train the naive reference.',
+)
+flags.DEFINE_integer(
+    'moe1_keep_checkpoints',
+    0,
+    'Whether mode=moe1-naive-k-ablation may save model checkpoints/final.pkl.',
+)
+flags.DEFINE_integer(
+    'moe1_gmm_fit_samples',
+    -1,
+    'Train samples for each GMM fit in mode=moe1-naive-k-ablation. -1 means full split.',
+)
+flags.DEFINE_integer(
+    'moe1_gmm_valid_samples',
+    -1,
+    'Validation samples for each GMM fit in mode=moe1-naive-k-ablation. -1 means full split.',
+)
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -170,6 +200,11 @@ def _resolve_jax_dtype(dtype_name):
 
 
 def main(_):
+    if FLAGS.mode == 'moe1-naive-k-ablation':
+        from moe1_naive_k_ablation import run as run_moe1_naive_k_ablation
+        run_moe1_naive_k_ablation(FLAGS)
+        return
+
     if FLAGS.mode == 'moe1-ablation':
         from moe1_ablation import run as run_moe1_ablation
         run_moe1_ablation(FLAGS)
