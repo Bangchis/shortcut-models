@@ -1196,6 +1196,64 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
     return json_path, md_path
 
 
+def _artifact_relpath(root, path):
+    root = Path(root)
+    path = Path(path)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
+def _log_summary_artifact(run, root, image_paths, run_id):
+    root = Path(root)
+    artifact = wandb.Artifact(
+        name=f'moe1_naive_k_ablation_analysis_{run_id}',
+        type='analysis',
+        description='Summary tables, analysis packet, and visualization outputs for moe1-naive-k-ablation.',
+    )
+    added = 0
+    seen = set()
+
+    def add_file(path):
+        nonlocal added
+        path = Path(path)
+        if not path.exists() or not path.is_file():
+            return
+        resolved = str(path.resolve())
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        artifact.add_file(str(path), name=_artifact_relpath(root, path))
+        added += 1
+
+    for filename in (
+        'ablation_context.json',
+        'master_summary.json',
+        'master_summary.csv',
+        'master_summary.png',
+        'analysis_packet.md',
+        'stage_candidates.csv',
+        'stage_winners.csv',
+        'stage_winners_summary.png',
+        'path_stats_summary.png',
+    ):
+        add_file(root / filename)
+
+    stage_summary_dir = root / 'stage_summaries'
+    if stage_summary_dir.exists():
+        for path in sorted(stage_summary_dir.glob('*.json')):
+            add_file(path)
+
+    for path in sorted(str(value) for value in image_paths.values() if value):
+        add_file(path)
+
+    if added > 0:
+        run.log_artifact(artifact)
+        run.summary['ablation/artifact_name'] = artifact.name
+        run.summary['ablation/artifact_file_count'] = added
+
+
 def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id, final_config=None, stage_summaries=None):
     best_moe = None
     moe_rows = [row for row in summary_rows if row.get('role') == 'moe']
@@ -1249,6 +1307,7 @@ def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id, final_
             log_payload[key] = wandb.Image(value)
     if log_payload:
         wandb.log(log_payload)
+    _log_summary_artifact(run, root, image_paths, run_id)
     run.finish()
 
 
