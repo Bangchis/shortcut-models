@@ -95,7 +95,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string(
     'moe1_balance_values',
-    '0.0,0.05,0.1,0.2,0.4,0.8,1.2,1.6',
+    '0.0,0.05,0.1,0.2,0.4,0.8',
     'Comma-separated loss_balance_weight values for greedy mode=moe1-naive-k-ablation.',
 )
 flags.DEFINE_string(
@@ -123,6 +123,11 @@ flags.DEFINE_string(
     'moe1_greedy_metric',
     'fid',
     'Primary greedy selection metric for mode=moe1-naive-k-ablation. Currently supports "fid".',
+)
+flags.DEFINE_integer(
+    'moe1_short_stage_steps',
+    10000,
+    'Max steps for short greedy stages in mode=moe1-naive-k-ablation: tau, balance, entropy.',
 )
 
 model_config = ml_collections.ConfigDict({

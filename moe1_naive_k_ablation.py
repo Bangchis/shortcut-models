@@ -36,6 +36,7 @@ GMM_GROUP = 'MoE1_Naive_K_GMM'
 TRAIN_GROUP = 'MoE1_Naive_K_Train'
 SUMMARY_GROUP = 'MoE1_Naive_K_Summary'
 PATH_PLOT_MAX_LINES = 256
+SHORT_STAGE_PARAMS = frozenset(('source_tau', 'loss_balance_weight', 'loss_entropy_weight'))
 GMM_STAT_KEYS = (
     'mean',
     'std',
@@ -150,7 +151,13 @@ def _float_token(value):
     return token.replace('+', '')
 
 
-def _candidate_key(config):
+def _stage_max_steps(flags, stage_param):
+    if stage_param in SHORT_STAGE_PARAMS:
+        return int(flags.moe1_short_stage_steps)
+    return int(flags.max_steps)
+
+
+def _candidate_key(config, max_steps):
     return (
         int(config['K']),
         _float_key(config['source_tau']),
@@ -158,10 +165,11 @@ def _candidate_key(config):
         _float_key(config['loss_entropy_weight']),
         _float_key(config['weight_decay']),
         _float_key(config['source_var_target_std']),
+        int(max_steps),
     )
 
 
-def _candidate_slug(config):
+def _candidate_slug(config, max_steps):
     return (
         f"K{int(config['K']):02d}"
         f"_tau{_float_token(config['source_tau'])}"
@@ -169,6 +177,7 @@ def _candidate_slug(config):
         f"_ent{_float_token(config['loss_entropy_weight'])}"
         f"_wd{_float_token(config['weight_decay'])}"
         f"_var{_float_token(config['source_var_target_std'])}"
+        f"_steps{int(max_steps)}"
     )
 
 
@@ -325,6 +334,8 @@ def _validate_runtime(flags, runtime):
         raise ValueError('--inference_generations must be at least --batch_size for final FID.')
     if int(flags.inference_generations) % int(flags.batch_size) != 0:
         raise ValueError('--inference_generations must be divisible by --batch_size for final FID.')
+    if int(flags.moe1_short_stage_steps) <= 0:
+        raise ValueError('--moe1_short_stage_steps must be positive.')
     if str(flags.moe1_greedy_metric).lower() != 'fid':
         raise ValueError('--moe1_greedy_metric currently supports only "fid".')
 
@@ -416,13 +427,15 @@ def _run_gmm(flags, root, k, runtime):
     }
 
 
-def _base_train_args(flags, run_dir, run_name, group):
+def _base_train_args(flags, run_dir, run_name, group, max_steps=None):
     run_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = run_dir / 'artifacts'
     metrics_path = run_dir / 'metrics.json'
+    max_steps = int(flags.max_steps if max_steps is None else max_steps)
+    eval_interval = min(int(flags.eval_interval), max_steps)
     save_interval = int(flags.save_interval)
     if not bool(flags.moe1_keep_checkpoints):
-        save_interval = max(save_interval, int(flags.max_steps) + 2)
+        save_interval = max(save_interval, max_steps + 2)
     eval_visual_level = flags.eval_visual_level if _flag_present(flags, 'eval_visual_level') else 'none'
     eval_fid_generations = (
         int(flags.eval_fid_generations)
@@ -436,9 +449,9 @@ def _base_train_args(flags, run_dir, run_name, group):
         f'--dataset_name={flags.dataset_name}',
         f'--batch_size={flags.batch_size}',
         f'--seed={flags.seed}',
-        f'--max_steps={int(flags.max_steps)}',
+        f'--max_steps={max_steps}',
         f'--log_interval={int(flags.log_interval)}',
-        f'--eval_interval={int(flags.eval_interval)}',
+        f'--eval_interval={eval_interval}',
         f'--save_interval={save_interval}',
         '--run_final_inference=1',
         '--train_metrics_level=summary',
@@ -464,11 +477,29 @@ def _base_train_args(flags, run_dir, run_name, group):
     return args, artifact_dir, metrics_path
 
 
-def _run_train(flags, root, run_name, role, model_overrides, runtime, k=None, run_dir_name=None, metadata=None):
+def _run_train(
+    flags,
+    root,
+    run_name,
+    role,
+    model_overrides,
+    runtime,
+    k=None,
+    run_dir_name=None,
+    metadata=None,
+    max_steps=None,
+):
     if run_dir_name is None:
         run_dir_name = f'K{k:02d}' if k is not None else 'naive_reference'
     run_dir = root / 'train' / run_dir_name
-    args, artifact_dir, metrics_path = _base_train_args(flags, run_dir, run_name, TRAIN_GROUP)
+    effective_max_steps = int(flags.max_steps if max_steps is None else max_steps)
+    args, artifact_dir, metrics_path = _base_train_args(
+        flags,
+        run_dir,
+        run_name,
+        TRAIN_GROUP,
+        max_steps=effective_max_steps,
+    )
     combined_model = flags.model.to_dict()
     combined_model.update(model_overrides)
     _extend_config_flags(args, 'model', combined_model)
@@ -486,6 +517,7 @@ def _run_train(flags, root, run_name, role, model_overrides, runtime, k=None, ru
         'metrics_path': str(metrics_path),
         'metrics': metrics,
         'model_overrides': model_overrides,
+        'max_steps': effective_max_steps,
     }
     if metadata:
         row.update(metadata)
@@ -721,6 +753,7 @@ def _summary_row_from_metrics(run, fid_key):
         'stage': run.get('stage'),
         'stage_param': run.get('stage_param'),
         'stage_value': run.get('stage_value'),
+        'max_steps': run.get('max_steps'),
         'K': run.get('K'),
         'source_tau': run.get('config', {}).get('source_tau'),
         'loss_balance_weight': run.get('config', {}).get('loss_balance_weight'),
@@ -792,6 +825,7 @@ def _stage_summary_row(stage_idx, stage_param, rows, selected_idx, fid_key):
         'stage_param': stage_param,
         'selected_run': selected.get('run_name'),
         'selected_value': selected.get('stage_value'),
+        'selected_max_steps': selected.get('max_steps'),
         'selected_K': selected.get('K'),
         'selected_fid': selected.get(fid_key),
         'selected_straightness_ratio_mean': selected.get('straightness_ratio_mean'),
@@ -1101,6 +1135,7 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
         'role',
         'stage_param',
         'stage_value',
+        'max_steps',
         'K',
         'source_tau',
         'loss_balance_weight',
@@ -1135,6 +1170,7 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
                 'stage_param',
                 'selected_run',
                 'selected_value',
+                'selected_max_steps',
                 'selected_fid',
                 'selected_straightness_ratio_mean',
                 'selected_conditioned_source_cluster_agreement',
@@ -1306,15 +1342,19 @@ def _run_or_reuse_candidate(
     candidate_cache,
     fid_key,
     max_points,
+    max_steps,
 ):
-    key = _candidate_key(config)
+    max_steps = int(max_steps)
+    slug = _candidate_slug(config, max_steps)
+    key = _candidate_key(config, max_steps)
     stage_metadata = {
         'stage': stage_idx,
         'stage_param': stage_param,
         'stage_value': stage_value,
+        'max_steps': max_steps,
         'config': dict(config),
         'candidate_key': '|'.join(str(part) for part in key),
-        'run_dir_name': _candidate_slug(config),
+        'run_dir_name': slug,
     }
     if key in candidate_cache:
         cached = candidate_cache[key]
@@ -1327,12 +1367,12 @@ def _run_or_reuse_candidate(
                 'stage': stage_idx,
                 'stage_param': stage_param,
                 'stage_value': stage_value,
+                'max_steps': max_steps,
             })
             row['summary'] = summary
         return row, cached.get('analysis'), {}
 
     gmm_row = _ensure_gmm(flags, root, int(config['K']), runtime, gmm_cache)
-    slug = _candidate_slug(config)
     run_name = f'moe1_greedy_{slug}'
     run_dir_name = f'candidates/{slug}'
     metadata = {
@@ -1349,6 +1389,7 @@ def _run_or_reuse_candidate(
         k=int(config['K']),
         run_dir_name=run_dir_name,
         metadata=metadata,
+        max_steps=max_steps,
     )
     analysis, image_paths = _render_moe_candidate_if_primary(run_row, gmm_row, root, fid_key, max_points, runtime)
     _sync_global(runtime, f'render_candidate_{slug}')
@@ -1375,7 +1416,8 @@ def _run_naive_reference(flags, root, runtime, fid_key, max_points):
         runtime,
         k=None,
         run_dir_name='naive_reference',
-        metadata={'config': {}, 'run_dir_name': 'naive_reference'},
+        metadata={'config': {}, 'run_dir_name': 'naive_reference', 'max_steps': int(flags.max_steps)},
+        max_steps=int(flags.max_steps),
     )
     naive_analysis = None
     image_paths = {}
@@ -1421,6 +1463,8 @@ def run(flags):
                 'tfds_data_dir': flags.tfds_data_dir,
                 'fid_stats': flags.fid_stats,
                 'max_steps': int(flags.max_steps),
+                'short_stage_steps': int(flags.moe1_short_stage_steps),
+                'short_stage_params': sorted(SHORT_STAGE_PARAMS),
                 'eval_fid_generations': int(flags.eval_fid_generations),
                 'inference_generations': int(flags.inference_generations),
                 'keep_checkpoints': bool(flags.moe1_keep_checkpoints),
@@ -1435,6 +1479,7 @@ def run(flags):
     current_config = dict(base_config)
 
     for stage_idx, (stage_param, values) in enumerate(stages, start=1):
+        stage_max_steps = _stage_max_steps(flags, stage_param)
         stage_rows = []
         for value in values:
             candidate_config = dict(current_config)
@@ -1451,6 +1496,7 @@ def run(flags):
                 candidate_cache,
                 fid_key,
                 max_points,
+                stage_max_steps,
             )
             summary = run_row.get('summary')
             if summary is None:
@@ -1460,6 +1506,7 @@ def run(flags):
                 'stage': stage_idx,
                 'stage_param': stage_param,
                 'stage_value': candidate_config[stage_param],
+                'max_steps': stage_max_steps,
                 'K': candidate_config['K'],
                 'source_tau': candidate_config['source_tau'],
                 'loss_balance_weight': candidate_config['loss_balance_weight'],
@@ -1512,7 +1559,7 @@ def run(flags):
         match = next((analysis for analysis in unique_analyses if analysis['run']['run_name'] == selected_run), None)
         if match is not None and match['run']['run_name'] not in winner_keys:
             winner_keys.append(match['run']['run_name'])
-    final_key = _candidate_key(current_config)
+    final_key = _candidate_key(current_config, int(flags.max_steps))
     final_analysis = candidate_cache.get(final_key, {}).get('analysis')
     if final_analysis is not None and final_analysis['run']['run_name'] not in winner_keys:
         winner_keys.append(final_analysis['run']['run_name'])
@@ -1543,6 +1590,7 @@ def run(flags):
         'role',
         'stage_param',
         'stage_value',
+        'max_steps',
         'K',
         'source_tau',
         'loss_balance_weight',
@@ -1580,6 +1628,7 @@ def run(flags):
             'stage_param',
             'selected_run',
             'selected_value',
+            'selected_max_steps',
             'selected_fid',
             'selected_straightness_ratio_mean',
             'selected_conditioned_source_cluster_agreement',
@@ -1620,6 +1669,7 @@ def run(flags):
             'stage',
             'stage_param',
             'stage_value',
+            'max_steps',
             'run_name',
             'K',
             'source_tau',
@@ -1646,6 +1696,7 @@ def run(flags):
             'stage_param',
             'selected_run',
             'selected_value',
+            'selected_max_steps',
             'selected_K',
             'selected_fid',
             'selected_straightness_ratio_mean',
@@ -1668,6 +1719,8 @@ def run(flags):
             'runtime': runtime,
             'base_config': base_config,
             'final_config': current_config,
+            'short_stage_steps': int(flags.moe1_short_stage_steps),
+            'short_stage_params': sorted(SHORT_STAGE_PARAMS),
             'stage_summaries': stage_summaries,
             'stage_candidate_rows': stage_candidate_rows,
             'gmm_rows': list(gmm_cache.values()),
