@@ -88,6 +88,42 @@ flags.DEFINE_integer(
     -1,
     'Validation samples for each GMM fit in mode=moe1-naive-k-ablation. -1 means full split.',
 )
+flags.DEFINE_string(
+    'moe1_tau_values',
+    '0.75,1.0,1.5,2.0,3.0',
+    'Comma-separated source_tau values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_balance_values',
+    '0.0,0.05,0.1,0.2,0.4,0.8,1.2,1.6',
+    'Comma-separated loss_balance_weight values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_entropy_values',
+    '0.0,0.005,0.01,0.03,0.1,0.2,0.5,1.0',
+    'Comma-separated loss_entropy_weight values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_weight_decay_values',
+    '0.001,0.003,0.01,0.03,0.1',
+    'Comma-separated weight_decay values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_var_target_values',
+    '0.5,0.7,1.0,1.3',
+    'Comma-separated source_var_target_std values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_integer('moe1_base_k', 8, 'Base K for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_float('moe1_base_tau', 1.5, 'Base source_tau for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_float('moe1_base_balance', 0.1, 'Base loss_balance_weight for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_float('moe1_base_entropy', 0.01, 'Base loss_entropy_weight for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_float('moe1_base_weight_decay', 0.01, 'Base weight_decay for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_float('moe1_base_var_target', 0.7, 'Base source_var_target_std for greedy mode=moe1-naive-k-ablation.')
+flags.DEFINE_string(
+    'moe1_greedy_metric',
+    'fid',
+    'Primary greedy selection metric for mode=moe1-naive-k-ablation. Currently supports "fid".',
+)
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -229,6 +265,16 @@ def main(_):
     print("Global device count", global_device_count)
     local_batch_size = FLAGS.batch_size // (
         global_device_count // device_count)
+    if FLAGS.batch_size % global_device_count != 0:
+        raise ValueError(
+            f'--batch_size={FLAGS.batch_size} must be divisible by global device count '
+            f'{global_device_count} for multihost sharding.'
+        )
+    if local_batch_size % device_count != 0:
+        raise ValueError(
+            f'Local batch size {local_batch_size} must be divisible by local device count '
+            f'{device_count} for multihost sharding.'
+        )
     print("Global Batch: ", FLAGS.batch_size)
     print("Node Batch: ", local_batch_size)
     print("Device Batch:", local_batch_size // device_count)

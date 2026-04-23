@@ -306,8 +306,8 @@ def eval_model(
         def do_fid_calc(cfg_scale, denoise_timesteps):
             activations = []
             images_shape = batch_images.shape
-            num_generations = max(1, int(getattr(FLAGS, 'eval_fid_generations', 50048)))
-            num_batches = max(1, int(np.ceil(num_generations / FLAGS.batch_size)))
+            num_generations = int(getattr(FLAGS, 'eval_fid_generations', 50048))
+            num_batches = int(np.ceil(num_generations / FLAGS.batch_size))
             print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps} with {num_generations} generations")
             for fid_it in tqdm.tqdm(range(num_batches)):
                 key = jax.random.PRNGKey(42)
@@ -352,7 +352,8 @@ def eval_model(
                 activations.append(acts)
             return activations, num_generations
         
-        if FLAGS.fid_stats is not None:
+        eval_fid_generations = int(getattr(FLAGS, 'eval_fid_generations', 50048))
+        if FLAGS.fid_stats is not None and eval_fid_generations > 0:
             for denoise_timesteps in denoise_timesteps_list:
                 if denoise_timesteps == 'cfg':
                     activations, num_generations = do_fid_calc(FLAGS.model.cfg_scale, FLAGS.model.denoise_timesteps)
@@ -370,3 +371,5 @@ def eval_model(
                         f'fid/timesteps/{denoise_timesteps}': fid,
                         f'fid{denoise_timesteps}_{num_generations}': fid,
                     }, step=step)
+        elif FLAGS.fid_stats is not None and jax.process_index() == 0:
+            print("Skipping periodic eval FID because --eval_fid_generations <= 0.")

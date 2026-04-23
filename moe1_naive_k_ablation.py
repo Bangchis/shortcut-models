@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import csv
 from datetime import datetime
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import numpy as np
 import wandb
 from matplotlib.lines import Line2D
 
-from gmm_utils import load_gmm_stats
+from gmm_utils import load_gmm_stats, save_gmm_stats
 from moe1_ablation import (
     _compute_cluster_assignments,
     _compute_path_stats,
@@ -35,6 +36,30 @@ GMM_GROUP = 'MoE1_Naive_K_GMM'
 TRAIN_GROUP = 'MoE1_Naive_K_Train'
 SUMMARY_GROUP = 'MoE1_Naive_K_Summary'
 PATH_PLOT_MAX_LINES = 256
+GMM_STAT_KEYS = (
+    'mean',
+    'std',
+    'pi',
+    'mu',
+    'var',
+    'nll_trace',
+    'counts_trace',
+    'var_min_trace',
+    'var_max_trace',
+    'final_counts',
+    'restart_index',
+    'n_train',
+    'standardize_eps',
+)
+DTYPE_TO_CODE = {
+    np.dtype('float16'): 1,
+    np.dtype('float32'): 2,
+    np.dtype('float64'): 3,
+    np.dtype('int32'): 4,
+    np.dtype('int64'): 5,
+}
+CODE_TO_DTYPE = {value: key for key, value in DTYPE_TO_CODE.items()}
+MAX_BROADCAST_NDIM = 8
 
 
 def _json_ready(value):
@@ -85,15 +110,223 @@ def _parse_k_list(raw_value):
     return values
 
 
+def _parse_float_list(raw_value, flag_name):
+    values = []
+    seen = set()
+    for item in str(raw_value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        value = float(item)
+        key = _float_key(value)
+        if key not in seen:
+            values.append(value)
+            seen.add(key)
+    if not values:
+        raise ValueError(f'--{flag_name} must contain at least one value.')
+    return values
+
+
+def _ensure_int_value(values, value):
+    value = int(value)
+    if value in values:
+        return values
+    return [value, *values]
+
+
+def _ensure_float_value(values, value):
+    value = float(value)
+    if any(_float_key(item) == _float_key(value) for item in values):
+        return values
+    return [value, *values]
+
+
+def _float_key(value):
+    return f'{float(value):.10g}'
+
+
+def _float_token(value):
+    token = _float_key(value).replace('-', 'm').replace('.', 'p')
+    return token.replace('+', '')
+
+
+def _candidate_key(config):
+    return (
+        int(config['K']),
+        _float_key(config['source_tau']),
+        _float_key(config['loss_balance_weight']),
+        _float_key(config['loss_entropy_weight']),
+        _float_key(config['weight_decay']),
+        _float_key(config['source_var_target_std']),
+    )
+
+
+def _candidate_slug(config):
+    return (
+        f"K{int(config['K']):02d}"
+        f"_tau{_float_token(config['source_tau'])}"
+        f"_bal{_float_token(config['loss_balance_weight'])}"
+        f"_ent{_float_token(config['loss_entropy_weight'])}"
+        f"_wd{_float_token(config['weight_decay'])}"
+        f"_var{_float_token(config['source_var_target_std'])}"
+    )
+
+
 def _make_run_id():
     return datetime.now().strftime('dt-%Y%m%d-%H%M%S')
 
 
-def _resolve_project_name(flags):
+def _sanitize_project_name(text):
+    text = str(text).strip().replace('/', '-').replace('_', '-').replace(' ', '-')
+    cleaned = ''.join(ch if (ch.isalnum() or ch == '-') else '-' for ch in text.lower())
+    while '--' in cleaned:
+        cleaned = cleaned.replace('--', '-')
+    return cleaned.strip('-') or DEFAULT_PROJECT
+
+
+def _resolve_project_name(flags, run_id):
     project = getattr(flags.wandb, 'project', None)
     if not project or project == 'shortcut':
-        return DEFAULT_PROJECT
-    return project
+        project = DEFAULT_PROJECT
+    base = _sanitize_project_name(project)
+    return f'{base}-{run_id}'
+
+
+def _runtime_info():
+    import jax
+
+    local_devices = len(jax.local_devices())
+    global_devices = jax.device_count()
+    process_count = jax.process_count()
+    process_index = jax.process_index()
+    hosts = max(1, global_devices // max(local_devices, 1))
+    return {
+        'process_index': int(process_index),
+        'process_count': int(process_count),
+        'local_device_count': int(local_devices),
+        'global_device_count': int(global_devices),
+        'host_count_from_devices': int(hosts),
+    }
+
+
+def _is_primary(runtime):
+    return int(runtime['process_index']) == 0
+
+
+def _sync_global(runtime, label):
+    if int(runtime.get('process_count', 1)) <= 1:
+        return
+    from jax.experimental import multihost_utils
+
+    safe_label = ''.join(ch if ch.isalnum() or ch in ('_', '-') else '_' for ch in str(label))
+    multihost_utils.sync_global_devices(f'moe1_naive_k_ablation_{safe_label}')
+
+
+def _broadcast_int(runtime, value, label):
+    if int(runtime.get('process_count', 1)) <= 1:
+        return int(value)
+    from jax.experimental import multihost_utils
+
+    _sync_global(runtime, f'{label}_before_broadcast_int')
+    payload = np.asarray([int(value) if _is_primary(runtime) else 0], dtype=np.int32)
+    result = multihost_utils.broadcast_one_to_all(payload)
+    return int(np.asarray(result)[0])
+
+
+def _broadcast_string(runtime, value, label, max_len=512):
+    if int(runtime.get('process_count', 1)) <= 1:
+        return str(value)
+    from jax.experimental import multihost_utils
+
+    _sync_global(runtime, f'{label}_before_broadcast_string')
+    encoded = str(value).encode('utf-8') if _is_primary(runtime) else b''
+    if len(encoded) > max_len:
+        raise ValueError(f'Broadcast string for {label} is too long: {len(encoded)} > {max_len}.')
+    length = np.asarray([len(encoded)], dtype=np.int32)
+    buffer = np.zeros((max_len,), dtype=np.uint8)
+    if encoded:
+        buffer[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    length = np.asarray(multihost_utils.broadcast_one_to_all(length))
+    buffer = np.asarray(multihost_utils.broadcast_one_to_all(buffer))
+    return bytes(buffer[:int(length[0])]).decode('utf-8')
+
+
+def _broadcast_array_from_primary(runtime, source_array, label):
+    if int(runtime.get('process_count', 1)) <= 1:
+        return np.asarray(source_array)
+    from jax.experimental import multihost_utils
+
+    if _is_primary(runtime):
+        source_array = np.asarray(source_array)
+        dtype_code = DTYPE_TO_CODE.get(source_array.dtype)
+        if dtype_code is None:
+            source_array = source_array.astype(np.float32)
+            dtype_code = DTYPE_TO_CODE[source_array.dtype]
+        ndim = source_array.ndim
+        shape = np.zeros((MAX_BROADCAST_NDIM,), dtype=np.int64)
+        shape[:ndim] = np.asarray(source_array.shape, dtype=np.int64)
+    else:
+        dtype_code = 0
+        ndim = 0
+        shape = np.zeros((MAX_BROADCAST_NDIM,), dtype=np.int64)
+
+    header = np.asarray([dtype_code, ndim], dtype=np.int64)
+    header = np.asarray(multihost_utils.broadcast_one_to_all(header))
+    shape = np.asarray(multihost_utils.broadcast_one_to_all(shape))
+    dtype = CODE_TO_DTYPE.get(int(header[0]))
+    if dtype is None:
+        raise ValueError(f'Unsupported dtype broadcast code {int(header[0])} for {label}.')
+    arr_shape = tuple(int(dim) for dim in shape[:int(header[1])])
+    if _is_primary(runtime):
+        payload = np.asarray(source_array, dtype=dtype)
+    else:
+        payload = np.zeros(arr_shape, dtype=dtype)
+    payload = multihost_utils.broadcast_one_to_all(payload)
+    return np.asarray(payload)
+
+
+def _replicate_gmm_stats_from_primary(runtime, gmm_path):
+    if int(runtime.get('process_count', 1)) <= 1:
+        return
+    gmm_path = Path(gmm_path)
+    payload = {}
+    if _is_primary(runtime):
+        with np.load(gmm_path, allow_pickle=False) as raw:
+            payload = {key: np.asarray(raw[key]) for key in raw.files}
+    replicated = {}
+    for key in GMM_STAT_KEYS:
+        present = np.asarray([1 if key in payload else 0], dtype=np.int32)
+        present = _broadcast_array_from_primary(runtime, present, f'gmm_present_{key}')
+        if int(present[0]) == 0:
+            continue
+        source_array = payload[key] if _is_primary(runtime) else np.zeros((0,), dtype=np.float32)
+        replicated[key] = _broadcast_array_from_primary(runtime, source_array, f'gmm_{key}')
+    if not _is_primary(runtime):
+        gmm_path.parent.mkdir(parents=True, exist_ok=True)
+        save_gmm_stats(gmm_path, replicated)
+    _sync_global(runtime, f'gmm_replicated_{gmm_path.parent.name}')
+
+
+def _validate_runtime(flags, runtime):
+    global_devices = int(runtime['global_device_count'])
+    local_devices = int(runtime['local_device_count'])
+    if global_devices <= 0 or local_devices <= 0:
+        raise ValueError('JAX device count must be positive.')
+    if int(flags.batch_size) % global_devices != 0:
+        raise ValueError(
+            f'--batch_size={flags.batch_size} must be divisible by global device count {global_devices}.'
+        )
+    local_batch_size = int(flags.batch_size) // max(1, global_devices // local_devices)
+    if local_batch_size % local_devices != 0:
+        raise ValueError(
+            f'Local batch size {local_batch_size} must be divisible by local device count {local_devices}.'
+        )
+    if int(flags.inference_generations) < int(flags.batch_size):
+        raise ValueError('--inference_generations must be at least --batch_size for final FID.')
+    if int(flags.inference_generations) % int(flags.batch_size) != 0:
+        raise ValueError('--inference_generations must be divisible by --batch_size for final FID.')
+    if str(flags.moe1_greedy_metric).lower() != 'fid':
+        raise ValueError('--moe1_greedy_metric currently supports only "fid".')
 
 
 def _run_subprocess(cmd, label):
@@ -145,7 +378,7 @@ def _fid_key(flags):
     return f'fid{int(flags.inference_timesteps)}_{int(flags.inference_generations)}'
 
 
-def _run_gmm(flags, root, k):
+def _run_gmm(flags, root, k, runtime):
     run_name = f'GMM_K{k:02d}'
     run_dir = root / 'gmm' / f'K{k:02d}'
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -168,8 +401,11 @@ def _run_gmm(flags, root, k):
     if flags.tfds_data_dir:
         cmd.append(f'--tfds_data_dir={flags.tfds_data_dir}')
     _append_wandb_args(cmd, flags, GMM_GROUP, run_name)
-    _run_subprocess(cmd, run_name)
-    metrics = _load_json(metrics_path)
+    if _is_primary(runtime):
+        _run_subprocess(cmd, run_name)
+    _sync_global(runtime, f'gmm_fit_K{k:02d}')
+    _replicate_gmm_stats_from_primary(runtime, gmm_path)
+    metrics = _load_json(metrics_path) if _is_primary(runtime) and metrics_path.exists() else {}
     return {
         'K': k,
         'run_name': run_name,
@@ -191,7 +427,7 @@ def _base_train_args(flags, run_dir, run_name, group):
     eval_fid_generations = (
         int(flags.eval_fid_generations)
         if _flag_present(flags, 'eval_fid_generations')
-        else 512
+        else 0
     )
     args = [
         sys.executable,
@@ -228,8 +464,9 @@ def _base_train_args(flags, run_dir, run_name, group):
     return args, artifact_dir, metrics_path
 
 
-def _run_train(flags, root, run_name, role, model_overrides, k=None):
-    run_dir_name = f'K{k:02d}' if k is not None else 'naive_reference'
+def _run_train(flags, root, run_name, role, model_overrides, runtime, k=None, run_dir_name=None, metadata=None):
+    if run_dir_name is None:
+        run_dir_name = f'K{k:02d}' if k is not None else 'naive_reference'
     run_dir = root / 'train' / run_dir_name
     args, artifact_dir, metrics_path = _base_train_args(flags, run_dir, run_name, TRAIN_GROUP)
     combined_model = flags.model.to_dict()
@@ -238,8 +475,9 @@ def _run_train(flags, root, run_name, role, model_overrides, k=None):
     if bool(flags.moe1_keep_checkpoints):
         args.append(f'--final_save_dir={run_dir / "final.pkl"}')
     _run_subprocess(args, run_name)
-    metrics = _load_json(metrics_path)
-    return {
+    _sync_global(runtime, f'train_done_{run_dir_name}')
+    metrics = _load_json(metrics_path) if _is_primary(runtime) and metrics_path.exists() else {}
+    row = {
         'K': k,
         'role': role,
         'run_name': run_name,
@@ -249,6 +487,9 @@ def _run_train(flags, root, run_name, role, model_overrides, k=None):
         'metrics': metrics,
         'model_overrides': model_overrides,
     }
+    if metadata:
+        row.update(metadata)
+    return row
 
 
 def _arr(payload, key):
@@ -324,6 +565,37 @@ def _save_conditioned_cluster_heatmap(conditioned_mode, assigned_cluster, num_mo
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     return output_path
+
+
+def _alignment_stats(conditioned_mode, assigned_cluster, num_modes):
+    conditioned = np.asarray(conditioned_mode, dtype=np.int32)
+    assigned = np.asarray(assigned_cluster, dtype=np.int32)
+    take = min(conditioned.shape[0], assigned.shape[0])
+    if take == 0:
+        return {}
+    conditioned = conditioned[:take]
+    assigned = assigned[:take]
+    size = int(max(num_modes, conditioned.max() + 1, assigned.max() + 1))
+    confusion = np.zeros((size, size), dtype=np.float64)
+    for cond, cluster in zip(conditioned, assigned):
+        confusion[int(cond), int(cluster)] += 1.0
+    total = np.sum(confusion)
+    if total <= 0:
+        return {}
+    joint = confusion / total
+    p_cond = np.sum(joint, axis=1, keepdims=True)
+    p_cluster = np.sum(joint, axis=0, keepdims=True)
+    denom = np.maximum(p_cond @ p_cluster, 1e-12)
+    mask = joint > 0
+    mutual_info = float(np.sum(joint[mask] * np.log(joint[mask] / denom[mask])))
+    h_cond = float(-np.sum(p_cond[p_cond > 0] * np.log(p_cond[p_cond > 0])))
+    h_cluster = float(-np.sum(p_cluster[p_cluster > 0] * np.log(p_cluster[p_cluster > 0])))
+    nmi = float(mutual_info / max(np.sqrt(max(h_cond, 0.0) * max(h_cluster, 0.0)), 1e-12))
+    return {
+        'condition_cluster_accuracy': float(np.mean(conditioned == assigned)),
+        'condition_cluster_mutual_info': mutual_info,
+        'condition_cluster_nmi': nmi,
+    }
 
 
 def _save_group_endpoint_projection(group_specs, output_path, title, method='pca'):
@@ -446,7 +718,15 @@ def _summary_row_from_metrics(run, fid_key):
     return {
         'run_name': run['run_name'],
         'role': run['role'],
+        'stage': run.get('stage'),
+        'stage_param': run.get('stage_param'),
+        'stage_value': run.get('stage_value'),
         'K': run.get('K'),
+        'source_tau': run.get('config', {}).get('source_tau'),
+        'loss_balance_weight': run.get('config', {}).get('loss_balance_weight'),
+        'loss_entropy_weight': run.get('config', {}).get('loss_entropy_weight'),
+        'weight_decay': run.get('config', {}).get('weight_decay'),
+        'source_var_target_std': run.get('config', {}).get('source_var_target_std'),
         fid_key: _extract_fid(metrics, fid_key),
         'valid_loss': train.get('valid_loss'),
         'max_usage': train.get('max_usage'),
@@ -454,6 +734,74 @@ def _summary_row_from_metrics(run, fid_key):
         'q_alpha_agreement': train.get('q_alpha_agreement'),
         'source_var_mean': train.get('source/var_mean'),
         'source_var_min': train.get('source/var_min'),
+    }
+
+
+def _write_csv(path, rows, columns):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(_json_ready(row))
+
+
+def _candidate_score(row, fid_key):
+    fid = row.get(fid_key)
+    fid_score = float(fid) if fid is not None else float('inf')
+    straightness = row.get('straightness_ratio_mean')
+    straightness_score = -float(straightness) if straightness is not None else float('inf')
+    alignment = row.get('conditioned_source_cluster_agreement')
+    if alignment is None:
+        alignment = row.get('q_source_cluster_agreement')
+    alignment_score = -float(alignment) if alignment is not None else float('inf')
+    usage = row.get('max_soft_usage')
+    if usage is None:
+        usage = row.get('max_usage')
+    usage_score = float(usage) if usage is not None else float('inf')
+    target_std = row.get('source_var_target_std')
+    target_var = float(target_std) ** 2 if target_std is not None else None
+    source_var = row.get('source_prior_variance_mean')
+    if source_var is None:
+        source_var = row.get('source_var_mean')
+    var_score = abs(float(source_var) - target_var) if source_var is not None and target_var is not None else float('inf')
+    return fid_score, straightness_score, alignment_score, usage_score, var_score
+
+
+def _select_stage_winner_index(rows, fid_key):
+    if not rows:
+        raise ValueError('Cannot select a winner from an empty candidate list.')
+    return min(range(len(rows)), key=lambda idx: _candidate_score(rows[idx], fid_key))
+
+
+def _best_by_column(rows, column, higher_is_better=False):
+    valid = [row for row in rows if row.get(column) is not None]
+    if not valid:
+        return None
+    return max(valid, key=lambda row: float(row[column])) if higher_is_better else min(valid, key=lambda row: float(row[column]))
+
+
+def _stage_summary_row(stage_idx, stage_param, rows, selected_idx, fid_key):
+    selected = rows[selected_idx]
+    best_fid = _best_by_column(rows, fid_key, higher_is_better=False)
+    best_alignment = _best_by_column(rows, 'conditioned_source_cluster_agreement', higher_is_better=True)
+    best_straightness = _best_by_column(rows, 'straightness_ratio_mean', higher_is_better=True)
+    return {
+        'stage_index': stage_idx,
+        'stage_param': stage_param,
+        'selected_run': selected.get('run_name'),
+        'selected_value': selected.get('stage_value'),
+        'selected_K': selected.get('K'),
+        'selected_fid': selected.get(fid_key),
+        'selected_straightness_ratio_mean': selected.get('straightness_ratio_mean'),
+        'selected_conditioned_source_cluster_agreement': selected.get('conditioned_source_cluster_agreement'),
+        'best_fid_run': best_fid.get('run_name') if best_fid else None,
+        'best_fid_value': best_fid.get(fid_key) if best_fid else None,
+        'best_alignment_run': best_alignment.get('run_name') if best_alignment else None,
+        'best_alignment_value': best_alignment.get('conditioned_source_cluster_agreement') if best_alignment else None,
+        'best_straightness_run': best_straightness.get('run_name') if best_straightness else None,
+        'best_straightness_value': best_straightness.get('straightness_ratio_mean') if best_straightness else None,
     }
 
 
@@ -553,6 +901,7 @@ def _render_moe_run(run, gmm_state, output_dir, fid_key, max_points):
                     alignment['conditioned_source_cluster_agreement'] = float(
                         np.mean(conditioned[:take] == posterior_clusters[:take])
                     )
+                    alignment.update(_alignment_stats(conditioned, posterior_clusters, int(run['K'])))
 
     summary = _summary_row_from_metrics(run, fid_key)
     summary.update({
@@ -652,6 +1001,16 @@ def _render_naive_run(run, output_dir, fid_key, max_points):
     }
 
 
+def _combined_moe_label(analysis):
+    run = analysis.get('run', {})
+    k_value = run.get('K')
+    stage_param = run.get('stage_param')
+    stage_value = run.get('stage_value')
+    if stage_param is not None and stage_value is not None:
+        return f'{stage_param}={stage_value} K{k_value}'
+    return f'K{k_value}'
+
+
 def _render_combined(moe_analyses, naive_analysis, output_dir, max_points):
     output_dir.mkdir(parents=True, exist_ok=True)
     image_paths = {}
@@ -682,7 +1041,7 @@ def _render_combined(moe_analyses, naive_analysis, output_dir, max_points):
         })
     for idx, analysis in enumerate(moe_analyses):
         groups.append({
-            'name': f'x_source_moe_K{analysis["run"]["K"]}',
+            'name': f'x_source_moe_{_combined_moe_label(analysis)}',
             'points': analysis['prior'],
             'marker': 'o',
             'color': colors(idx),
@@ -713,7 +1072,7 @@ def _render_combined(moe_analyses, naive_analysis, output_dir, max_points):
         if analysis['path_states'].size == 0:
             continue
         path_specs.append({
-            'name': f'K{analysis["run"]["K"]}',
+            'name': _combined_moe_label(analysis),
             'path_states': analysis['path_states'],
             'color': colors(idx),
             'linestyle': '-',
@@ -734,13 +1093,20 @@ def _render_combined(moe_analyses, naive_analysis, output_dir, max_points):
     return image_paths
 
 
-def _write_analysis_packet(root, run_id, summary_rows, image_paths, fid_key):
+def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_paths, fid_key):
     md_path = root / 'analysis_packet.md'
     json_path = root / 'master_summary.json'
     columns = [
         'run_name',
         'role',
+        'stage_param',
+        'stage_value',
         'K',
+        'source_tau',
+        'loss_balance_weight',
+        'loss_entropy_weight',
+        'weight_decay',
+        'source_var_target_std',
         fid_key,
         'valid_loss',
         'q_alpha_agreement',
@@ -748,6 +1114,7 @@ def _write_analysis_packet(root, run_id, summary_rows, image_paths, fid_key):
         'q_source_cluster_agreement',
         'alpha_source_cluster_agreement',
         'conditioned_source_cluster_agreement',
+        'condition_cluster_nmi',
         'source_prior_to_data_distance',
         'source_posterior_to_data_distance',
         'straightness_ratio_mean',
@@ -758,6 +1125,23 @@ def _write_analysis_packet(root, run_id, summary_rows, image_paths, fid_key):
         '',
         f'- run_id: `{run_id}`',
         f'- ranking_metric: `{fid_key}`',
+        '',
+        '## Greedy Stage Winners',
+        '',
+        _markdown_table(
+            stage_summaries,
+            [
+                'stage_index',
+                'stage_param',
+                'selected_run',
+                'selected_value',
+                'selected_fid',
+                'selected_straightness_ratio_mean',
+                'selected_conditioned_source_cluster_agreement',
+                'best_alignment_run',
+                'best_straightness_run',
+            ],
+        ),
         '',
         '## Summary',
         '',
@@ -776,7 +1160,7 @@ def _write_analysis_packet(root, run_id, summary_rows, image_paths, fid_key):
     return json_path, md_path
 
 
-def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id):
+def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id, final_config=None, stage_summaries=None):
     best_moe = None
     moe_rows = [row for row in summary_rows if row.get('role') == 'moe']
     if moe_rows:
@@ -789,6 +1173,9 @@ def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id):
         'ablation/root': str(root),
         'ablation/fid_key': fid_key,
     }
+    if final_config:
+        for key, value in final_config.items():
+            summary_metrics[f'ablation/final_{key}'] = value
     if best_moe is not None:
         summary_metrics['ablation/best_moe_run'] = best_moe['run_name']
         summary_metrics['ablation/best_moe_k'] = int(best_moe['K'])
@@ -805,8 +1192,8 @@ def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id):
         group=SUMMARY_GROUP,
         name='moe1_naive_k_ablation_summary',
         config={
-            'k_list': [row.get('K') for row in summary_rows if row.get('role') == 'moe'],
-            'source_var_target_std': flags.model['source_var_target_std'],
+            'final_config': final_config or {},
+            'stage_summaries': stage_summaries or [],
             'fid_key': fid_key,
         },
         mode='offline' if flags.wandb.offline else 'online',
@@ -829,108 +1216,339 @@ def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id):
     run.finish()
 
 
-def run(flags):
-    if not flags.fid_stats:
-        raise ValueError('--fid_stats is required for mode=moe1-naive-k-ablation.')
-    flags.wandb.project = _resolve_project_name(flags)
-    k_list = _parse_k_list(flags.moe1_k_list)
-    run_id = _make_run_id()
-    root = Path(flags.moe1_root_dir) / run_id
-    root.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        root / 'ablation_context.json',
-        {
-            'run_id': run_id,
-            'mode': 'moe1-naive-k-ablation',
-            'k_list': k_list,
-            'dataset_name': flags.dataset_name,
-            'tfds_data_dir': flags.tfds_data_dir,
-            'fid_stats': flags.fid_stats,
-            'max_steps': int(flags.max_steps),
-            'keep_checkpoints': bool(flags.moe1_keep_checkpoints),
-            'source_var_target_std': flags.model['source_var_target_std'],
-        },
+def _base_config(flags):
+    return {
+        'K': int(flags.moe1_base_k),
+        'source_tau': float(flags.moe1_base_tau),
+        'loss_balance_weight': float(flags.moe1_base_balance),
+        'loss_entropy_weight': float(flags.moe1_base_entropy),
+        'weight_decay': float(flags.moe1_base_weight_decay),
+        'source_var_target_std': float(flags.moe1_base_var_target),
+    }
+
+
+def _greedy_stages(flags):
+    k_values = _ensure_int_value(_parse_k_list(flags.moe1_k_list), flags.moe1_base_k)
+    tau_values = _ensure_float_value(_parse_float_list(flags.moe1_tau_values, 'moe1_tau_values'), flags.moe1_base_tau)
+    balance_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_balance_values, 'moe1_balance_values'),
+        flags.moe1_base_balance,
     )
+    entropy_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_entropy_values, 'moe1_entropy_values'),
+        flags.moe1_base_entropy,
+    )
+    weight_decay_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_weight_decay_values, 'moe1_weight_decay_values'),
+        flags.moe1_base_weight_decay,
+    )
+    var_target_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_var_target_values, 'moe1_var_target_values'),
+        flags.moe1_base_var_target,
+    )
+    return [
+        ('K', k_values),
+        ('source_tau', tau_values),
+        ('loss_balance_weight', balance_values),
+        ('loss_entropy_weight', entropy_values),
+        ('weight_decay', weight_decay_values),
+        ('source_var_target_std', var_target_values),
+    ]
 
-    gmm_rows = []
-    train_rows = []
-    for k in k_list:
-        gmm_row = _run_gmm(flags, root, k)
-        gmm_rows.append(gmm_row)
-        overrides = flags.model.to_dict()
-        overrides.update({
-            'train_type': 'naive-moe-source',
-            'gmm_stats_path': gmm_row['gmm_stats_path'],
-            'gmm_num_modes': k,
-            'use_stable_vae': 1,
-        })
-        train_rows.append(_run_train(
-            flags,
-            root,
-            f'moe1_naive_k{k:02d}',
-            'moe',
-            overrides,
-            k=k,
-        ))
 
-    naive_row = None
-    if bool(flags.moe1_train_naive_ref):
-        naive_overrides = flags.model.to_dict()
-        naive_overrides.update({
-            'train_type': 'naive',
-            'gmm_stats_path': '',
-        })
-        naive_row = _run_train(
-            flags,
-            root,
-            'naive_reference',
-            'naive',
-            naive_overrides,
-            k=None,
-        )
+def _model_overrides_for_config(flags, config, gmm_path):
+    overrides = flags.model.to_dict()
+    overrides.update({
+        'train_type': 'naive-moe-source',
+        'gmm_stats_path': str(gmm_path),
+        'gmm_num_modes': int(config['K']),
+        'use_stable_vae': 1,
+        'source_tau': float(config['source_tau']),
+        'loss_balance_weight': float(config['loss_balance_weight']),
+        'loss_entropy_weight': float(config['loss_entropy_weight']),
+        'weight_decay': float(config['weight_decay']),
+        'source_var_target_std': float(config['source_var_target_std']),
+    })
+    return overrides
 
-    fid_key = _fid_key(flags)
-    max_points = max(1, int(flags.source_stats_samples))
-    image_paths = {}
-    moe_analyses = []
-    for train_row, gmm_row in zip(train_rows, gmm_rows):
-        gmm_state = load_gmm_stats(gmm_row['gmm_stats_path'])
-        analysis = _render_moe_run(
-            train_row,
-            gmm_state,
-            root / 'visualizations' / f'K{train_row["K"]:02d}',
-            fid_key,
-            max_points,
-        )
-        moe_analyses.append(analysis)
-        image_paths.update(analysis['image_paths'])
 
+def _ensure_gmm(flags, root, k, runtime, gmm_cache):
+    k = int(k)
+    if k not in gmm_cache:
+        gmm_cache[k] = _run_gmm(flags, root, k, runtime)
+    return gmm_cache[k]
+
+
+def _render_moe_candidate_if_primary(run_row, gmm_row, root, fid_key, max_points, runtime):
+    if not _is_primary(runtime):
+        return None, {}
+    gmm_state = load_gmm_stats(gmm_row['gmm_stats_path'])
+    analysis = _render_moe_run(
+        run_row,
+        gmm_state,
+        root / 'visualizations' / 'candidates' / run_row['run_dir_name'],
+        fid_key,
+        max_points,
+    )
+    run_row['summary'] = analysis['summary']
+    return analysis, analysis['image_paths']
+
+
+def _run_or_reuse_candidate(
+    flags,
+    root,
+    config,
+    stage_idx,
+    stage_param,
+    stage_value,
+    runtime,
+    gmm_cache,
+    candidate_cache,
+    fid_key,
+    max_points,
+):
+    key = _candidate_key(config)
+    stage_metadata = {
+        'stage': stage_idx,
+        'stage_param': stage_param,
+        'stage_value': stage_value,
+        'config': dict(config),
+        'candidate_key': '|'.join(str(part) for part in key),
+        'run_dir_name': _candidate_slug(config),
+    }
+    if key in candidate_cache:
+        cached = candidate_cache[key]
+        cached['run'].setdefault('reused_in_stages', []).append(stage_param)
+        row = dict(cached['run'])
+        row.update(stage_metadata)
+        if cached.get('analysis') is not None:
+            summary = dict(cached['analysis']['summary'])
+            summary.update({
+                'stage': stage_idx,
+                'stage_param': stage_param,
+                'stage_value': stage_value,
+            })
+            row['summary'] = summary
+        return row, cached.get('analysis'), {}
+
+    gmm_row = _ensure_gmm(flags, root, int(config['K']), runtime, gmm_cache)
+    slug = _candidate_slug(config)
+    run_name = f'moe1_greedy_{slug}'
+    run_dir_name = f'candidates/{slug}'
+    metadata = {
+        **stage_metadata,
+        'reused_in_stages': [stage_param],
+    }
+    run_row = _run_train(
+        flags,
+        root,
+        run_name,
+        'moe',
+        _model_overrides_for_config(flags, config, gmm_row['gmm_stats_path']),
+        runtime,
+        k=int(config['K']),
+        run_dir_name=run_dir_name,
+        metadata=metadata,
+    )
+    analysis, image_paths = _render_moe_candidate_if_primary(run_row, gmm_row, root, fid_key, max_points, runtime)
+    _sync_global(runtime, f'render_candidate_{slug}')
+    candidate_cache[key] = {
+        'run': run_row,
+        'analysis': analysis,
+        'gmm': gmm_row,
+    }
+    return run_row, analysis, image_paths
+
+
+def _run_naive_reference(flags, root, runtime, fid_key, max_points):
+    naive_overrides = flags.model.to_dict()
+    naive_overrides.update({
+        'train_type': 'naive',
+        'gmm_stats_path': '',
+    })
+    naive_row = _run_train(
+        flags,
+        root,
+        'naive_reference',
+        'naive',
+        naive_overrides,
+        runtime,
+        k=None,
+        run_dir_name='naive_reference',
+        metadata={'config': {}, 'run_dir_name': 'naive_reference'},
+    )
     naive_analysis = None
-    if naive_row is not None:
+    image_paths = {}
+    if _is_primary(runtime):
         naive_analysis = _render_naive_run(
             naive_row,
             root / 'visualizations' / 'naive_reference',
             fid_key,
             max_points,
         )
+        naive_row['summary'] = naive_analysis['summary']
         image_paths.update(naive_analysis['image_paths'])
+    _sync_global(runtime, 'render_naive_reference')
+    return naive_row, naive_analysis, image_paths
 
+
+def run(flags):
+    if not flags.fid_stats:
+        raise ValueError('--fid_stats is required for mode=moe1-naive-k-ablation.')
+    runtime = _runtime_info()
+    _validate_runtime(flags, runtime)
+    local_run_id = _make_run_id() if _is_primary(runtime) else ''
+    run_id = _broadcast_string(runtime, local_run_id, 'run_id')
+    flags.wandb.project = _resolve_project_name(flags, run_id)
+    root = Path(flags.moe1_root_dir) / run_id
+    root.mkdir(parents=True, exist_ok=True)
+    fid_key = _fid_key(flags)
+    max_points = max(1, int(flags.source_stats_samples))
+    base_config = _base_config(flags)
+    stages = _greedy_stages(flags)
+    if _is_primary(runtime):
+        _write_json(
+            root / 'ablation_context.json',
+            {
+                'run_id': run_id,
+                'wandb_project': flags.wandb.project,
+                'mode': 'moe1-naive-k-ablation',
+                'runtime': runtime,
+                'greedy_metric': flags.moe1_greedy_metric,
+                'base_config': base_config,
+                'stages': [{'param': name, 'values': values} for name, values in stages],
+                'dataset_name': flags.dataset_name,
+                'tfds_data_dir': flags.tfds_data_dir,
+                'fid_stats': flags.fid_stats,
+                'max_steps': int(flags.max_steps),
+                'eval_fid_generations': int(flags.eval_fid_generations),
+                'inference_generations': int(flags.inference_generations),
+                'keep_checkpoints': bool(flags.moe1_keep_checkpoints),
+            },
+        )
+
+    gmm_cache = {}
+    candidate_cache = {}
+    image_paths = {}
+    stage_summaries = []
+    stage_candidate_rows = []
+    current_config = dict(base_config)
+
+    for stage_idx, (stage_param, values) in enumerate(stages, start=1):
+        stage_rows = []
+        for value in values:
+            candidate_config = dict(current_config)
+            candidate_config[stage_param] = int(value) if stage_param == 'K' else float(value)
+            run_row, analysis, candidate_images = _run_or_reuse_candidate(
+                flags,
+                root,
+                candidate_config,
+                stage_idx,
+                stage_param,
+                candidate_config[stage_param],
+                runtime,
+                gmm_cache,
+                candidate_cache,
+                fid_key,
+                max_points,
+            )
+            summary = run_row.get('summary')
+            if summary is None:
+                summary = _summary_row_from_metrics(run_row, fid_key)
+            summary = dict(summary)
+            summary.update({
+                'stage': stage_idx,
+                'stage_param': stage_param,
+                'stage_value': candidate_config[stage_param],
+                'K': candidate_config['K'],
+                'source_tau': candidate_config['source_tau'],
+                'loss_balance_weight': candidate_config['loss_balance_weight'],
+                'loss_entropy_weight': candidate_config['loss_entropy_weight'],
+                'weight_decay': candidate_config['weight_decay'],
+                'source_var_target_std': candidate_config['source_var_target_std'],
+            })
+            stage_rows.append(summary)
+            image_paths.update(candidate_images)
+
+        if _is_primary(runtime):
+            selected_idx = _select_stage_winner_index(stage_rows, fid_key)
+        else:
+            selected_idx = 0
+        selected_idx = _broadcast_int(runtime, selected_idx, f'stage_{stage_idx}_winner')
+        selected_config = dict(current_config)
+        selected_config[stage_param] = stage_rows[selected_idx]['K'] if stage_param == 'K' else stage_rows[selected_idx][stage_param]
+        current_config = selected_config
+        stage_candidate_rows.extend(stage_rows)
+        if _is_primary(runtime):
+            stage_summary = _stage_summary_row(stage_idx, stage_param, stage_rows, selected_idx, fid_key)
+            stage_summaries.append(stage_summary)
+            _write_json(
+                root / 'stage_summaries' / f'stage_{stage_idx:02d}_{stage_param}.json',
+                {
+                    'stage_index': stage_idx,
+                    'stage_param': stage_param,
+                    'selected_index': selected_idx,
+                    'selected_config': current_config,
+                    'stage_summary': stage_summary,
+                    'candidate_rows': stage_rows,
+                },
+            )
+        _sync_global(runtime, f'stage_{stage_idx}_complete')
+
+    naive_analysis = None
+    if bool(flags.moe1_train_naive_ref):
+        _, naive_analysis, naive_images = _run_naive_reference(flags, root, runtime, fid_key, max_points)
+        image_paths.update(naive_images)
+
+    if not _is_primary(runtime):
+        _sync_global(runtime, 'summary_complete')
+        print(f'worker {runtime["process_index"]}: moe1-naive-k-ablation subprocess orchestration complete.')
+        return
+
+    unique_analyses = [entry['analysis'] for entry in candidate_cache.values() if entry.get('analysis') is not None]
+    winner_keys = []
+    for stage_summary in stage_summaries:
+        selected_run = stage_summary.get('selected_run')
+        match = next((analysis for analysis in unique_analyses if analysis['run']['run_name'] == selected_run), None)
+        if match is not None and match['run']['run_name'] not in winner_keys:
+            winner_keys.append(match['run']['run_name'])
+    final_key = _candidate_key(current_config)
+    final_analysis = candidate_cache.get(final_key, {}).get('analysis')
+    if final_analysis is not None and final_analysis['run']['run_name'] not in winner_keys:
+        winner_keys.append(final_analysis['run']['run_name'])
+    k_stage_runs = {
+        analysis['run']['run_name']
+        for analysis in unique_analyses
+        if analysis.get('summary', {}).get('stage_param') == 'K'
+    }
+    combined_moe_analyses = [
+        analysis
+        for analysis in unique_analyses
+        if analysis['run']['run_name'] in set(winner_keys) or analysis['run']['run_name'] in k_stage_runs
+    ]
     combined_paths = _render_combined(
-        moe_analyses,
+        combined_moe_analyses,
         naive_analysis,
         root / 'visualizations' / 'combined',
         max_points,
     )
     image_paths.update(combined_paths)
 
-    summary_rows = [analysis['summary'] for analysis in moe_analyses]
+    summary_rows = [analysis['summary'] for analysis in unique_analyses]
     if naive_analysis is not None:
         summary_rows.append(naive_analysis['summary'])
 
     summary_columns = [
         'run_name',
         'role',
+        'stage_param',
+        'stage_value',
         'K',
+        'source_tau',
+        'loss_balance_weight',
+        'loss_entropy_weight',
+        'weight_decay',
+        'source_var_target_std',
         fid_key,
         'valid_loss',
         'max_usage',
@@ -941,6 +1559,7 @@ def run(flags):
         'q_source_cluster_agreement',
         'alpha_source_cluster_agreement',
         'conditioned_source_cluster_agreement',
+        'condition_cluster_nmi',
         'source_prior_to_data_distance',
         'source_posterior_to_data_distance',
         'straightness_ratio_mean',
@@ -954,7 +1573,25 @@ def run(flags):
     )
     image_paths['master_summary'] = str(summary_table)
 
-    path_rows = [analysis['path_row'] for analysis in moe_analyses if analysis.get('path_row')]
+    stage_table = _make_table_png(
+        stage_summaries,
+        [
+            'stage_index',
+            'stage_param',
+            'selected_run',
+            'selected_value',
+            'selected_fid',
+            'selected_straightness_ratio_mean',
+            'selected_conditioned_source_cluster_agreement',
+            'best_alignment_run',
+            'best_straightness_run',
+        ],
+        'MoE1 greedy stage winners',
+        root / 'stage_winners_summary.png',
+    )
+    image_paths['stage_winners_summary'] = str(stage_table)
+
+    path_rows = [analysis['path_row'] for analysis in unique_analyses if analysis.get('path_row')]
     if naive_analysis is not None and naive_analysis.get('path_row') is not None:
         path_rows.append(naive_analysis['path_row'])
     if path_rows:
@@ -975,17 +1612,78 @@ def run(flags):
         )
         image_paths['path_stats_summary'] = str(path_table)
 
+    _write_csv(root / 'master_summary.csv', summary_rows, summary_columns)
+    _write_csv(
+        root / 'stage_candidates.csv',
+        stage_candidate_rows,
+        [
+            'stage',
+            'stage_param',
+            'stage_value',
+            'run_name',
+            'K',
+            'source_tau',
+            'loss_balance_weight',
+            'loss_entropy_weight',
+            'weight_decay',
+            'source_var_target_std',
+            fid_key,
+            'valid_loss',
+            'conditioned_source_cluster_agreement',
+            'condition_cluster_nmi',
+            'straightness_ratio_mean',
+            'curvature_proxy_mean',
+            'max_usage',
+            'max_soft_usage',
+            'source_prior_variance_mean',
+        ],
+    )
+    _write_csv(
+        root / 'stage_winners.csv',
+        stage_summaries,
+        [
+            'stage_index',
+            'stage_param',
+            'selected_run',
+            'selected_value',
+            'selected_K',
+            'selected_fid',
+            'selected_straightness_ratio_mean',
+            'selected_conditioned_source_cluster_agreement',
+            'best_fid_run',
+            'best_fid_value',
+            'best_alignment_run',
+            'best_alignment_value',
+            'best_straightness_run',
+            'best_straightness_value',
+        ],
+    )
+
     _write_json(
         root / 'master_summary.json',
         {
             'run_id': run_id,
+            'wandb_project': flags.wandb.project,
             'fid_key': fid_key,
-            'gmm_rows': gmm_rows,
+            'runtime': runtime,
+            'base_config': base_config,
+            'final_config': current_config,
+            'stage_summaries': stage_summaries,
+            'stage_candidate_rows': stage_candidate_rows,
+            'gmm_rows': list(gmm_cache.values()),
             'summary_rows': summary_rows,
             'image_paths': image_paths,
         },
     )
-    analysis_packet_json, analysis_packet_md = _write_analysis_packet(root, run_id, summary_rows, image_paths, fid_key)
+    _, analysis_packet_md = _write_analysis_packet(
+        root,
+        run_id,
+        summary_rows,
+        stage_summaries,
+        image_paths,
+        fid_key,
+    )
     print(f'Analysis packet for copy/paste: {analysis_packet_md}')
-    _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id)
+    _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id, current_config, stage_summaries)
+    _sync_global(runtime, 'summary_complete')
     print(f'moe1-naive-k-ablation complete. Outputs: {root}')

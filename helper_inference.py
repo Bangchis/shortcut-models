@@ -183,7 +183,6 @@ def do_inference(
         def dump_source_stats_if_needed():
             if FLAGS.save_dir is None or not (FLAGS.dump_source_stats or FLAGS.dump_flow_viz):
                 return None
-            os.makedirs(FLAGS.save_dir, exist_ok=True)
             num_needed = max(analysis_needed, images_shape[0])
             x1_chunks = []
             x0_posterior_chunks = []
@@ -233,12 +232,23 @@ def do_inference(
                     payload['flow_path_states'] = np.stack(path_chunks, axis=1)
                     payload['flow_path_times'] = (np.asarray(flow_completed_steps, dtype=np.float32) / float(FLAGS.inference_timesteps))
                     payload['flow_path_completed_steps'] = np.asarray(flow_completed_steps, dtype=np.int32)
-            output_path = os.path.join(FLAGS.save_dir, 'source_stats.npz')
-            np.savez_compressed(output_path, **payload)
-            return output_path
+            if jax.process_index() == 0:
+                os.makedirs(FLAGS.save_dir, exist_ok=True)
+                output_path = os.path.join(FLAGS.save_dir, 'source_stats.npz')
+                np.savez_compressed(output_path, **payload)
+                return output_path
+            return None
 
         denoise_timesteps = FLAGS.inference_timesteps
         num_generations = FLAGS.inference_generations
+        if num_generations < FLAGS.batch_size:
+            raise ValueError(
+                f'--inference_generations={num_generations} must be at least --batch_size={FLAGS.batch_size}.'
+            )
+        if num_generations % FLAGS.batch_size != 0:
+            raise ValueError(
+                f'--inference_generations={num_generations} must be divisible by --batch_size={FLAGS.batch_size}.'
+            )
         cfg_scale = FLAGS.inference_cfg_scale
         should_save_x_render = bool(FLAGS.save_x_render)
         alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
@@ -330,6 +340,8 @@ def do_inference(
             acts = jax.experimental.multihost_utils.process_allgather(acts)
             activations.append(np.array(acts))
 
+        source_stats_path = dump_source_stats_if_needed()
+
         if jax.process_index() == 0:
             activations = np.concatenate(activations, axis=0)
             activations = activations.reshape((-1, activations.shape[-1]))
@@ -341,7 +353,6 @@ def do_inference(
             print(f"FID is {fid}")
             latency = generation_time / max(num_generations, 1)
             throughput = num_generations / max(generation_time, 1e-8)
-            source_stats_path = dump_source_stats_if_needed()
             fid_key = f'fid{int(denoise_timesteps)}_{int(num_generations)}'
             latency_key = f'latency_{int(denoise_timesteps)}'
             throughput_key = f'throughput_{int(denoise_timesteps)}'
