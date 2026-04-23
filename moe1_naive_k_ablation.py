@@ -1434,6 +1434,45 @@ def _run_naive_reference(flags, root, runtime, fid_key, max_points):
     return naive_row, naive_analysis, image_paths
 
 
+def _run_final_best_moe(flags, root, config, runtime, gmm_cache, fid_key, max_points):
+    max_steps = int(flags.max_steps)
+    gmm_row = _ensure_gmm(flags, root, int(config['K']), runtime, gmm_cache)
+    run_name = 'final_best_moe_50k' if max_steps == 50000 else f'final_best_moe_{max_steps}'
+    run_dir_name = run_name
+    metadata = {
+        'stage': 'final',
+        'stage_param': 'final_best',
+        'stage_value': 'full_retrain',
+        'max_steps': max_steps,
+        'config': dict(config),
+        'candidate_key': 'final_best_full_retrain',
+        'run_dir_name': run_dir_name,
+        'reused_in_stages': [],
+    }
+    run_row = _run_train(
+        flags,
+        root,
+        run_name,
+        'moe',
+        _model_overrides_for_config(flags, config, gmm_row['gmm_stats_path']),
+        runtime,
+        k=int(config['K']),
+        run_dir_name=run_dir_name,
+        metadata=metadata,
+        max_steps=max_steps,
+    )
+    analysis, image_paths = _render_moe_candidate_if_primary(
+        run_row,
+        gmm_row,
+        root,
+        fid_key,
+        max_points,
+        runtime,
+    )
+    _sync_global(runtime, 'render_final_best_moe')
+    return run_row, analysis, image_paths
+
+
 def run(flags):
     if not flags.fid_stats:
         raise ValueError('--fid_stats is required for mode=moe1-naive-k-ablation.')
@@ -1465,6 +1504,7 @@ def run(flags):
                 'max_steps': int(flags.max_steps),
                 'short_stage_steps': int(flags.moe1_short_stage_steps),
                 'short_stage_params': sorted(SHORT_STAGE_PARAMS),
+                'retrain_final_best_full_budget': True,
                 'eval_fid_generations': int(flags.eval_fid_generations),
                 'inference_generations': int(flags.inference_generations),
                 'keep_checkpoints': bool(flags.moe1_keep_checkpoints),
@@ -1542,6 +1582,17 @@ def run(flags):
             )
         _sync_global(runtime, f'stage_{stage_idx}_complete')
 
+    _, final_best_analysis, final_best_images = _run_final_best_moe(
+        flags,
+        root,
+        current_config,
+        runtime,
+        gmm_cache,
+        fid_key,
+        max_points,
+    )
+    image_paths.update(final_best_images)
+
     naive_analysis = None
     if bool(flags.moe1_train_naive_ref):
         _, naive_analysis, naive_images = _run_naive_reference(flags, root, runtime, fid_key, max_points)
@@ -1553,16 +1604,17 @@ def run(flags):
         return
 
     unique_analyses = [entry['analysis'] for entry in candidate_cache.values() if entry.get('analysis') is not None]
+    all_moe_analyses = list(unique_analyses)
+    if final_best_analysis is not None:
+        all_moe_analyses.append(final_best_analysis)
     winner_keys = []
     for stage_summary in stage_summaries:
         selected_run = stage_summary.get('selected_run')
         match = next((analysis for analysis in unique_analyses if analysis['run']['run_name'] == selected_run), None)
         if match is not None and match['run']['run_name'] not in winner_keys:
             winner_keys.append(match['run']['run_name'])
-    final_key = _candidate_key(current_config, int(flags.max_steps))
-    final_analysis = candidate_cache.get(final_key, {}).get('analysis')
-    if final_analysis is not None and final_analysis['run']['run_name'] not in winner_keys:
-        winner_keys.append(final_analysis['run']['run_name'])
+    if final_best_analysis is not None and final_best_analysis['run']['run_name'] not in winner_keys:
+        winner_keys.append(final_best_analysis['run']['run_name'])
     k_stage_runs = {
         analysis['run']['run_name']
         for analysis in unique_analyses
@@ -1570,7 +1622,7 @@ def run(flags):
     }
     combined_moe_analyses = [
         analysis
-        for analysis in unique_analyses
+        for analysis in all_moe_analyses
         if analysis['run']['run_name'] in set(winner_keys) or analysis['run']['run_name'] in k_stage_runs
     ]
     combined_paths = _render_combined(
@@ -1581,7 +1633,7 @@ def run(flags):
     )
     image_paths.update(combined_paths)
 
-    summary_rows = [analysis['summary'] for analysis in unique_analyses]
+    summary_rows = [analysis['summary'] for analysis in all_moe_analyses]
     if naive_analysis is not None:
         summary_rows.append(naive_analysis['summary'])
 
@@ -1640,7 +1692,7 @@ def run(flags):
     )
     image_paths['stage_winners_summary'] = str(stage_table)
 
-    path_rows = [analysis['path_row'] for analysis in unique_analyses if analysis.get('path_row')]
+    path_rows = [analysis['path_row'] for analysis in all_moe_analyses if analysis.get('path_row')]
     if naive_analysis is not None and naive_analysis.get('path_row') is not None:
         path_rows.append(naive_analysis['path_row'])
     if path_rows:
@@ -1719,6 +1771,8 @@ def run(flags):
             'runtime': runtime,
             'base_config': base_config,
             'final_config': current_config,
+            'final_best_moe_run': final_best_analysis['run']['run_name'] if final_best_analysis is not None else None,
+            'final_best_moe_summary': final_best_analysis['summary'] if final_best_analysis is not None else None,
             'short_stage_steps': int(flags.moe1_short_stage_steps),
             'short_stage_params': sorted(SHORT_STAGE_PARAMS),
             'stage_summaries': stage_summaries,
