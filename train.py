@@ -166,6 +166,7 @@ model_config = ml_collections.ConfigDict({
     'source_tau': 2.0,
     'loss_balance_weight': 0.1,
     'loss_entropy_weight': 0.01,
+    'loss_alignment_weight': 0.0,
     'source_var_weight': 1.0,
     'source_var_target_std': 1.0,
     'source_var_eps': 1e-6,
@@ -600,10 +601,33 @@ def main(_):
                     target_std=FLAGS.model['source_var_target_std'],
                     eps=FLAGS.model['source_var_eps'],
                 )
+                loss_alignment = jnp.asarray(0.0, dtype=jnp.float32)
+                source_q = None
+                source_mode_agreement = None
+                if FLAGS.model['loss_alignment_weight'] > 0:
+                    source_q = posterior_from_stats(
+                        flatten_latents(mu_x0),
+                        gmm_state['mean'],
+                        gmm_state['std'],
+                        gmm_standardize_eps,
+                        gmm_state['log_pi'],
+                        gmm_state['mu'],
+                        gmm_state['var'],
+                    )
+                    loss_alignment = -jnp.mean(
+                        jnp.sum(
+                            condition_weights * jnp.log(jnp.maximum(source_q, 1e-8)),
+                            axis=-1,
+                        )
+                    )
+                    source_mode_agreement = jnp.mean(
+                        jnp.argmax(source_q, axis=-1) == sampled_modes
+                    )
                 loss = (
                     loss_fm
                     + FLAGS.model['loss_balance_weight'] * loss_balance
                     - FLAGS.model['loss_entropy_weight'] * loss_entropy
+                    + FLAGS.model['loss_alignment_weight'] * loss_alignment
                     + FLAGS.model['source_var_weight'] * loss_var
                 )
 
@@ -612,6 +636,7 @@ def main(_):
                     'loss/fm': loss_fm,
                     'loss/balance': loss_balance,
                     'loss/entropy': loss_entropy,
+                    'loss/alignment': loss_alignment,
                     'loss/var': loss_var,
                     'source/shift_norm': jnp.sqrt(jnp.mean(jnp.square(x_0 - z))),
                     'source/x0_sample_norm': jnp.sqrt(jnp.mean(jnp.square(x_0))),
@@ -631,6 +656,12 @@ def main(_):
                     'dropped_ratio': jnp.mean(
                         labels_dropped == FLAGS.model['num_classes']),
                 }
+                if source_q is not None:
+                    info['source/source_cluster_entropy_mean'] = jnp.mean(
+                        -jnp.sum(source_q * jnp.log(jnp.maximum(source_q, 1e-8)), axis=-1)
+                    )
+                if source_mode_agreement is not None:
+                    info['condition_source_cluster_agreement'] = source_mode_agreement
 
                 if collect_full_train_diagnostics:
                     info['router/logit_norm'] = jnp.sqrt(jnp.mean(jnp.square(router_logits)))
@@ -784,6 +815,8 @@ def main(_):
         for key in (
             'router/entropy_mean',
             'q_alpha_agreement',
+            'condition_source_cluster_agreement',
+            'loss/alignment',
             'source/var_mean',
             'source/var_min',
             'source/mu_x0_norm',
