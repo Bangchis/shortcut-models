@@ -39,6 +39,26 @@ flags.DEFINE_integer('gmm_init_seed', 0, 'Seed for GMM initialization.')
 flags.DEFINE_float('gmm_standardize_eps', 1e-6, 'Epsilon used for latent standardization.')
 flags.DEFINE_float('gmm_var_floor', 1e-4, 'Minimum variance for every GMM dimension.')
 flags.DEFINE_float('gmm_weight_prior', 1e-2, 'Pseudo-count added to each mixture component.')
+flags.DEFINE_float(
+    'gmm_pi_uniform_prior',
+    0.0,
+    'Uniform-mixture prior strength. 1.0 blends empirical pi halfway with uniform.',
+)
+flags.DEFINE_float(
+    'gmm_var_prior_strength',
+    0.0,
+    'Variance prior pseudo-count. 0 disables; useful for preventing tiny mode variances.',
+)
+flags.DEFINE_float(
+    'gmm_var_prior_value',
+    1.0,
+    'Target diagonal variance for the variance prior in standardized latent space.',
+)
+flags.DEFINE_float(
+    'gmm_min_component_count',
+    1.0,
+    'Components with effective count below this threshold are reinitialized.',
+)
 flags.DEFINE_integer('gmm_kmeanspp_init', 1, 'Whether to use kmeans++-style initialization.')
 flags.DEFINE_integer('gmm_em_chunk_size', 1024, 'Chunk size for E-step/M-step accumulation.')
 flags.DEFINE_integer('gmm_keep_latent_cache', 0, 'Whether to keep the latent cache file after fitting.')
@@ -78,6 +98,10 @@ def main(_):
                 'gmm_em_restarts': FLAGS.gmm_em_restarts,
                 'gmm_var_floor': FLAGS.gmm_var_floor,
                 'gmm_weight_prior': FLAGS.gmm_weight_prior,
+                'gmm_pi_uniform_prior': FLAGS.gmm_pi_uniform_prior,
+                'gmm_var_prior_strength': FLAGS.gmm_var_prior_strength,
+                'gmm_var_prior_value': FLAGS.gmm_var_prior_value,
+                'gmm_min_component_count': FLAGS.gmm_min_component_count,
                 'gmm_fit_samples': FLAGS.gmm_fit_samples,
             },
             **FLAGS.wandb,
@@ -170,6 +194,10 @@ def main(_):
         var_floor=FLAGS.gmm_var_floor,
         weight_prior=FLAGS.gmm_weight_prior,
         use_kmeanspp=bool(FLAGS.gmm_kmeanspp_init),
+        pi_uniform_prior=FLAGS.gmm_pi_uniform_prior,
+        var_prior_strength=FLAGS.gmm_var_prior_strength,
+        var_prior_value=FLAGS.gmm_var_prior_value,
+        min_component_count=FLAGS.gmm_min_component_count,
     )
 
     stats_to_save = {
@@ -182,10 +210,18 @@ def main(_):
         'counts_trace': gmm_state['counts_trace'],
         'var_min_trace': gmm_state['var_min_trace'],
         'var_max_trace': gmm_state['var_max_trace'],
+        'floor_frac_trace': gmm_state['floor_frac_trace'],
+        'dead_count_trace': gmm_state['dead_count_trace'],
+        'min_count_trace': gmm_state['min_count_trace'],
+        'pi_kl_uniform_trace': gmm_state['pi_kl_uniform_trace'],
         'final_counts': gmm_state['final_counts'],
         'restart_index': np.array(gmm_state['restart_index'], dtype=np.int32),
         'n_train': np.array(target_examples, dtype=np.int32),
         'standardize_eps': np.array(FLAGS.gmm_standardize_eps, dtype=np.float32),
+        'pi_uniform_prior': np.array(FLAGS.gmm_pi_uniform_prior, dtype=np.float32),
+        'var_prior_strength': np.array(FLAGS.gmm_var_prior_strength, dtype=np.float32),
+        'var_prior_value': np.array(FLAGS.gmm_var_prior_value, dtype=np.float32),
+        'min_component_count': np.array(FLAGS.gmm_min_component_count, dtype=np.float32),
     }
     save_gmm_stats(FLAGS.gmm_save_path, stats_to_save)
     print(f"Saved GMM stats to {FLAGS.gmm_save_path}")
@@ -198,6 +234,10 @@ def main(_):
                 'gmm/nll': float(nll),
                 'gmm/var_min': float(stats_to_save['var_min_trace'][step - 1]),
                 'gmm/var_max': float(stats_to_save['var_max_trace'][step - 1]),
+                'gmm/floor_frac': float(stats_to_save['floor_frac_trace'][step - 1]),
+                'gmm/dead_components': float(stats_to_save['dead_count_trace'][step - 1]),
+                'gmm/min_count': float(stats_to_save['min_count_trace'][step - 1]),
+                'gmm/pi_kl_uniform': float(stats_to_save['pi_kl_uniform_trace'][step - 1]),
             }, step=step)
         for idx in range(FLAGS.gmm_num_modes):
             wandb.log({
@@ -207,6 +247,10 @@ def main(_):
         wandb.log({
             'latent/std_mean': float(np.mean(std)),
             'latent/mean_abs': float(np.mean(np.abs(mean))),
+            'gmm/final_floor_frac': float(stats_to_save['floor_frac_trace'][-1]),
+            'gmm/final_dead_components': float(stats_to_save['dead_count_trace'][-1]),
+            'gmm/final_min_count': float(stats_to_save['min_count_trace'][-1]),
+            'gmm/final_pi_kl_uniform': float(stats_to_save['pi_kl_uniform_trace'][-1]),
         }, step=FLAGS.gmm_em_iters + 1)
 
     if not FLAGS.gmm_keep_latent_cache and os.path.exists(cache_path):

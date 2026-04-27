@@ -116,10 +116,27 @@ def fit_diag_gmm(
     var_floor,
     weight_prior,
     use_kmeanspp,
+    pi_uniform_prior=0.0,
+    var_prior_strength=0.0,
+    var_prior_value=1.0,
+    min_component_count=1.0,
 ):
     num_examples, latent_dim = latents_std.shape
     best_state = None
     best_nll = np.inf
+    uniform_pi = np.ones((num_modes,), dtype=np.float32) / num_modes
+    pi_uniform_prior = float(pi_uniform_prior)
+    var_prior_strength = float(var_prior_strength)
+    var_prior_value = float(var_prior_value)
+    min_component_count = float(min_component_count)
+    if pi_uniform_prior < 0:
+        raise ValueError("pi_uniform_prior must be non-negative.")
+    if var_prior_strength < 0:
+        raise ValueError("var_prior_strength must be non-negative.")
+    if var_prior_value <= 0:
+        raise ValueError("var_prior_value must be positive.")
+    if min_component_count < 0:
+        raise ValueError("min_component_count must be non-negative.")
 
     for restart_idx in range(restarts):
         pi, mu, var = initialize_gmm_params(
@@ -134,6 +151,10 @@ def fit_diag_gmm(
         counts_trace = []
         var_min_trace = []
         var_max_trace = []
+        floor_frac_trace = []
+        dead_count_trace = []
+        min_count_trace = []
+        pi_kl_uniform_trace = []
 
         for _ in range(em_iters):
             counts = np.zeros((num_modes,), dtype=np.float64)
@@ -161,9 +182,18 @@ def fit_diag_gmm(
             safe_counts = np.maximum(counts, 1e-6)
             mu_new = (sum_x / safe_counts[:, None]).astype(np.float32)
             second_moment = (sum_x2 / safe_counts[:, None]).astype(np.float32)
-            var_new = np.maximum(second_moment - mu_new * mu_new, var_floor).astype(np.float32)
+            var_ml = np.maximum(second_moment - mu_new * mu_new, 0.0).astype(np.float32)
+            if var_prior_strength > 0:
+                prior_var = np.ones_like(var_ml, dtype=np.float32) * var_prior_value
+                var_new = (
+                    safe_counts[:, None] * var_ml
+                    + var_prior_strength * prior_var
+                ) / (safe_counts[:, None] + var_prior_strength)
+            else:
+                var_new = var_ml
+            var_new = np.maximum(var_new, var_floor).astype(np.float32)
 
-            dead_mask = counts < 1.0
+            dead_mask = counts < min_component_count
             if np.any(dead_mask):
                 fallback = random_init(latents_std, int(np.sum(dead_mask)), seed + restart_idx + 123)
                 mu_new[dead_mask] = fallback
@@ -171,6 +201,9 @@ def fit_diag_gmm(
                 var_new[dead_mask] = np.maximum(global_var, var_floor)
 
             counts_with_prior = counts + weight_prior
+            if pi_uniform_prior > 0:
+                # Relative prior: 1.0 adds one full dataset worth of uniform counts.
+                counts_with_prior += pi_uniform_prior * (num_examples / num_modes)
             pi_new = (counts_with_prior / np.sum(counts_with_prior)).astype(np.float32)
 
             pi = pi_new
@@ -181,6 +214,12 @@ def fit_diag_gmm(
             counts_trace.append(counts.astype(np.float32))
             var_min_trace.append(float(np.min(var)))
             var_max_trace.append(float(np.max(var)))
+            floor_frac_trace.append(float(np.mean(var <= var_floor * (1.0 + 1e-6))))
+            dead_count_trace.append(float(np.sum(dead_mask)))
+            min_count_trace.append(float(np.min(counts)))
+            pi_kl_uniform_trace.append(
+                float(np.sum(pi * (np.log(np.maximum(pi, 1e-8)) - np.log(uniform_pi))))
+            )
 
         final_nll = nll_trace[-1]
         if final_nll < best_nll:
@@ -193,6 +232,10 @@ def fit_diag_gmm(
                 'counts_trace': np.asarray(counts_trace, dtype=np.float32),
                 'var_min_trace': np.asarray(var_min_trace, dtype=np.float32),
                 'var_max_trace': np.asarray(var_max_trace, dtype=np.float32),
+                'floor_frac_trace': np.asarray(floor_frac_trace, dtype=np.float32),
+                'dead_count_trace': np.asarray(dead_count_trace, dtype=np.float32),
+                'min_count_trace': np.asarray(min_count_trace, dtype=np.float32),
+                'pi_kl_uniform_trace': np.asarray(pi_kl_uniform_trace, dtype=np.float32),
                 'restart_index': restart_idx,
                 'final_counts': counts.astype(np.float32),
             }
