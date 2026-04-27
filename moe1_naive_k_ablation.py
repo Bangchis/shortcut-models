@@ -41,6 +41,27 @@ GMM_CONFIG_KEYS = (
     'gmm_var_mse_weight',
     'gmm_pi_kl_weight',
 )
+GMM_SUMMARY_METRIC_KEYS = (
+    'train_nll',
+    'valid_nll',
+    'train_valid_nll_gap',
+    'min_component_fraction',
+    'max_component_fraction',
+    'effective_num_components',
+    'effective_component_fraction',
+    'near_dead_component_count',
+    'under_half_uniform_component_count',
+    'var_floor_hit_rate',
+    'var_floor_component_count',
+    'component_var_mean_min',
+    'component_var_mean_max',
+    'var_target_abs_error_mean',
+    'posterior_entropy_normalized_mean',
+    'posterior_top1_prob_mean',
+    'posterior_top1_margin_mean',
+    'center_distance_min',
+)
+GMM_SUMMARY_COLUMNS = tuple(f'gmm_{key}' for key in GMM_SUMMARY_METRIC_KEYS)
 SHORT_STAGE_PARAMS = frozenset((*GMM_CONFIG_KEYS, 'source_tau', 'loss_balance_weight', 'loss_entropy_weight'))
 GMM_STAT_KEYS = (
     'mean',
@@ -416,6 +437,17 @@ def _metric_value(metrics, key):
 
 def _fid_key(flags):
     return f'fid{int(flags.inference_timesteps)}_{int(flags.inference_generations)}'
+
+
+def _gmm_summary_fields(gmm_row):
+    metrics = gmm_row.get('metrics', {}) if isinstance(gmm_row, dict) else {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    return {
+        f'gmm_{key}': metrics.get(key)
+        for key in GMM_SUMMARY_METRIC_KEYS
+        if metrics.get(key) is not None
+    }
 
 
 def _run_gmm(flags, root, config, runtime):
@@ -870,6 +902,10 @@ def _stage_summary_row(stage_idx, stage_param, rows, selected_idx, fid_key):
         'selected_gmm_var_mse_target_std': selected.get('gmm_var_mse_target_std'),
         'selected_gmm_var_mse_weight': selected.get('gmm_var_mse_weight'),
         'selected_gmm_pi_kl_weight': selected.get('gmm_pi_kl_weight'),
+        'selected_gmm_min_component_fraction': selected.get('gmm_min_component_fraction'),
+        'selected_gmm_effective_num_components': selected.get('gmm_effective_num_components'),
+        'selected_gmm_near_dead_component_count': selected.get('gmm_near_dead_component_count'),
+        'selected_gmm_valid_nll': selected.get('gmm_valid_nll'),
         'selected_fid': selected.get(fid_key),
         'selected_straightness_ratio_mean': selected.get('straightness_ratio_mean'),
         'selected_conditioned_source_cluster_agreement': selected.get('conditioned_source_cluster_agreement'),
@@ -1188,6 +1224,7 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
         'loss_entropy_weight',
         'weight_decay',
         'source_var_target_std',
+        *GMM_SUMMARY_COLUMNS,
         fid_key,
         'valid_loss',
         'q_alpha_agreement',
@@ -1220,6 +1257,10 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
                 'selected_gmm_var_mse_target_std',
                 'selected_gmm_var_mse_weight',
                 'selected_gmm_pi_kl_weight',
+                'selected_gmm_min_component_fraction',
+                'selected_gmm_effective_num_components',
+                'selected_gmm_near_dead_component_count',
+                'selected_gmm_valid_nll',
                 'selected_fid',
                 'selected_straightness_ratio_mean',
                 'selected_conditioned_source_cluster_agreement',
@@ -1240,6 +1281,7 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
         ),
         '',
         f'Machine-readable summary: `{json_path}`',
+        f'GMM stage-1 summary CSV: `{root / "gmm_summary.csv"}`',
     ]
     md_path.write_text('\n'.join(md) + '\n', encoding='utf-8')
     return json_path, md_path
@@ -1280,7 +1322,9 @@ def _log_summary_artifact(run, root, image_paths, run_id):
         'ablation_context.json',
         'master_summary.json',
         'master_summary.csv',
+        'gmm_summary.csv',
         'master_summary.png',
+        'gmm_summary.png',
         'analysis_packet.md',
         'stage_candidates.csv',
         'stage_winners.csv',
@@ -1518,6 +1562,9 @@ def _run_or_reuse_candidate(
         max_steps=max_steps,
     )
     analysis, image_paths = _render_moe_candidate_if_primary(run_row, gmm_row, root, fid_key, max_points, runtime)
+    if analysis is not None:
+        analysis['summary'].update(_gmm_summary_fields(gmm_row))
+        run_row['summary'] = analysis['summary']
     _sync_global(runtime, f'render_candidate_{slug}')
     candidate_cache[key] = {
         'run': run_row,
@@ -1595,8 +1642,32 @@ def _run_final_best_moe(flags, root, config, runtime, gmm_cache, fid_key, max_po
         max_points,
         runtime,
     )
+    if analysis is not None:
+        analysis['summary'].update(_gmm_summary_fields(gmm_row))
+        run_row['summary'] = analysis['summary']
     _sync_global(runtime, 'render_final_best_moe')
     return run_row, analysis, image_paths
+
+
+def _gmm_summary_rows(gmm_cache):
+    rows = []
+    for row in gmm_cache.values():
+        metrics = row.get('metrics', {}) if isinstance(row, dict) else {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        summary = {
+            'run_name': row.get('run_name'),
+            'K': row.get('K'),
+            'gmm_var_mse_target_std': row.get('gmm_var_mse_target_std'),
+            'gmm_var_mse_weight': row.get('gmm_var_mse_weight'),
+            'gmm_pi_kl_weight': row.get('gmm_pi_kl_weight'),
+            'gmm_stats_path': row.get('gmm_stats_path'),
+            'metrics_path': row.get('metrics_path'),
+        }
+        for key in GMM_SUMMARY_METRIC_KEYS:
+            summary[key] = metrics.get(key)
+        rows.append(summary)
+    return rows
 
 
 def run(flags):
@@ -1732,6 +1803,7 @@ def run(flags):
         print(f'worker {runtime["process_index"]}: moe1-naive-k-ablation subprocess orchestration complete.')
         return
 
+    gmm_summary_rows = _gmm_summary_rows(gmm_cache)
     unique_analyses = [entry['analysis'] for entry in candidate_cache.values() if entry.get('analysis') is not None]
     all_moe_analyses = list(unique_analyses)
     if final_best_analysis is not None:
@@ -1781,6 +1853,7 @@ def run(flags):
         'loss_entropy_weight',
         'weight_decay',
         'source_var_target_std',
+        *GMM_SUMMARY_COLUMNS,
         fid_key,
         'valid_loss',
         'max_usage',
@@ -1805,6 +1878,30 @@ def run(flags):
     )
     image_paths['master_summary'] = str(summary_table)
 
+    gmm_table = _make_table_png(
+        gmm_summary_rows,
+        [
+            'run_name',
+            'K',
+            'gmm_var_mse_target_std',
+            'gmm_var_mse_weight',
+            'gmm_pi_kl_weight',
+            'valid_nll',
+            'train_valid_nll_gap',
+            'min_component_fraction',
+            'max_component_fraction',
+            'effective_num_components',
+            'near_dead_component_count',
+            'var_floor_hit_rate',
+            'var_floor_component_count',
+            'posterior_top1_prob_mean',
+            'center_distance_min',
+        ],
+        'GMM stage-1 health summary',
+        root / 'gmm_summary.png',
+    )
+    image_paths['gmm_summary'] = str(gmm_table)
+
     stage_table = _make_table_png(
         stage_summaries,
         [
@@ -1816,6 +1913,10 @@ def run(flags):
             'selected_gmm_var_mse_target_std',
             'selected_gmm_var_mse_weight',
             'selected_gmm_pi_kl_weight',
+            'selected_gmm_min_component_fraction',
+            'selected_gmm_effective_num_components',
+            'selected_gmm_near_dead_component_count',
+            'selected_gmm_valid_nll',
             'selected_fid',
             'selected_straightness_ratio_mean',
             'selected_conditioned_source_cluster_agreement',
@@ -1850,6 +1951,20 @@ def run(flags):
 
     _write_csv(root / 'master_summary.csv', summary_rows, summary_columns)
     _write_csv(
+        root / 'gmm_summary.csv',
+        gmm_summary_rows,
+        [
+            'run_name',
+            'K',
+            'gmm_var_mse_target_std',
+            'gmm_var_mse_weight',
+            'gmm_pi_kl_weight',
+            *GMM_SUMMARY_METRIC_KEYS,
+            'gmm_stats_path',
+            'metrics_path',
+        ],
+    )
+    _write_csv(
         root / 'stage_candidates.csv',
         stage_candidate_rows,
         [
@@ -1867,6 +1982,7 @@ def run(flags):
             'loss_entropy_weight',
             'weight_decay',
             'source_var_target_std',
+            *GMM_SUMMARY_COLUMNS,
             fid_key,
             'valid_loss',
             'conditioned_source_cluster_agreement',
@@ -1891,6 +2007,10 @@ def run(flags):
             'selected_gmm_var_mse_target_std',
             'selected_gmm_var_mse_weight',
             'selected_gmm_pi_kl_weight',
+            'selected_gmm_min_component_fraction',
+            'selected_gmm_effective_num_components',
+            'selected_gmm_near_dead_component_count',
+            'selected_gmm_valid_nll',
             'selected_fid',
             'selected_straightness_ratio_mean',
             'selected_conditioned_source_cluster_agreement',
@@ -1918,6 +2038,7 @@ def run(flags):
             'short_stage_params': sorted(SHORT_STAGE_PARAMS),
             'stage_summaries': stage_summaries,
             'stage_candidate_rows': stage_candidate_rows,
+            'gmm_summary_rows': gmm_summary_rows,
             'gmm_rows': list(gmm_cache.values()),
             'summary_rows': summary_rows,
             'image_paths': image_paths,

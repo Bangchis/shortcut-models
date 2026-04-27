@@ -336,24 +336,66 @@ def main(_):
     )
     train_vis_q = np.exp(train_vis_log_prob - train_vis_log_norm)
 
-    occupancy = stats_to_save['final_counts'] / np.maximum(np.sum(stats_to_save['final_counts']), 1e-8)
+    final_counts = np.asarray(stats_to_save['final_counts'], dtype=np.float64)
+    occupancy = final_counts / np.maximum(np.sum(final_counts), 1e-8)
+    uniform_fraction = 1.0 / max(int(FLAGS.gmm_num_modes), 1)
     occupancy_entropy = float(-np.sum(occupancy * np.log(np.maximum(occupancy, 1e-8))))
+    effective_num_components = float(np.exp(occupancy_entropy))
+    pi = np.asarray(stats_to_save['pi'], dtype=np.float64)
+    pi_entropy = float(-np.sum(pi * np.log(np.maximum(pi, 1e-8))))
+    pi_effective_num_components = float(np.exp(pi_entropy))
     posterior_entropy = -np.sum(valid_q * np.log(np.maximum(valid_q, 1e-8)), axis=-1)
     max_entropy = float(np.log(max(FLAGS.gmm_num_modes, 1))) if FLAGS.gmm_num_modes > 1 else 1.0
     posterior_entropy_normalized = posterior_entropy / max(max_entropy, 1e-8)
+    posterior_top1_prob = np.max(valid_q, axis=-1)
     q_sorted = np.sort(valid_q, axis=-1)
     posterior_margin = q_sorted[:, -1] - q_sorted[:, -2] if valid_q.shape[1] > 1 else q_sorted[:, -1]
     pairwise_center_distance = np.linalg.norm(
         stats_to_save['mu'][:, None, :] - stats_to_save['mu'][None, :, :],
         axis=-1,
     )
+    if pairwise_center_distance.shape[0] > 1:
+        pairwise_non_diag = pairwise_center_distance[
+            ~np.eye(pairwise_center_distance.shape[0], dtype=bool)
+        ]
+    else:
+        pairwise_non_diag = np.asarray([], dtype=np.float64)
+    var = np.asarray(stats_to_save['var'], dtype=np.float64)
+    component_var_mean = np.mean(var, axis=1)
+    component_std_mean = np.mean(np.sqrt(np.maximum(var, 0.0)), axis=1)
+    floor_mask = var <= (FLAGS.gmm_var_floor * 1.0001)
+    train_nll = float(stats_to_save['nll_trace'][-1])
+    valid_nll = _mean_nll(valid_latents_std)
+    nll_trace = np.asarray(stats_to_save['nll_trace'], dtype=np.float64)
+    nll_step_delta = np.diff(nll_trace) if nll_trace.shape[0] > 1 else np.asarray([], dtype=np.float64)
+    target_var = float(FLAGS.gmm_var_mse_target_std) ** 2
+    var_target_abs_error = np.abs(component_var_mean - target_var)
     gmm_metrics = {
         'gmm_num_modes': int(FLAGS.gmm_num_modes),
-        'train_nll': float(stats_to_save['nll_trace'][-1]),
-        'valid_nll': _mean_nll(valid_latents_std),
-        'dead_component_count': int(np.sum(stats_to_save['final_counts'] < 1.0)),
+        'train_nll': train_nll,
+        'valid_nll': valid_nll,
+        'train_valid_nll_gap': float(valid_nll - train_nll),
+        'nll_improvement': float(nll_trace[0] - nll_trace[-1]) if nll_trace.size > 0 else 0.0,
+        'nll_increase_step_count': int(np.sum(nll_step_delta > 1e-5)),
+        'dead_component_count': int(np.sum(final_counts < 1.0)),
+        'near_dead_component_count': int(np.sum(occupancy < (0.25 * uniform_fraction))),
+        'under_half_uniform_component_count': int(np.sum(occupancy < (0.5 * uniform_fraction))),
+        'min_component_count': float(np.min(final_counts)),
+        'max_component_count': float(np.max(final_counts)),
+        'min_component_fraction': float(np.min(occupancy)),
+        'p05_component_fraction': float(np.percentile(occupancy, 5)),
+        'median_component_fraction': float(np.percentile(occupancy, 50)),
         'max_component_fraction': float(np.max(occupancy)),
+        'component_fraction_std': float(np.std(occupancy)),
         'occupancy_entropy': occupancy_entropy,
+        'occupancy_entropy_normalized': float(occupancy_entropy / max(max_entropy, 1e-8)),
+        'effective_num_components': effective_num_components,
+        'effective_component_fraction': float(effective_num_components / max(int(FLAGS.gmm_num_modes), 1)),
+        'pi_min': float(np.min(pi)),
+        'pi_max': float(np.max(pi)),
+        'pi_entropy': pi_entropy,
+        'pi_entropy_normalized': float(pi_entropy / max(max_entropy, 1e-8)),
+        'pi_effective_num_components': pi_effective_num_components,
         'posterior_entropy_mean': float(np.mean(posterior_entropy)),
         'posterior_entropy_std': float(np.std(posterior_entropy)),
         'posterior_entropy_min': float(np.min(posterior_entropy)),
@@ -362,8 +404,29 @@ def main(_):
         'posterior_entropy_p50': float(np.percentile(posterior_entropy, 50)),
         'posterior_entropy_p95': float(np.percentile(posterior_entropy, 95)),
         'posterior_entropy_normalized_mean': float(np.mean(posterior_entropy_normalized)),
+        'posterior_top1_prob_mean': float(np.mean(posterior_top1_prob)),
+        'posterior_top1_prob_p05': float(np.percentile(posterior_top1_prob, 5)),
+        'posterior_top1_prob_p50': float(np.percentile(posterior_top1_prob, 50)),
         'posterior_top1_margin_mean': float(np.mean(posterior_margin)),
+        'posterior_top1_margin_p05': float(np.percentile(posterior_margin, 5)),
         'var_floor_hit_rate': float(np.mean(stats_to_save['var'] <= (FLAGS.gmm_var_floor * 1.0001))),
+        'var_floor_component_count': int(np.sum(np.any(floor_mask, axis=1))),
+        'var_mean': float(np.mean(var)),
+        'var_min': float(np.min(var)),
+        'var_p05': float(np.percentile(var, 5)),
+        'var_median': float(np.percentile(var, 50)),
+        'var_max': float(np.max(var)),
+        'component_var_mean_min': float(np.min(component_var_mean)),
+        'component_var_mean_max': float(np.max(component_var_mean)),
+        'component_var_mean_std': float(np.std(component_var_mean)),
+        'component_std_mean_min': float(np.min(component_std_mean)),
+        'component_std_mean_max': float(np.max(component_std_mean)),
+        'component_std_mean_std': float(np.std(component_std_mean)),
+        'var_target_abs_error_mean': float(np.mean(var_target_abs_error)),
+        'var_target_abs_error_max': float(np.max(var_target_abs_error)),
+        'center_distance_min': float(np.min(pairwise_non_diag)) if pairwise_non_diag.size > 0 else 0.0,
+        'center_distance_mean': float(np.mean(pairwise_non_diag)) if pairwise_non_diag.size > 0 else 0.0,
+        'center_distance_p05': float(np.percentile(pairwise_non_diag, 5)) if pairwise_non_diag.size > 0 else 0.0,
         'n_train_used': int(target_examples),
         'n_valid_used': int(valid_latents.shape[0]),
         'gmm_save_path': FLAGS.gmm_save_path,
@@ -493,6 +556,23 @@ def main(_):
         ax.set_title('Component Occupancy')
         ax.set_xlabel('Component')
         ax.set_ylabel('Fraction')
+        ax.axhline(uniform_fraction, color='black', linestyle='--', linewidth=1.0, label='uniform')
+        ax.axhline(0.25 * uniform_fraction, color='red', linestyle=':', linewidth=1.0, label='near-dead')
+        ax.text(
+            0.02,
+            0.95,
+            (
+                f'min_frac={np.min(occupancy):.4f}\n'
+                f'max_frac={np.max(occupancy):.4f}\n'
+                f'eff_K={effective_num_components:.2f}/{FLAGS.gmm_num_modes}'
+            ),
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.8, edgecolor='none'),
+        )
+        ax.legend(loc='upper right')
         figure_paths['occupancy'] = _save_figure(fig, figures_dir, 'occupancy')
 
         fig, ax = plt.subplots(figsize=(7, 4))
