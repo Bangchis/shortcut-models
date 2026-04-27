@@ -38,11 +38,16 @@ def default_wandb_config():
 
     config.unique_identifier = ""  # Unique identifier for run (will be automatically generated unless provided)
     config.random_delay = 0  # Random delay for wandb.init (in seconds)
+    config.service_wait = 30  # W&B internal service wait in seconds.
+    config.start_method = "thread"  # W&B process start method.
+    config.disable_stats = 0  # Disable W&B system stats collection.
+    config.save_code = 1  # Save code snapshot to W&B.
     return config
 
 
 def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=None, name=None,
-    unique_identifier="", offline=False, random_delay=0, run_id='None', **additional_init_kwargs):
+    unique_identifier="", offline=False, random_delay=0, run_id='None', service_wait=30,
+    start_method="thread", disable_stats=0, save_code=1, **additional_init_kwargs):
     if "exp_descriptor" in additional_init_kwargs:
         # Remove deprecated exp_descriptor
         additional_init_kwargs.pop("exp_descriptor")
@@ -77,12 +82,22 @@ def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=Non
     print(wandb_output_dir)
     tags = [group] if group is not None else None
 
+    settings_kwargs = dict(
+        start_method=start_method,
+        _disable_stats=bool(disable_stats),
+    )
+    try:
+        settings = wandb.Settings(
+            **settings_kwargs,
+            _service_wait=service_wait,
+        )
+    except TypeError:
+        settings = wandb.Settings(**settings_kwargs)
+
     init_kwargs = dict(
         config=hyperparam_dict, project=project, entity=entity, tags=tags, group=group, dir=wandb_output_dir,
-        id=experiment_id, name=name, settings=wandb.Settings(
-            start_method="thread",
-            _disable_stats=False,
-        ), mode="offline" if offline else "online", save_code=True,
+        id=experiment_id, name=name, settings=settings,
+        mode="offline" if offline else "online", save_code=bool(save_code),
     )
     init_kwargs.update(additional_init_kwargs)
 
