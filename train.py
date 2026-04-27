@@ -88,6 +88,21 @@ flags.DEFINE_integer(
     -1,
     'Validation samples for each GMM fit in mode=moe1-naive-k-ablation. -1 means full split.',
 )
+flags.DEFINE_float(
+    'moe1_gmm_var_mse_target_std',
+    0.0,
+    'Forwards to data_prep.py --gmm_var_mse_target_std. Target sigma for per-mode mean-variance MSE.',
+)
+flags.DEFINE_float(
+    'moe1_gmm_var_mse_weight',
+    0.0,
+    'Forwards to data_prep.py --gmm_var_mse_weight. beta_var in [0,1] (per-iter pull fraction).',
+)
+flags.DEFINE_float(
+    'moe1_gmm_pi_kl_weight',
+    0.0,
+    'Forwards to data_prep.py --gmm_pi_kl_weight. beta_pi in [0,1] (uniform-blend strength).',
+)
 flags.DEFINE_string(
     'moe1_tau_values',
     '0.75,1.0,1.5,2.0,3.0',

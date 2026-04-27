@@ -116,7 +116,13 @@ def fit_diag_gmm(
     var_floor,
     weight_prior,
     use_kmeanspp,
+    var_mse_target_std=0.0,
+    var_mse_weight=0.0,
+    pi_kl_weight=0.0,
 ):
+    sigma_target_sq = float(var_mse_target_std) ** 2
+    beta_var = float(np.clip(var_mse_weight, 0.0, 1.0))
+    beta_pi = float(np.clip(pi_kl_weight, 0.0, 1.0))
     num_examples, latent_dim = latents_std.shape
     best_state = None
     best_nll = np.inf
@@ -161,7 +167,16 @@ def fit_diag_gmm(
             safe_counts = np.maximum(counts, 1e-6)
             mu_new = (sum_x / safe_counts[:, None]).astype(np.float32)
             second_moment = (sum_x2 / safe_counts[:, None]).astype(np.float32)
-            var_new = np.maximum(second_moment - mu_new * mu_new, var_floor).astype(np.float32)
+            var_em = (second_moment - mu_new * mu_new).astype(np.float64)
+            if beta_var > 0.0:
+                # MAP-EM proximal step on penalty:
+                #   L_var = (1/K) sum_k (mean_j sigma_{k,j}^2 - sigma_target^2)^2
+                # Reparam beta_var = 2*lambda_var / (K*d) in [0,1] (one-step pull).
+                #   sigma_{k,j}^new = sigma_{k,j}^em - beta_var * (mean_j sigma_{k,j}^em - sigma_target^2)
+                mean_var_per_mode = var_em.mean(axis=1, keepdims=True)
+                shift = beta_var * (mean_var_per_mode - sigma_target_sq)
+                var_em = var_em - shift
+            var_new = np.maximum(var_em, var_floor).astype(np.float32)
 
             dead_mask = counts < 1.0
             if np.any(dead_mask):
@@ -170,8 +185,13 @@ def fit_diag_gmm(
                 global_var = np.var(np.asarray(latents_std), axis=0, dtype=np.float64).astype(np.float32)
                 var_new[dead_mask] = np.maximum(global_var, var_floor)
 
+            # pi M-step: standard Dirichlet smoothing, then convex blend with uniform.
+            # beta_pi in [0,1] is the exact reparameterization of DKL(U||pi) penalty:
+            #   pi_k = (1-beta_pi) * pi_k^em + beta_pi / K
+            # Equivalent to lambda_pi = beta_pi * (N + K*weight_prior) / (1 - beta_pi).
             counts_with_prior = counts + weight_prior
-            pi_new = (counts_with_prior / np.sum(counts_with_prior)).astype(np.float32)
+            pi_em = counts_with_prior / np.sum(counts_with_prior)
+            pi_new = ((1.0 - beta_pi) * pi_em + beta_pi / float(num_modes)).astype(np.float32)
 
             pi = pi_new
             mu = mu_new

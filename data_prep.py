@@ -45,6 +45,25 @@ flags.DEFINE_integer('gmm_init_seed', 0, 'Seed for GMM initialization.')
 flags.DEFINE_float('gmm_standardize_eps', 1e-6, 'Epsilon used for latent standardization.')
 flags.DEFINE_float('gmm_var_floor', 1e-4, 'Minimum variance for every GMM dimension.')
 flags.DEFINE_float('gmm_weight_prior', 1e-2, 'Pseudo-count added to each mixture component.')
+flags.DEFINE_float(
+    'gmm_var_mse_target_std',
+    0.0,
+    'Target sigma for per-mode mean-variance MSE penalty (sigma_target). '
+    'Penalty: (1/K) sum_k (mean_j sigma_{k,j}^2 - sigma_target^2)^2. '
+    'Set 0 (with weight 0) to disable.',
+)
+flags.DEFINE_float(
+    'gmm_var_mse_weight',
+    0.0,
+    'beta_var in [0,1]: per-iter fraction of mean-variance correction toward target. '
+    'beta_var = 2*lambda_var/(K*d). 0=off, 1=full pull each EM iter.',
+)
+flags.DEFINE_float(
+    'gmm_pi_kl_weight',
+    0.0,
+    'beta_pi in [0,1]: exact reparam of DKL(U||pi) penalty as convex blend with uniform. '
+    '0=pure Dirichlet+EM, 1=force pi exactly uniform.',
+)
 flags.DEFINE_integer('gmm_kmeanspp_init', 1, 'Whether to use kmeans++-style initialization.')
 flags.DEFINE_integer('gmm_em_chunk_size', 1024, 'Chunk size for E-step/M-step accumulation.')
 flags.DEFINE_integer('gmm_keep_latent_cache', 0, 'Whether to keep the latent cache file after fitting.')
@@ -145,6 +164,9 @@ def main(_):
                 'gmm_em_restarts': FLAGS.gmm_em_restarts,
                 'gmm_var_floor': FLAGS.gmm_var_floor,
                 'gmm_weight_prior': FLAGS.gmm_weight_prior,
+                'gmm_var_mse_target_std': FLAGS.gmm_var_mse_target_std,
+                'gmm_var_mse_weight': FLAGS.gmm_var_mse_weight,
+                'gmm_pi_kl_weight': FLAGS.gmm_pi_kl_weight,
                 'gmm_fit_samples': FLAGS.gmm_fit_samples,
             },
             **FLAGS.wandb,
@@ -245,6 +267,9 @@ def main(_):
         var_floor=FLAGS.gmm_var_floor,
         weight_prior=FLAGS.gmm_weight_prior,
         use_kmeanspp=bool(FLAGS.gmm_kmeanspp_init),
+        var_mse_target_std=FLAGS.gmm_var_mse_target_std,
+        var_mse_weight=FLAGS.gmm_var_mse_weight,
+        pi_kl_weight=FLAGS.gmm_pi_kl_weight,
     )
 
     stats_to_save = {

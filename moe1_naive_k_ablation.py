@@ -406,6 +406,9 @@ def _run_gmm(flags, root, k, runtime):
         f'--metrics_output_path={metrics_path}',
         f'--gmm_fit_samples={int(flags.moe1_gmm_fit_samples)}',
         f'--gmm_valid_samples={int(flags.moe1_gmm_valid_samples)}',
+        f'--gmm_var_mse_target_std={float(flags.moe1_gmm_var_mse_target_std)}',
+        f'--gmm_var_mse_weight={float(flags.moe1_gmm_var_mse_weight)}',
+        f'--gmm_pi_kl_weight={float(flags.moe1_gmm_pi_kl_weight)}',
         '--gmm_keep_latent_cache=0',
         '--gmm_wandb_level=summary',
     ]
