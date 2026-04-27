@@ -6,7 +6,13 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
-from gmm_utils import flatten_latents, posterior_from_stats
+from gmm_utils import (
+    assign_angular_codes,
+    build_source_base,
+    flatten_and_standardize,
+    posterior_from_standardized,
+    sample_lognormal_radius,
+)
 
 def eval_model(
     FLAGS,
@@ -42,6 +48,13 @@ def eval_model(
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
         eps = jax.random.normal(key, batch_images.shape)
         alpha = float(FLAGS.model['kfm_alpha']) if FLAGS.model['train_type'] == 'khoat-fm' else 1.0
+        source_standardize_eps = 1e-6
+        source_local_eta = 0.5
+        if FLAGS.model.train_type == 'naive-moe-source':
+            source_standardize_eps = float(np.asarray(
+                gmm_state.get('standardize_eps', np.array(1e-6, dtype=np.float32))))
+            source_local_eta = float(np.asarray(
+                gmm_state.get('local_eta', np.array(FLAGS.model.local_eta, dtype=np.float32))))
 
         def process_img(img):
             if FLAGS.model.use_stable_vae:
@@ -60,63 +73,113 @@ def eval_model(
             output = call_fn(images, t, dt, labels, train=False)
             return output
 
-        @partial(jax.jit, static_argnums=(3, 4))
-        def call_source(train_state, latents, condition, return_experts=False, use_ema=True):
+        @partial(jax.jit, static_argnums=(6,))
+        def call_source(train_state, z, x_base, modes, angular_codes, log_radius, use_ema=True):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_source_ema
             else:
                 call_fn = train_state.call_source
-            return call_fn(latents, condition, return_experts=return_experts)
+            return call_fn(z, x_base, modes, angular_codes, log_radius)
 
         def sample_source_prior(sample_key, batch_shape):
             if FLAGS.model.train_type != 'naive-moe-source':
                 return shard_data(jax.random.normal(sample_key, batch_shape))
-            z_key, cond_key, x0_key = jax.random.split(sample_key, 3)
+            z_key, mode_key, angular_key, radius_key, x0_key = jax.random.split(sample_key, 5)
             z = jax.random.normal(z_key, batch_shape)
             sampled_modes = jax.random.categorical(
-                cond_key,
+                mode_key,
                 jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
                 shape=(batch_shape[0],),
             )
-            condition = jax.nn.one_hot(
-                sampled_modes,
-                FLAGS.model['gmm_num_modes'],
-                dtype=jnp.float32,
+            angular_probs = gmm_state['angular_pi'][sampled_modes]
+            angular_codes = jax.random.categorical(
+                angular_key,
+                jnp.log(jnp.maximum(angular_probs, 1e-8)),
+                axis=-1,
             )
-            z, condition = shard_data(z, condition)
-            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition)
-            x0_key = shard_data(jax.random.normal(x0_key, batch_shape))
-            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
+            radius, log_radius = sample_lognormal_radius(
+                radius_key,
+                sampled_modes,
+                angular_codes,
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
+            )
+            x_base, _ = build_source_base(
+                sampled_modes,
+                angular_codes,
+                radius,
+                batch_shape[1:],
+                gmm_state['mean'],
+                gmm_state['std'],
+                source_standardize_eps,
+                gmm_state['mu'],
+                gmm_state['var'],
+                gmm_state['angular_centers'],
+                source_local_eta,
+                eps=FLAGS.model['source_eps'],
+            )
+            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
+                z, x_base, sampled_modes, angular_codes, log_radius)
+            mu_x0, log_sigma, _ = call_source(
+                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
+            eps_x0 = shard_data(jax.random.normal(x0_key, batch_shape))
+            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
                 return latents
-            z_key, mode_key, x0_key = jax.random.split(sample_key, 3)
-            flat_latents = flatten_latents(latents)
-            q = posterior_from_stats(
-                flat_latents,
+            z_key, radius_key, x0_key = jax.random.split(sample_key, 3)
+            latents_std = flatten_and_standardize(
+                latents,
                 gmm_state['mean'],
                 gmm_state['std'],
-                float(np.asarray(gmm_state.get('standardize_eps', np.array(1e-6, dtype=np.float32)))),
+                source_standardize_eps,
+            )
+            q = posterior_from_standardized(
+                latents_std,
                 gmm_state['log_pi'],
                 gmm_state['mu'],
                 gmm_state['var'],
             )
-            sampled_modes = jax.random.categorical(
-                mode_key,
-                jnp.log(jnp.maximum(q, 1e-8)),
-                axis=-1,
-            )
-            condition_weights = jax.nn.one_hot(
+            sampled_modes = jnp.argmax(q, axis=-1).astype(jnp.int32)
+            angular_codes, _ = assign_angular_codes(
+                latents_std,
                 sampled_modes,
-                FLAGS.model['gmm_num_modes'],
-                dtype=jnp.float32,
+                gmm_state['mu'],
+                gmm_state['var'],
+                gmm_state['angular_centers'],
+                source_local_eta,
+                eps=FLAGS.model['source_eps'],
+            )
+            angular_codes = angular_codes.astype(jnp.int32)
+            radius, log_radius = sample_lognormal_radius(
+                radius_key,
+                sampled_modes,
+                angular_codes,
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
+            )
+            x_base, _ = build_source_base(
+                sampled_modes,
+                angular_codes,
+                radius,
+                latents.shape[1:],
+                gmm_state['mean'],
+                gmm_state['std'],
+                source_standardize_eps,
+                gmm_state['mu'],
+                gmm_state['var'],
+                gmm_state['angular_centers'],
+                source_local_eta,
+                eps=FLAGS.model['source_eps'],
             )
             z = jax.random.normal(z_key, latents.shape)
-            z, condition_weights = shard_data(z, condition_weights)
-            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition_weights)
-            x0_key = shard_data(jax.random.normal(x0_key, latents.shape))
-            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
+            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
+                z, x_base, sampled_modes, angular_codes, log_radius)
+            mu_x0, log_sigma, _ = call_source(
+                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
+            eps_x0 = shard_data(jax.random.normal(x0_key, latents.shape))
+            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:
@@ -187,7 +250,7 @@ def eval_model(
                 eps_tile = jnp.repeat(eps, 8, axis=0)[:valid_images.shape[0]]
                 valid_images_tile = jnp.repeat(valid_images, 8, axis=0)[:valid_images.shape[0]]
                 t_full = t[..., None, None, None]
-                x_t = (1 - (1 - 1e-5) * t_full) * eps_tile + t_full * valid_images_tile
+                x_t = (1 - t_full) * eps_tile + t_full * valid_images_tile
                 x_t, t, dt_base = shard_data(x_t, t, dt_base)
                 v_pred = call_model(train_state, x_t, t, dt_base, valid_labels_sharded if FLAGS.model.cfg_scale != 0 else labels_uncond)
                 x_1_pred = x_t + v_pred * (1-t[..., None, None, None])

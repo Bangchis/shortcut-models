@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import os
 from functools import partial
 from absl import app, flags
+from gmm_utils import build_source_base, sample_lognormal_radius
 
 flags.DEFINE_integer('inference_timesteps', 128, 'Number of timesteps for inference.')
 flags.DEFINE_integer('inference_generations', 4096, 'Number of generations for inference.')
@@ -41,6 +42,13 @@ def do_inference(
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
         eps = jax.random.normal(key, batch_images.shape)
+        source_standardize_eps = 1e-6
+        source_local_eta = 0.5
+        if FLAGS.model.train_type == 'naive-moe-source':
+            source_standardize_eps = float(np.asarray(
+                gmm_state.get('standardize_eps', np.array(1e-6, dtype=np.float32))))
+            source_local_eta = float(np.asarray(
+                gmm_state.get('local_eta', np.array(FLAGS.model.local_eta, dtype=np.float32))))
 
         def process_img(img):
             if FLAGS.model.use_stable_vae:
@@ -59,34 +67,58 @@ def do_inference(
             output = call_fn(images, t, dt, labels, train=False)
             return output
 
-        @partial(jax.jit, static_argnums=(3, 4))
-        def call_source(train_state, latents, condition, return_experts=False, use_ema=True):
+        @partial(jax.jit, static_argnums=(6,))
+        def call_source(train_state, z, x_base, modes, angular_codes, log_radius, use_ema=True):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_source_ema
             else:
                 call_fn = train_state.call_source
-            return call_fn(latents, condition, return_experts=return_experts)
+            return call_fn(z, x_base, modes, angular_codes, log_radius)
 
         def sample_source_prior(sample_key):
             if FLAGS.model.train_type != 'naive-moe-source':
                 latents = jax.random.normal(sample_key, images_shape)
                 return shard_data(latents)
-            z_key, cond_key, x0_key = jax.random.split(sample_key, 3)
+            z_key, mode_key, angular_key, radius_key, x0_key = jax.random.split(sample_key, 5)
             z = jax.random.normal(z_key, images_shape)
             sampled_modes = jax.random.categorical(
-                cond_key,
+                mode_key,
                 jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
                 shape=(images_shape[0],),
             )
-            condition = jax.nn.one_hot(
-                sampled_modes,
-                FLAGS.model['gmm_num_modes'],
-                dtype=jnp.float32,
+            angular_probs = gmm_state['angular_pi'][sampled_modes]
+            angular_codes = jax.random.categorical(
+                angular_key,
+                jnp.log(jnp.maximum(angular_probs, 1e-8)),
+                axis=-1,
             )
-            z, condition = shard_data(z, condition)
-            mu_x0, logvar_x0, _, _ = call_source(train_state, z, condition)
-            x0_key = shard_data(jax.random.normal(x0_key, images_shape))
-            return mu_x0 + x0_key * jnp.exp(0.5 * logvar_x0)
+            radius, log_radius = sample_lognormal_radius(
+                radius_key,
+                sampled_modes,
+                angular_codes,
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
+            )
+            x_base, _ = build_source_base(
+                sampled_modes,
+                angular_codes,
+                radius,
+                images_shape[1:],
+                gmm_state['mean'],
+                gmm_state['std'],
+                source_standardize_eps,
+                gmm_state['mu'],
+                gmm_state['var'],
+                gmm_state['angular_centers'],
+                source_local_eta,
+                eps=FLAGS.model['source_eps'],
+            )
+            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
+                z, x_base, sampled_modes, angular_codes, log_radius)
+            mu_x0, log_sigma, _ = call_source(
+                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
+            eps_x0 = shard_data(jax.random.normal(x0_key, images_shape))
+            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
         
         if FLAGS.mode == 'interpolate':
             seed = 5

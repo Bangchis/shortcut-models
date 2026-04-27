@@ -1,179 +1,140 @@
+import math
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
 
-def sample_diag_gaussian(key, mu, logvar):
+def sample_source_gaussian(key, mu, log_sigma):
     eps = jax.random.normal(key, mu.shape)
-    return mu + eps * jnp.exp(0.5 * logvar)
+    return mu + eps * jnp.exp(log_sigma)
 
 
-def var_only_kld_loss(var, logvar, target_std=1.0, eps=1e-6):
-    target_var = jnp.maximum(jnp.asarray(target_std, dtype=var.dtype) ** 2, eps)
-    var_star = var / target_var
-    logvar_star = logvar - jnp.log(target_var)
-    return -0.5 * jnp.mean(1.0 + logvar_star - var_star)
+def source_sigma_floor_loss(log_sigma, sigma_min):
+    log_sigma_min = jnp.log(jnp.asarray(sigma_min, dtype=log_sigma.dtype))
+    return jnp.mean(jnp.maximum(0.0, log_sigma_min - log_sigma) ** 2)
 
 
-class ConditionProjector(nn.Module):
-    condition_dim: int
-    hidden_channels: int
-
-    @nn.compact
-    def __call__(self, condition_embedding):
-        x = nn.Dense(self.hidden_channels)(condition_embedding)
-        x = nn.silu(x)
-        x = nn.Dense(self.hidden_channels)(x)
-        return x
+def _valid_num_groups(channels, preferred):
+    for groups in range(min(channels, preferred), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
 
 
-class SharedTrunk(nn.Module):
-    hidden_channels: int
+class FiLMResBlock(nn.Module):
+    channels: int
+    cond_dim: int
+    kernel_size: int = 3
+    num_groups: int = 8
 
     @nn.compact
-    def __call__(self, z):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(z)
+    def __call__(self, h, cond):
+        residual = h
+        groups = _valid_num_groups(self.channels, self.num_groups)
+
+        x = nn.GroupNorm(num_groups=groups)(h)
+        film = nn.Dense(
+            self.channels * 2,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='film_0',
+        )(cond)
+        scale, bias = jnp.split(film, 2, axis=-1)
+        x = x * (1.0 + scale[:, None, None, :]) + bias[:, None, None, :]
         x = nn.silu(x)
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(x)
+        x = nn.Conv(
+            self.channels,
+            (self.kernel_size, self.kernel_size),
+            padding='SAME',
+            name='conv_0',
+        )(x)
+
+        x = nn.GroupNorm(num_groups=groups)(x)
+        film = nn.Dense(
+            self.channels * 2,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='film_1',
+        )(cond)
+        scale, bias = jnp.split(film, 2, axis=-1)
+        x = x * (1.0 + scale[:, None, None, :]) + bias[:, None, None, :]
         x = nn.silu(x)
-        return x
+        x = nn.Conv(
+            self.channels,
+            (self.kernel_size, self.kernel_size),
+            padding='SAME',
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='conv_1',
+        )(x)
+        return residual + x
 
 
-class Router(nn.Module):
-    hidden_channels: int
+class SourceBaseNet(nn.Module):
     num_modes: int
-    tau: float
-
-    @nn.compact
-    def __call__(self, features):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(features)
-        x = nn.silu(x)
-        x = jnp.mean(x, axis=(1, 2))
-        logits = nn.Dense(self.num_modes)(x)
-        alpha = nn.softmax(logits / self.tau, axis=-1)
-        return alpha, logits
-
-
-class SourceExpert(nn.Module):
-    hidden_channels: int
+    angular_num_submodes: int
+    condition_dim: int
+    channels: int
+    num_blocks: int
     out_channels: int
-    zero_init: bool
-    logvar_min: float
-    logvar_max: float
+    sigma_init: float
+    kernel_size: int = 3
+    num_groups: int = 8
 
     @nn.compact
-    def __call__(self, features):
-        x = nn.Conv(self.hidden_channels, (3, 3), padding='SAME')(features)
-        x = nn.silu(x)
-        if self.zero_init:
-            kernel_init = nn.initializers.zeros
-            mu_bias_init = nn.initializers.zeros
-            logvar_bias_init = nn.initializers.zeros
-        else:
-            kernel_init = nn.initializers.lecun_normal()
-            mu_bias_init = nn.initializers.zeros
-            logvar_bias_init = nn.initializers.zeros
-        mu = nn.Conv(
+    def __call__(self, z, x_base, modes, angular_codes, log_radius):
+        mode_embed = nn.Embed(
+            num_embeddings=self.num_modes,
+            features=self.condition_dim,
+            name='mode_embed',
+        )(modes)
+        angular_embed = nn.Embed(
+            num_embeddings=self.angular_num_submodes,
+            features=self.condition_dim,
+            name='angular_embed',
+        )(angular_codes)
+        cond = jnp.concatenate(
+            [mode_embed, angular_embed, log_radius[:, None]], axis=-1)
+        cond = nn.Dense(self.condition_dim * 4, name='cond_dense_0')(cond)
+        cond = nn.silu(cond)
+        cond = nn.Dense(self.condition_dim * 4, name='cond_dense_1')(cond)
+        cond = nn.silu(cond)
+
+        h = jnp.concatenate([z, x_base], axis=-1)
+        h = nn.Conv(
+            self.channels,
+            (self.kernel_size, self.kernel_size),
+            padding='SAME',
+            name='input_conv',
+        )(h)
+        for idx in range(self.num_blocks):
+            h = FiLMResBlock(
+                channels=self.channels,
+                cond_dim=self.condition_dim * 4,
+                kernel_size=self.kernel_size,
+                num_groups=self.num_groups,
+                name=f'resblock_{idx}',
+            )(h, cond)
+
+        groups = _valid_num_groups(self.channels, self.num_groups)
+        h = nn.GroupNorm(num_groups=groups, name='out_norm')(h)
+        h = nn.silu(h)
+        delta_mu = nn.Conv(
             self.out_channels,
             (3, 3),
             padding='SAME',
-            kernel_init=kernel_init,
-            bias_init=mu_bias_init,
-            name='mu_head',
-        )(x)
-        logvar = nn.Conv(
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='delta_mu_head',
+        )(h)
+        log_sigma = nn.Conv(
             self.out_channels,
             (3, 3),
             padding='SAME',
-            kernel_init=kernel_init,
-            bias_init=logvar_bias_init,
-            name='logvar_head',
-        )(x)
-        logvar = jnp.clip(logvar, self.logvar_min, self.logvar_max)
-        return mu, logvar
-
-
-class SourceMoE(nn.Module):
-    num_modes: int
-    condition_dim: int
-    hidden_channels: int
-    out_channels: int
-    tau: float
-    soft_moe: bool
-    var_eps: float
-    logvar_min: float
-    logvar_max: float
-    zero_init: bool = True
-
-    @nn.compact
-    def __call__(self, z, condition_weights, return_experts=False):
-        mode_embeddings = self.param(
-            'mode_embeddings',
-            nn.initializers.normal(stddev=0.02),
-            (self.num_modes, self.condition_dim),
-        )
-        condition_embedding = jnp.matmul(condition_weights, mode_embeddings)
-        condition_bias = ConditionProjector(
-            condition_dim=self.condition_dim,
-            hidden_channels=self.hidden_channels,
-            name='condition_projector',
-        )(condition_embedding)
-        condition_bias = condition_bias[:, None, None, :]
-
-        features = SharedTrunk(
-            hidden_channels=self.hidden_channels,
-            name='shared_trunk',
-        )(z)
-        conditioned_features = features + condition_bias
-
-        alpha, logits = Router(
-            hidden_channels=self.hidden_channels,
-            num_modes=self.num_modes,
-            tau=self.tau,
-            name='router',
-        )(conditioned_features)
-
-        expert_mu = []
-        expert_logvar = []
-        for idx in range(self.num_modes):
-            mu_j, logvar_j = SourceExpert(
-                hidden_channels=self.hidden_channels,
-                out_channels=self.out_channels,
-                zero_init=self.zero_init,
-                logvar_min=self.logvar_min,
-                logvar_max=self.logvar_max,
-                name=f'expert_{idx}',
-            )(conditioned_features)
-            expert_mu.append(mu_j)
-            expert_logvar.append(logvar_j)
-
-        expert_mu = jnp.stack(expert_mu, axis=1)
-        expert_logvar = jnp.stack(expert_logvar, axis=1)
-        expert_var = jnp.exp(expert_logvar)
-
-        if self.soft_moe:
-            alpha_mix = alpha
-        else:
-            alpha_mix = jax.nn.one_hot(
-                jnp.argmax(alpha, axis=-1),
-                self.num_modes,
-                dtype=alpha.dtype,
-            )
-
-        alpha_full = alpha_mix[:, :, None, None, None]
-        mu_x0 = jnp.sum(expert_mu * alpha_full, axis=1)
-        second_moment = jnp.sum(alpha_full * (expert_var + expert_mu ** 2), axis=1)
-        var_x0 = jnp.maximum(second_moment - mu_x0 ** 2, self.var_eps)
-        logvar_x0 = jnp.log(var_x0 + self.var_eps)
-
-        if return_experts:
-            return (
-                mu_x0,
-                logvar_x0,
-                var_x0,
-                alpha,
-                expert_mu,
-                expert_logvar,
-                logits,
-            )
-        return mu_x0, logvar_x0, var_x0, alpha
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.constant(math.log(self.sigma_init)),
+            name='log_sigma_head',
+        )(h)
+        mu_x0 = x_base + delta_mu
+        return mu_x0, log_sigma, delta_mu

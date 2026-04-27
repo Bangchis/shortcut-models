@@ -14,10 +14,18 @@ def standardize_latents(latents_flat, mean, std, eps):
     return (latents_flat - mean) / (std + eps)
 
 
+def unstandardize_latents(latents_std, mean, std, eps):
+    return latents_std * (std + eps) + mean
+
+
+def flatten_and_standardize(latents, mean, std, eps):
+    return standardize_latents(flatten_latents(latents), mean, std, eps)
+
+
 @jax.jit
-def diag_gmm_log_prob(x, log_pi, mu, var):
-    dim = x.shape[-1]
-    diff = x[:, None, :] - mu[None, :, :]
+def diag_gmm_log_prob(x_std, log_pi, mu, var):
+    dim = x_std.shape[-1]
+    diff = x_std[:, None, :] - mu[None, :, :]
     quad = jnp.sum((diff * diff) / var[None, :, :], axis=-1)
     log_det = jnp.sum(jnp.log(var), axis=-1)
     normalizer = dim * math.log(2.0 * math.pi)
@@ -25,11 +33,16 @@ def diag_gmm_log_prob(x, log_pi, mu, var):
 
 
 @jax.jit
-def posterior_from_stats(latents_flat, mean, std, eps, log_pi, mu, var):
-    latents_std = standardize_latents(latents_flat, mean, std, eps)
-    log_prob = diag_gmm_log_prob(latents_std, log_pi, mu, var)
+def posterior_from_standardized(x_std, log_pi, mu, var):
+    log_prob = diag_gmm_log_prob(x_std, log_pi, mu, var)
     log_norm = jsp.special.logsumexp(log_prob, axis=-1, keepdims=True)
     return jnp.exp(log_prob - log_norm)
+
+
+@jax.jit
+def posterior_from_stats(latents_flat, mean, std, eps, log_pi, mu, var):
+    latents_std = standardize_latents(latents_flat, mean, std, eps)
+    return posterior_from_standardized(latents_std, log_pi, mu, var)
 
 
 @jax.jit
@@ -41,7 +54,11 @@ def chunk_em_stats(latents_std, log_pi, mu, var):
     sum_x = jnp.einsum('bk,bd->kd', responsibilities, latents_std)
     sum_x2 = jnp.einsum('bk,bd->kd', responsibilities, latents_std * latents_std)
     nll = -jnp.sum(log_norm)
-    return counts, sum_x, sum_x2, nll
+    entropy = -jnp.sum(
+        responsibilities * jnp.log(jnp.maximum(responsibilities, 1e-8)))
+    hard_counts = jnp.bincount(
+        jnp.argmax(responsibilities, axis=-1), length=mu.shape[0])
+    return counts, sum_x, sum_x2, nll, entropy, hard_counts
 
 
 @jax.jit
@@ -69,9 +86,12 @@ def kmeanspp_init(latents_std, num_modes, seed, chunk_size):
     for _ in range(1, num_modes):
         center = jnp.asarray(centers[-1], dtype=jnp.float32)
         for start, stop in _chunk_slices(latents_std.shape[0], chunk_size):
-            latents_chunk = jnp.asarray(np.asarray(latents_std[start:stop]), dtype=jnp.float32)
-            dist_chunk = np.asarray(jax.device_get(squared_distance_chunk(latents_chunk, center)))
-            min_distances[start:stop] = np.minimum(min_distances[start:stop], dist_chunk)
+            latents_chunk = jnp.asarray(
+                np.asarray(latents_std[start:stop]), dtype=jnp.float32)
+            dist_chunk = np.asarray(jax.device_get(
+                squared_distance_chunk(latents_chunk, center)))
+            min_distances[start:stop] = np.minimum(
+                min_distances[start:stop], dist_chunk)
 
         probs = min_distances / np.sum(min_distances)
         idx = int(rng.choice(latents_std.shape[0], p=probs))
@@ -82,7 +102,8 @@ def kmeanspp_init(latents_std, num_modes, seed, chunk_size):
 
 def random_init(latents_std, num_modes, seed):
     rng = np.random.default_rng(seed)
-    indices = rng.choice(latents_std.shape[0], size=num_modes, replace=False)
+    replace = latents_std.shape[0] < num_modes
+    indices = rng.choice(latents_std.shape[0], size=num_modes, replace=replace)
     return np.asarray(latents_std[indices], dtype=np.float32)
 
 
@@ -106,6 +127,13 @@ def initialize_gmm_params(
     return pi, mu.astype(np.float32), var.astype(np.float32)
 
 
+def _pi_kl_uniform_to_pi(pi):
+    num_modes = pi.shape[0]
+    uniform = np.ones_like(pi, dtype=np.float32) / num_modes
+    return float(np.sum(uniform * (
+        np.log(np.maximum(uniform, 1e-8)) - np.log(np.maximum(pi, 1e-8)))))
+
+
 def fit_diag_gmm(
     latents_std,
     num_modes,
@@ -114,27 +142,42 @@ def fit_diag_gmm(
     seed,
     chunk_size,
     var_floor,
-    weight_prior,
     use_kmeanspp,
-    pi_uniform_prior=0.0,
-    var_prior_strength=0.0,
-    var_prior_value=1.0,
+    pi_uniform_beta=0.01,
+    var_update='scale',
+    var_beta=0.05,
+    var_target=1.0,
+    var_eps=1e-8,
+    var_scale_min=0.5,
+    var_scale_max=2.0,
     min_component_count=1.0,
 ):
     num_examples, latent_dim = latents_std.shape
     best_state = None
-    best_nll = np.inf
+    best_objective = -np.inf
     uniform_pi = np.ones((num_modes,), dtype=np.float32) / num_modes
-    pi_uniform_prior = float(pi_uniform_prior)
-    var_prior_strength = float(var_prior_strength)
-    var_prior_value = float(var_prior_value)
+    pi_uniform_beta = float(pi_uniform_beta)
+    var_beta = float(var_beta)
+    var_target = float(var_target)
+    var_eps = float(var_eps)
+    var_scale_min = float(var_scale_min)
+    var_scale_max = float(var_scale_max)
     min_component_count = float(min_component_count)
-    if pi_uniform_prior < 0:
-        raise ValueError("pi_uniform_prior must be non-negative.")
-    if var_prior_strength < 0:
-        raise ValueError("var_prior_strength must be non-negative.")
-    if var_prior_value <= 0:
-        raise ValueError("var_prior_value must be positive.")
+
+    if not 0.0 <= pi_uniform_beta <= 1.0:
+        raise ValueError("pi_uniform_beta must be in [0, 1].")
+    if var_update not in ('none', 'scale'):
+        raise ValueError("var_update must be 'none' or 'scale'.")
+    if var_beta < 0:
+        raise ValueError("var_beta must be non-negative.")
+    if var_target <= 0:
+        raise ValueError("var_target must be positive.")
+    if var_eps <= 0:
+        raise ValueError("var_eps must be positive.")
+    if var_scale_min <= 0 or var_scale_max <= 0:
+        raise ValueError("var scale bounds must be positive.")
+    if var_scale_min > var_scale_max:
+        raise ValueError("var_scale_min must be <= var_scale_max.")
     if min_component_count < 0:
         raise ValueError("min_component_count must be non-negative.")
 
@@ -148,19 +191,30 @@ def fit_diag_gmm(
             use_kmeanspp=use_kmeanspp,
         )
         nll_trace = []
+        objective_trace = []
         counts_trace = []
+        hard_counts_trace = []
         var_min_trace = []
         var_max_trace = []
         floor_frac_trace = []
         dead_count_trace = []
         min_count_trace = []
-        pi_kl_uniform_trace = []
+        max_count_trace = []
+        pi_kl_u_to_pi_trace = []
+        pi_entropy_trace = []
+        effective_components_trace = []
+        posterior_entropy_trace = []
+        var_target_mse_trace = []
+        var_scale_min_trace = []
+        var_scale_max_trace = []
 
         for _ in range(em_iters):
             counts = np.zeros((num_modes,), dtype=np.float64)
+            hard_counts = np.zeros((num_modes,), dtype=np.float64)
             sum_x = np.zeros((num_modes, latent_dim), dtype=np.float64)
             sum_x2 = np.zeros((num_modes, latent_dim), dtype=np.float64)
             total_nll = 0.0
+            total_posterior_entropy = 0.0
 
             log_pi = jnp.asarray(np.log(np.maximum(pi, 1e-8)), dtype=jnp.float32)
             mu_device = jnp.asarray(mu, dtype=jnp.float32)
@@ -168,79 +222,195 @@ def fit_diag_gmm(
 
             for start, stop in _chunk_slices(num_examples, chunk_size):
                 latents_chunk = jnp.asarray(
-                    np.asarray(latents_std[start:stop]),
-                    dtype=jnp.float32,
-                )
-                counts_chunk, sum_x_chunk, sum_x2_chunk, nll_chunk = jax.device_get(
-                    chunk_em_stats(latents_chunk, log_pi, mu_device, var_device)
-                )
+                    np.asarray(latents_std[start:stop]), dtype=jnp.float32)
+                stats = jax.device_get(chunk_em_stats(
+                    latents_chunk, log_pi, mu_device, var_device))
+                counts_chunk, sum_x_chunk, sum_x2_chunk, nll_chunk, entropy_chunk, hard_chunk = stats
                 counts += np.asarray(counts_chunk, dtype=np.float64)
                 sum_x += np.asarray(sum_x_chunk, dtype=np.float64)
                 sum_x2 += np.asarray(sum_x2_chunk, dtype=np.float64)
+                hard_counts += np.asarray(hard_chunk, dtype=np.float64)
                 total_nll += float(nll_chunk)
+                total_posterior_entropy += float(entropy_chunk)
 
             safe_counts = np.maximum(counts, 1e-6)
             mu_new = (sum_x / safe_counts[:, None]).astype(np.float32)
             second_moment = (sum_x2 / safe_counts[:, None]).astype(np.float32)
-            var_ml = np.maximum(second_moment - mu_new * mu_new, 0.0).astype(np.float32)
-            if var_prior_strength > 0:
-                prior_var = np.ones_like(var_ml, dtype=np.float32) * var_prior_value
-                var_new = (
-                    safe_counts[:, None] * var_ml
-                    + var_prior_strength * prior_var
-                ) / (safe_counts[:, None] + var_prior_strength)
+            var_em = np.maximum(second_moment - mu_new * mu_new, 0.0).astype(np.float32)
+
+            if var_update == 'scale' and var_beta > 0:
+                mean_var = np.mean(var_em, axis=1)
+                var_scale = (var_target / (mean_var + var_eps)) ** var_beta
+                var_scale = np.clip(var_scale, var_scale_min, var_scale_max)
+                var_new = var_em * var_scale[:, None]
             else:
-                var_new = var_ml
+                var_scale = np.ones((num_modes,), dtype=np.float32)
+                var_new = var_em
             var_new = np.maximum(var_new, var_floor).astype(np.float32)
 
-            dead_mask = counts < min_component_count
-            if np.any(dead_mask):
-                fallback = random_init(latents_std, int(np.sum(dead_mask)), seed + restart_idx + 123)
-                mu_new[dead_mask] = fallback
-                global_var = np.var(np.asarray(latents_std), axis=0, dtype=np.float64).astype(np.float32)
-                var_new[dead_mask] = np.maximum(global_var, var_floor)
-
-            counts_with_prior = counts + weight_prior
-            if pi_uniform_prior > 0:
-                # Relative prior: 1.0 adds one full dataset worth of uniform counts.
-                counts_with_prior += pi_uniform_prior * (num_examples / num_modes)
-            pi_new = (counts_with_prior / np.sum(counts_with_prior)).astype(np.float32)
+            pi_em = (counts / max(float(num_examples), 1.0)).astype(np.float32)
+            pi_new = (
+                (1.0 - pi_uniform_beta) * pi_em
+                + pi_uniform_beta * uniform_pi
+            ).astype(np.float32)
+            pi_new = pi_new / np.sum(pi_new)
 
             pi = pi_new
             mu = mu_new
             var = var_new
 
-            nll_trace.append(total_nll / num_examples)
+            nll = total_nll / num_examples
+            pi_kl = _pi_kl_uniform_to_pi(pi)
+            pi_entropy = float(-np.sum(pi * np.log(np.maximum(pi, 1e-8))))
+            var_target_mse = float(np.mean(
+                (np.mean(var, axis=1) - var_target) ** 2))
+            objective = -nll - pi_kl - var_target_mse
+
+            nll_trace.append(nll)
+            objective_trace.append(objective)
             counts_trace.append(counts.astype(np.float32))
+            hard_counts_trace.append(hard_counts.astype(np.float32))
             var_min_trace.append(float(np.min(var)))
             var_max_trace.append(float(np.max(var)))
             floor_frac_trace.append(float(np.mean(var <= var_floor * (1.0 + 1e-6))))
-            dead_count_trace.append(float(np.sum(dead_mask)))
+            dead_count_trace.append(float(np.sum(counts < min_component_count)))
             min_count_trace.append(float(np.min(counts)))
-            pi_kl_uniform_trace.append(
-                float(np.sum(pi * (np.log(np.maximum(pi, 1e-8)) - np.log(uniform_pi))))
-            )
+            max_count_trace.append(float(np.max(counts)))
+            pi_kl_u_to_pi_trace.append(pi_kl)
+            pi_entropy_trace.append(pi_entropy)
+            effective_components_trace.append(float(np.exp(pi_entropy)))
+            posterior_entropy_trace.append(total_posterior_entropy / num_examples)
+            var_target_mse_trace.append(var_target_mse)
+            var_scale_min_trace.append(float(np.min(var_scale)))
+            var_scale_max_trace.append(float(np.max(var_scale)))
 
-        final_nll = nll_trace[-1]
-        if final_nll < best_nll:
-            best_nll = final_nll
+        final_objective = objective_trace[-1]
+        if final_objective > best_objective:
+            best_objective = final_objective
             best_state = {
                 'pi': pi,
                 'mu': mu,
                 'var': var,
                 'nll_trace': np.asarray(nll_trace, dtype=np.float32),
+                'objective_trace': np.asarray(objective_trace, dtype=np.float32),
                 'counts_trace': np.asarray(counts_trace, dtype=np.float32),
+                'hard_counts_trace': np.asarray(hard_counts_trace, dtype=np.float32),
                 'var_min_trace': np.asarray(var_min_trace, dtype=np.float32),
                 'var_max_trace': np.asarray(var_max_trace, dtype=np.float32),
                 'floor_frac_trace': np.asarray(floor_frac_trace, dtype=np.float32),
                 'dead_count_trace': np.asarray(dead_count_trace, dtype=np.float32),
                 'min_count_trace': np.asarray(min_count_trace, dtype=np.float32),
-                'pi_kl_uniform_trace': np.asarray(pi_kl_uniform_trace, dtype=np.float32),
+                'max_count_trace': np.asarray(max_count_trace, dtype=np.float32),
+                'pi_kl_u_to_pi_trace': np.asarray(pi_kl_u_to_pi_trace, dtype=np.float32),
+                'pi_entropy_trace': np.asarray(pi_entropy_trace, dtype=np.float32),
+                'effective_components_trace': np.asarray(
+                    effective_components_trace, dtype=np.float32),
+                'posterior_entropy_trace': np.asarray(
+                    posterior_entropy_trace, dtype=np.float32),
+                'var_target_mse_trace': np.asarray(var_target_mse_trace, dtype=np.float32),
+                'var_scale_min_trace': np.asarray(var_scale_min_trace, dtype=np.float32),
+                'var_scale_max_trace': np.asarray(var_scale_max_trace, dtype=np.float32),
                 'restart_index': restart_idx,
                 'final_counts': counts.astype(np.float32),
+                'final_hard_counts': hard_counts.astype(np.float32),
             }
 
     return best_state
+
+
+def local_coordinates_from_standardized(x_std, modes, mu, var, eta, eps=1e-8):
+    mode_mu = mu[modes]
+    mode_var = jnp.maximum(var[modes], eps)
+    return (x_std - mode_mu) * (mode_var ** (-0.5 * eta))
+
+
+def directions_from_local(local_coords, eps=1e-8):
+    norm = jnp.linalg.norm(local_coords, axis=-1, keepdims=True)
+    return local_coords / (norm + eps)
+
+
+def assign_angular_codes(x_std, modes, mu, var, angular_centers, eta, eps=1e-8):
+    local_coords = local_coordinates_from_standardized(
+        x_std, modes, mu, var, eta, eps=eps)
+    directions = directions_from_local(local_coords, eps=eps)
+    centers = angular_centers[modes]
+    scores = jnp.einsum('bd,bad->ba', directions, centers)
+    return jnp.argmax(scores, axis=-1), directions
+
+
+def build_source_base_flat(
+    modes,
+    angular_codes,
+    radius,
+    mean,
+    std,
+    standardize_eps,
+    mu,
+    var,
+    angular_centers,
+    eta,
+    eps=1e-8,
+):
+    mode_mu = mu[modes]
+    mode_var = jnp.maximum(var[modes], eps)
+    centers = angular_centers[modes, angular_codes]
+    x_base_std = mode_mu + (mode_var ** (0.5 * eta)) * radius[:, None] * centers
+    return unstandardize_latents(x_base_std, mean, std, standardize_eps), x_base_std
+
+
+def build_source_base(
+    modes,
+    angular_codes,
+    radius,
+    latent_shape,
+    mean,
+    std,
+    standardize_eps,
+    mu,
+    var,
+    angular_centers,
+    eta,
+    eps=1e-8,
+):
+    x_base_flat, x_base_std = build_source_base_flat(
+        modes,
+        angular_codes,
+        radius,
+        mean,
+        std,
+        standardize_eps,
+        mu,
+        var,
+        angular_centers,
+        eta,
+        eps=eps,
+    )
+    return x_base_flat.reshape((modes.shape[0],) + tuple(latent_shape)), x_base_std
+
+
+def sample_lognormal_radius(key, modes, angular_codes, radius_log_mean, radius_log_std):
+    log_mean = radius_log_mean[modes, angular_codes]
+    log_std = radius_log_std[modes, angular_codes]
+    log_radius = log_mean + log_std * jax.random.normal(key, log_mean.shape)
+    return jnp.exp(log_radius), log_radius
+
+
+def temperature_smooth_probs(probs, temperature, eps=1e-8):
+    if temperature == 1.0:
+        return probs
+    smoothed = jnp.maximum(probs, eps) ** (1.0 / temperature)
+    return smoothed / jnp.sum(smoothed, axis=-1, keepdims=True)
+
+
+def categorical_kl(target_probs, pred_probs, eps=1e-8):
+    target = jnp.maximum(target_probs, eps)
+    pred = jnp.maximum(pred_probs, eps)
+    return jnp.sum(target * (jnp.log(target) - jnp.log(pred)), axis=-1)
+
+
+def categorical_entropy(probs, eps=1e-8):
+    probs = jnp.maximum(probs, eps)
+    return -jnp.sum(probs * jnp.log(probs), axis=-1)
 
 
 def save_gmm_stats(path, stats_dict):
@@ -250,16 +420,37 @@ def save_gmm_stats(path, stats_dict):
 def load_gmm_stats(path):
     raw = np.load(path, allow_pickle=False)
     stats = {key: raw[key] for key in raw.files}
-    stats['mean'] = jnp.asarray(stats['mean'], dtype=jnp.float32)
-    stats['std'] = jnp.asarray(stats['std'], dtype=jnp.float32)
-    stats['pi'] = jnp.asarray(stats['pi'], dtype=jnp.float32)
-    stats['mu'] = jnp.asarray(stats['mu'], dtype=jnp.float32)
-    stats['var'] = jnp.asarray(stats['var'], dtype=jnp.float32)
+    tensor_keys = [
+        'mean',
+        'std',
+        'pi',
+        'mu',
+        'var',
+        'angular_centers',
+        'angular_pi',
+        'angular_counts',
+        'angular_active',
+        'radius_log_mean',
+        'radius_log_std',
+        'radius_counts',
+        'radius_backoff',
+        'latent_shape',
+        'n_train',
+        'standardize_eps',
+        'local_eta',
+    ]
+    for key in tensor_keys:
+        if key in stats:
+            dtype = jnp.float32
+            if key == 'latent_shape':
+                dtype = jnp.int32
+            stats[key] = jnp.asarray(stats[key], dtype=dtype)
     stats['log_pi'] = jnp.log(jnp.maximum(stats['pi'], 1e-8))
     return stats
 
 
 def sample_categorical_onehot(key, probs, num_modes):
-    indices = jax.random.categorical(key, jnp.log(jnp.maximum(probs, 1e-8)), axis=-1)
+    indices = jax.random.categorical(
+        key, jnp.log(jnp.maximum(probs, 1e-8)), axis=-1)
     one_hot = jax.nn.one_hot(indices, num_modes, dtype=jnp.float32)
     return indices, one_hot
