@@ -36,7 +36,12 @@ GMM_GROUP = 'MoE1_Naive_K_GMM'
 TRAIN_GROUP = 'MoE1_Naive_K_Train'
 SUMMARY_GROUP = 'MoE1_Naive_K_Summary'
 PATH_PLOT_MAX_LINES = 256
-SHORT_STAGE_PARAMS = frozenset(('source_tau', 'loss_balance_weight', 'loss_entropy_weight'))
+GMM_CONFIG_KEYS = (
+    'gmm_var_mse_target_std',
+    'gmm_var_mse_weight',
+    'gmm_pi_kl_weight',
+)
+SHORT_STAGE_PARAMS = frozenset((*GMM_CONFIG_KEYS, 'source_tau', 'loss_balance_weight', 'loss_entropy_weight'))
 GMM_STAT_KEYS = (
     'mean',
     'std',
@@ -160,6 +165,9 @@ def _stage_max_steps(flags, stage_param):
 def _candidate_key(config, max_steps):
     return (
         int(config['K']),
+        _float_key(config['gmm_var_mse_target_std']),
+        _float_key(config['gmm_var_mse_weight']),
+        _float_key(config['gmm_pi_kl_weight']),
         _float_key(config['source_tau']),
         _float_key(config['loss_balance_weight']),
         _float_key(config['loss_entropy_weight']),
@@ -172,12 +180,33 @@ def _candidate_key(config, max_steps):
 def _candidate_slug(config, max_steps):
     return (
         f"K{int(config['K']):02d}"
+        f"_gts{_float_token(config['gmm_var_mse_target_std'])}"
+        f"_gvb{_float_token(config['gmm_var_mse_weight'])}"
+        f"_gpb{_float_token(config['gmm_pi_kl_weight'])}"
         f"_tau{_float_token(config['source_tau'])}"
         f"_bal{_float_token(config['loss_balance_weight'])}"
         f"_ent{_float_token(config['loss_entropy_weight'])}"
         f"_wd{_float_token(config['weight_decay'])}"
         f"_var{_float_token(config['source_var_target_std'])}"
         f"_steps{int(max_steps)}"
+    )
+
+
+def _gmm_key(config):
+    return (
+        int(config['K']),
+        _float_key(config['gmm_var_mse_target_std']),
+        _float_key(config['gmm_var_mse_weight']),
+        _float_key(config['gmm_pi_kl_weight']),
+    )
+
+
+def _gmm_slug(config):
+    return (
+        f"K{int(config['K']):02d}"
+        f"_gts{_float_token(config['gmm_var_mse_target_std'])}"
+        f"_gvb{_float_token(config['gmm_var_mse_weight'])}"
+        f"_gpb{_float_token(config['gmm_pi_kl_weight'])}"
     )
 
 
@@ -389,9 +418,11 @@ def _fid_key(flags):
     return f'fid{int(flags.inference_timesteps)}_{int(flags.inference_generations)}'
 
 
-def _run_gmm(flags, root, k, runtime):
-    run_name = f'GMM_K{k:02d}'
-    run_dir = root / 'gmm' / f'K{k:02d}'
+def _run_gmm(flags, root, config, runtime):
+    k = int(config['K'])
+    slug = _gmm_slug(config)
+    run_name = f'GMM_{slug}'
+    run_dir = root / 'gmm' / slug
     run_dir.mkdir(parents=True, exist_ok=True)
     gmm_path = run_dir / 'gmm_stats.npz'
     metrics_path = run_dir / 'metrics.json'
@@ -406,9 +437,9 @@ def _run_gmm(flags, root, k, runtime):
         f'--metrics_output_path={metrics_path}',
         f'--gmm_fit_samples={int(flags.moe1_gmm_fit_samples)}',
         f'--gmm_valid_samples={int(flags.moe1_gmm_valid_samples)}',
-        f'--gmm_var_mse_target_std={float(flags.moe1_gmm_var_mse_target_std)}',
-        f'--gmm_var_mse_weight={float(flags.moe1_gmm_var_mse_weight)}',
-        f'--gmm_pi_kl_weight={float(flags.moe1_gmm_pi_kl_weight)}',
+        f'--gmm_var_mse_target_std={float(config["gmm_var_mse_target_std"])}',
+        f'--gmm_var_mse_weight={float(config["gmm_var_mse_weight"])}',
+        f'--gmm_pi_kl_weight={float(config["gmm_pi_kl_weight"])}',
         '--gmm_keep_latent_cache=0',
         '--gmm_wandb_level=summary',
     ]
@@ -417,11 +448,14 @@ def _run_gmm(flags, root, k, runtime):
     _append_wandb_args(cmd, flags, GMM_GROUP, run_name)
     if _is_primary(runtime):
         _run_subprocess(cmd, run_name)
-    _sync_global(runtime, f'gmm_fit_K{k:02d}')
+    _sync_global(runtime, f'gmm_fit_{slug}')
     _replicate_gmm_stats_from_primary(runtime, gmm_path)
     metrics = _load_json(metrics_path) if _is_primary(runtime) and metrics_path.exists() else {}
     return {
         'K': k,
+        'gmm_var_mse_target_std': float(config['gmm_var_mse_target_std']),
+        'gmm_var_mse_weight': float(config['gmm_var_mse_weight']),
+        'gmm_pi_kl_weight': float(config['gmm_pi_kl_weight']),
         'run_name': run_name,
         'run_dir': str(run_dir),
         'gmm_stats_path': str(gmm_path),
@@ -758,6 +792,9 @@ def _summary_row_from_metrics(run, fid_key):
         'stage_value': run.get('stage_value'),
         'max_steps': run.get('max_steps'),
         'K': run.get('K'),
+        'gmm_var_mse_target_std': run.get('config', {}).get('gmm_var_mse_target_std'),
+        'gmm_var_mse_weight': run.get('config', {}).get('gmm_var_mse_weight'),
+        'gmm_pi_kl_weight': run.get('config', {}).get('gmm_pi_kl_weight'),
         'source_tau': run.get('config', {}).get('source_tau'),
         'loss_balance_weight': run.get('config', {}).get('loss_balance_weight'),
         'loss_entropy_weight': run.get('config', {}).get('loss_entropy_weight'),
@@ -830,6 +867,9 @@ def _stage_summary_row(stage_idx, stage_param, rows, selected_idx, fid_key):
         'selected_value': selected.get('stage_value'),
         'selected_max_steps': selected.get('max_steps'),
         'selected_K': selected.get('K'),
+        'selected_gmm_var_mse_target_std': selected.get('gmm_var_mse_target_std'),
+        'selected_gmm_var_mse_weight': selected.get('gmm_var_mse_weight'),
+        'selected_gmm_pi_kl_weight': selected.get('gmm_pi_kl_weight'),
         'selected_fid': selected.get(fid_key),
         'selected_straightness_ratio_mean': selected.get('straightness_ratio_mean'),
         'selected_conditioned_source_cluster_agreement': selected.get('conditioned_source_cluster_agreement'),
@@ -1140,6 +1180,9 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
         'stage_value',
         'max_steps',
         'K',
+        'gmm_var_mse_target_std',
+        'gmm_var_mse_weight',
+        'gmm_pi_kl_weight',
         'source_tau',
         'loss_balance_weight',
         'loss_entropy_weight',
@@ -1174,6 +1217,9 @@ def _write_analysis_packet(root, run_id, summary_rows, stage_summaries, image_pa
                 'selected_run',
                 'selected_value',
                 'selected_max_steps',
+                'selected_gmm_var_mse_target_std',
+                'selected_gmm_var_mse_weight',
+                'selected_gmm_pi_kl_weight',
                 'selected_fid',
                 'selected_straightness_ratio_mean',
                 'selected_conditioned_source_cluster_agreement',
@@ -1317,6 +1363,9 @@ def _log_summary(flags, summary_rows, image_paths, root, fid_key, run_id, final_
 def _base_config(flags):
     return {
         'K': int(flags.moe1_base_k),
+        'gmm_var_mse_target_std': float(flags.moe1_gmm_var_mse_target_std),
+        'gmm_var_mse_weight': float(flags.moe1_gmm_var_mse_weight),
+        'gmm_pi_kl_weight': float(flags.moe1_gmm_pi_kl_weight),
         'source_tau': float(flags.moe1_base_tau),
         'loss_balance_weight': float(flags.moe1_base_balance),
         'loss_entropy_weight': float(flags.moe1_base_entropy),
@@ -1344,8 +1393,23 @@ def _greedy_stages(flags):
         _parse_float_list(flags.moe1_var_target_values, 'moe1_var_target_values'),
         flags.moe1_base_var_target,
     )
+    gmm_target_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_gmm_var_mse_target_std_values, 'moe1_gmm_var_mse_target_std_values'),
+        flags.moe1_gmm_var_mse_target_std,
+    )
+    gmm_var_beta_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_gmm_var_mse_weight_values, 'moe1_gmm_var_mse_weight_values'),
+        flags.moe1_gmm_var_mse_weight,
+    )
+    gmm_pi_beta_values = _ensure_float_value(
+        _parse_float_list(flags.moe1_gmm_pi_kl_weight_values, 'moe1_gmm_pi_kl_weight_values'),
+        flags.moe1_gmm_pi_kl_weight,
+    )
     return [
         ('K', k_values),
+        ('gmm_var_mse_target_std', gmm_target_values),
+        ('gmm_var_mse_weight', gmm_var_beta_values),
+        ('gmm_pi_kl_weight', gmm_pi_beta_values),
         ('source_tau', tau_values),
         ('loss_balance_weight', balance_values),
         ('loss_entropy_weight', entropy_values),
@@ -1370,11 +1434,11 @@ def _model_overrides_for_config(flags, config, gmm_path):
     return overrides
 
 
-def _ensure_gmm(flags, root, k, runtime, gmm_cache):
-    k = int(k)
-    if k not in gmm_cache:
-        gmm_cache[k] = _run_gmm(flags, root, k, runtime)
-    return gmm_cache[k]
+def _ensure_gmm(flags, root, config, runtime, gmm_cache):
+    key = _gmm_key(config)
+    if key not in gmm_cache:
+        gmm_cache[key] = _run_gmm(flags, root, config, runtime)
+    return gmm_cache[key]
 
 
 def _render_moe_candidate_if_primary(run_row, gmm_row, root, fid_key, max_points, runtime):
@@ -1434,7 +1498,7 @@ def _run_or_reuse_candidate(
             row['summary'] = summary
         return row, cached.get('analysis'), {}
 
-    gmm_row = _ensure_gmm(flags, root, int(config['K']), runtime, gmm_cache)
+    gmm_row = _ensure_gmm(flags, root, config, runtime, gmm_cache)
     run_name = f'moe1_greedy_{slug}'
     run_dir_name = f'candidates/{slug}'
     metadata = {
@@ -1498,7 +1562,7 @@ def _run_naive_reference(flags, root, runtime, fid_key, max_points):
 
 def _run_final_best_moe(flags, root, config, runtime, gmm_cache, fid_key, max_points):
     max_steps = int(flags.max_steps)
-    gmm_row = _ensure_gmm(flags, root, int(config['K']), runtime, gmm_cache)
+    gmm_row = _ensure_gmm(flags, root, config, runtime, gmm_cache)
     run_name = 'final_best_moe_50k' if max_steps == 50000 else f'final_best_moe_{max_steps}'
     run_dir_name = run_name
     metadata = {
@@ -1610,6 +1674,9 @@ def run(flags):
                 'stage_value': candidate_config[stage_param],
                 'max_steps': stage_max_steps,
                 'K': candidate_config['K'],
+                'gmm_var_mse_target_std': candidate_config['gmm_var_mse_target_std'],
+                'gmm_var_mse_weight': candidate_config['gmm_var_mse_weight'],
+                'gmm_pi_kl_weight': candidate_config['gmm_pi_kl_weight'],
                 'source_tau': candidate_config['source_tau'],
                 'loss_balance_weight': candidate_config['loss_balance_weight'],
                 'loss_entropy_weight': candidate_config['loss_entropy_weight'],
@@ -1706,6 +1773,9 @@ def run(flags):
         'stage_value',
         'max_steps',
         'K',
+        'gmm_var_mse_target_std',
+        'gmm_var_mse_weight',
+        'gmm_pi_kl_weight',
         'source_tau',
         'loss_balance_weight',
         'loss_entropy_weight',
@@ -1743,6 +1813,9 @@ def run(flags):
             'selected_run',
             'selected_value',
             'selected_max_steps',
+            'selected_gmm_var_mse_target_std',
+            'selected_gmm_var_mse_weight',
+            'selected_gmm_pi_kl_weight',
             'selected_fid',
             'selected_straightness_ratio_mean',
             'selected_conditioned_source_cluster_agreement',
@@ -1786,6 +1859,9 @@ def run(flags):
             'max_steps',
             'run_name',
             'K',
+            'gmm_var_mse_target_std',
+            'gmm_var_mse_weight',
+            'gmm_pi_kl_weight',
             'source_tau',
             'loss_balance_weight',
             'loss_entropy_weight',
@@ -1812,6 +1888,9 @@ def run(flags):
             'selected_value',
             'selected_max_steps',
             'selected_K',
+            'selected_gmm_var_mse_target_std',
+            'selected_gmm_var_mse_weight',
+            'selected_gmm_pi_kl_weight',
             'selected_fid',
             'selected_straightness_ratio_mean',
             'selected_conditioned_source_cluster_agreement',

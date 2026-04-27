@@ -90,18 +90,33 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_float(
     'moe1_gmm_var_mse_target_std',
-    0.0,
+    0.5,
     'Forwards to data_prep.py --gmm_var_mse_target_std. Target sigma for per-mode mean-variance MSE.',
 )
 flags.DEFINE_float(
     'moe1_gmm_var_mse_weight',
-    0.0,
+    0.25,
     'Forwards to data_prep.py --gmm_var_mse_weight. beta_var in [0,1] (per-iter pull fraction).',
 )
 flags.DEFINE_float(
     'moe1_gmm_pi_kl_weight',
-    0.0,
+    0.25,
     'Forwards to data_prep.py --gmm_pi_kl_weight. beta_pi in [0,1] (uniform-blend strength).',
+)
+flags.DEFINE_string(
+    'moe1_gmm_var_mse_target_std_values',
+    '0.0,0.25,0.5,0.75,1.0',
+    'Comma-separated GMM sigma_target values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_gmm_var_mse_weight_values',
+    '0.0,0.25,0.5,0.75,1.0',
+    'Comma-separated GMM beta_var values for greedy mode=moe1-naive-k-ablation.',
+)
+flags.DEFINE_string(
+    'moe1_gmm_pi_kl_weight_values',
+    '0.0,0.25,0.5,0.75,1.0',
+    'Comma-separated GMM beta_pi values for greedy mode=moe1-naive-k-ablation.',
 )
 flags.DEFINE_string(
     'moe1_tau_values',
@@ -142,7 +157,7 @@ flags.DEFINE_string(
 flags.DEFINE_integer(
     'moe1_short_stage_steps',
     10000,
-    'Max steps for short greedy stages in mode=moe1-naive-k-ablation: tau, balance, entropy.',
+    'Max steps for short greedy stages in mode=moe1-naive-k-ablation: GMM-reg, tau, balance, entropy.',
 )
 
 model_config = ml_collections.ConfigDict({
