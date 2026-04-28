@@ -35,6 +35,7 @@ def eval_model(
     truth_fid_stats,
     gmm_state=None,
 ):
+    eval_metrics = {}
     with jax.spmd_mode('allow_all'):
         global_device_count = jax.device_count()
         key = jax.random.PRNGKey(42 + jax.process_index())
@@ -256,6 +257,14 @@ def eval_model(
                 axs[2, d].set_title(f"Bootstrap {d}")
 
             if jax.process_index() == 0:
+                eval_metrics[f'eval/loss_grid/d_{d}'] = float(
+                    np.mean(np.asarray(infos['loss'], dtype=np.float32)))
+                if isinstance(infos, dict) and 'loss_flow' in infos:
+                    eval_metrics[f'eval/loss_grid_flow/d_{d}'] = float(
+                        np.mean(np.asarray(infos['loss_flow'], dtype=np.float32)))
+                if isinstance(infos, dict) and 'loss_bootstrap' in infos:
+                    eval_metrics[f'eval/loss_grid_bootstrap/d_{d}'] = float(
+                        np.mean(np.asarray(infos['loss_bootstrap'], dtype=np.float32)))
                 fig.tight_layout()
                 wandb.log({f'mse': wandb.Image(fig)}, step=step)
 
@@ -476,4 +485,9 @@ def eval_model(
                     sigma1 = np.cov(activations, rowvar=False)
                     fid = fid_from_stats(mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
                     print(f"FID for denoise_timesteps {denoise_timesteps} is {fid}")
-                    wandb.log({f'fid/timesteps/{denoise_timesteps}': fid}, step=step)
+                    fid_metric_name = f'fid/timesteps/{denoise_timesteps}'
+                    eval_metrics[fid_metric_name] = float(fid)
+                    eval_metrics[f'{fid_metric_name}/generations'] = int(
+                        activations.shape[0])
+                    wandb.log({fid_metric_name: fid}, step=step)
+    return eval_metrics

@@ -75,27 +75,40 @@ def _write_summary_csv(path, step, metrics):
             reader = csv.DictReader(f)
             fieldnames = list(reader.fieldnames or ['step'])
             existing_rows = list(reader)
-        missing_fields = [
-            key for key in sorted(row.keys())
-            if key not in fieldnames
-        ]
-        if missing_fields:
-            fieldnames = fieldnames + missing_fields
-            tmp_path = path + '.tmp'
-            with open(tmp_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(existing_rows)
-                writer.writerow(row)
-            os.replace(tmp_path, path)
-            return
     else:
-        fieldnames = ['step'] + sorted(scalar_metrics.keys())
-    with open(path, 'a', newline='') as f:
+        fieldnames = ['step']
+        existing_rows = []
+    missing_fields = [
+        key for key in sorted(row.keys())
+        if key not in fieldnames
+    ]
+    fieldnames = fieldnames + missing_fields
+
+    def is_same_step(existing_step):
+        try:
+            return int(float(existing_step)) == int(step)
+        except (TypeError, ValueError):
+            return str(existing_step) == str(int(step))
+
+    merged_rows = []
+    replaced = False
+    for existing in existing_rows:
+        if is_same_step(existing.get('step')):
+            merged = dict(existing)
+            merged.update(row)
+            merged_rows.append(merged)
+            replaced = True
+        else:
+            merged_rows.append(existing)
+    if not replaced:
+        merged_rows.append(row)
+
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+        writer.writeheader()
+        writer.writerows(merged_rows)
+    os.replace(tmp_path, path)
 
 
 def _upload_summary_csv_to_wandb(path):
@@ -1005,9 +1018,15 @@ def main(_):
                     lambda x: x, out_shardings=train_state_sharding)(train_state)
 
         if i % FLAGS.eval_interval == 0:
-            eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
-                       get_fid_activations, imagenet_labels, visualize_labels,
-                       fid_from_stats, truth_fid_stats, gmm_state)
+            eval_metrics = eval_model(
+                FLAGS, train_state, train_state_teacher, i, dataset,
+                dataset_valid, shard_data, vae_encode, vae_decode, update,
+                get_fid_activations, imagenet_labels, visualize_labels,
+                fid_from_stats, truth_fid_stats, gmm_state)
+            if jax.process_index() == 0 and summary_csv_path is not None:
+                _write_summary_csv(summary_csv_path, i, eval_metrics)
+                if FLAGS.summary_csv_wandb_upload:
+                    _upload_summary_csv_to_wandb(summary_csv_path)
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             train_state_gather = jax.experimental.multihost_utils.process_allgather(
