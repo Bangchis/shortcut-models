@@ -220,6 +220,10 @@ training/entangle/velocity_cos_same_c
 training/activations/moe_condition_embed
 ```
 
+`training_summary.csv` is written from the full scalar training metric dict. If
+new scalar metrics appear after the first row, the writer expands the CSV header
+and preserves existing rows, so important diagnostics are not dropped.
+
 Interpretation:
 
 - If `x0_minus_x1_norm` is too small, the source is too close and the path is

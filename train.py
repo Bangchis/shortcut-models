@@ -65,17 +65,33 @@ def _write_summary_csv(path, step, metrics):
     if path is None:
         return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    scalar_metrics = {key: _csv_scalar(value) for key, value in metrics.items()}
     row = {'step': int(step)}
-    row.update({key: _csv_scalar(value) for key, value in metrics.items()})
+    row.update(scalar_metrics)
     file_exists = os.path.exists(path) and os.path.getsize(path) > 0
     if file_exists:
         with open(path, 'r', newline='') as f:
-            fieldnames = next(csv.reader(f))
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or ['step'])
+            existing_rows = list(reader)
+        missing_fields = [
+            key for key in sorted(row.keys())
+            if key not in fieldnames
+        ]
+        if missing_fields:
+            fieldnames = fieldnames + missing_fields
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(existing_rows)
+                writer.writerow(row)
+            os.replace(tmp_path, path)
+            return
     else:
-        fieldnames = ['step'] + sorted(metrics.keys())
+        fieldnames = ['step'] + sorted(scalar_metrics.keys())
     with open(path, 'a', newline='') as f:
-        writer = csv.DictWriter(
-            f, fieldnames=fieldnames, extrasaction='ignore')
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
