@@ -163,6 +163,7 @@ model_config = ml_collections.ConfigDict({
     'source_sigma_init': 0.7,
     'source_sigma_min': 0.7,
     'source_sigma_hard_floor': 0,
+    'source_sensitivity_metrics': 1,
     'source_eps': 1e-8,
     'loss_post_weight': 0.1,
     'posterior_temperature': 2.0,
@@ -462,8 +463,9 @@ def main(_):
         if FLAGS.model['train_type'] == 'naive-moe-source':
 
             def loss_fn(grad_params):
-                label_key, time_key, z_key, radius_key, x0_key = jax.random.split(
-                    targets_key, 5)
+                label_key, time_key, z_key, radius_key, x0_key, sens_key = (
+                    jax.random.split(targets_key, 6))
+                z_sens_key, _ = jax.random.split(sens_key)
 
                 labels_dropout = jax.random.bernoulli(
                     label_key,
@@ -604,7 +606,40 @@ def main(_):
                 sigma_floor_frac = jnp.mean(
                     (raw_log_sigma < log_sigma_min).astype(jnp.float32))
                 x0_minus_base_norm = jnp.sqrt(jnp.mean(jnp.square(x_0 - x_base)))
+                x0_minus_x1_norm = jnp.sqrt(jnp.mean(jnp.square(x_0 - images)))
+                mu_x0_minus_x1_norm = jnp.sqrt(
+                    jnp.mean(jnp.square(mu_x0 - images)))
+                base_minus_x1_norm = jnp.sqrt(
+                    jnp.mean(jnp.square(x_base - images)))
                 delta_mu_norm = jnp.sqrt(jnp.mean(jnp.square(delta_mu)))
+                if FLAGS.model['source_sensitivity_metrics']:
+                    z_alt = jax.random.normal(z_sens_key, images.shape)
+                    mu_x0_z_alt, _, _ = train_state.call_source(
+                        z_alt,
+                        x_base,
+                        mode_indices,
+                        angular_indices,
+                        log_radius,
+                        params=grad_params,
+                    )
+                    angular_alt = (
+                        angular_indices + 1
+                    ) % FLAGS.model['angular_num_submodes']
+                    mu_x0_a_alt, _, _ = train_state.call_source(
+                        z,
+                        x_base,
+                        mode_indices,
+                        angular_alt,
+                        log_radius,
+                        params=grad_params,
+                    )
+                    z_sensitivity_mu = jnp.sqrt(
+                        jnp.mean(jnp.square(mu_x0_z_alt - mu_x0)))
+                    angular_sensitivity_mu = jnp.sqrt(
+                        jnp.mean(jnp.square(mu_x0_a_alt - mu_x0)))
+                else:
+                    z_sensitivity_mu = jnp.asarray(0.0, dtype=images.dtype)
+                    angular_sensitivity_mu = jnp.asarray(0.0, dtype=images.dtype)
                 q0_entropy = jnp.mean(categorical_entropy(
                     q0, eps=FLAGS.model['source_eps']))
                 q1_entropy = jnp.mean(categorical_entropy(
@@ -635,8 +670,13 @@ def main(_):
                     'source/sigma_raw_max': jnp.max(raw_sigma),
                     'source/sigma_floor_frac': sigma_floor_frac,
                     'source/x0_minus_base_norm': x0_minus_base_norm,
+                    'source/x0_minus_x1_norm': x0_minus_x1_norm,
+                    'source/mu_x0_minus_x1_norm': mu_x0_minus_x1_norm,
+                    'source/base_minus_x1_norm': base_minus_x1_norm,
                     'source/delta_mu_norm': delta_mu_norm,
                     'source/base_norm': jnp.sqrt(jnp.mean(jnp.square(x_base))),
+                    'condition/z_sensitivity_mu': z_sensitivity_mu,
+                    'condition/angular_sensitivity_mu': angular_sensitivity_mu,
                     'posterior/agreement_argmax_mu_x0_x1': posterior_agreement,
                     'posterior/q0_entropy': q0_entropy,
                     'posterior/q1_entropy': q1_entropy,
