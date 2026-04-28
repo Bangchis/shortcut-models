@@ -749,25 +749,36 @@ def main(_):
                             rolled_condition, rolled_geometry)
 
                         def delta_norm(v_alt):
+                            diff = (
+                                v_alt.astype(jnp.float32)
+                                - v_prime.astype(jnp.float32)
+                            )
                             return jnp.sqrt(jnp.mean(jnp.square(
-                                v_alt - v_prime)))
+                                diff))).astype(loss_fm.dtype)
 
                         zero_all_norm = delta_norm(v_zero_all)
                         zero_geometry_norm = delta_norm(v_zero_geometry)
                         zero_rho_norm = delta_norm(v_zero_rho)
                         roll_all_norm = delta_norm(v_roll_all)
-                        denom = v_prime_norm + FLAGS.model['source_eps']
+                        denom = (
+                            v_prime_norm.astype(loss_fm.dtype)
+                            + FLAGS.model['source_eps']
+                        )
                         return {
                             'condition/sensitivity_ran': jnp.asarray(
                                 1.0, dtype=loss_fm.dtype),
                             'condition/sensitivity_zero_all_norm': zero_all_norm,
-                            'condition/sensitivity_zero_all_rel': zero_all_norm / denom,
+                            'condition/sensitivity_zero_all_rel': (
+                                zero_all_norm / denom).astype(loss_fm.dtype),
                             'condition/sensitivity_zero_geometry_norm': zero_geometry_norm,
-                            'condition/sensitivity_zero_geometry_rel': zero_geometry_norm / denom,
+                            'condition/sensitivity_zero_geometry_rel': (
+                                zero_geometry_norm / denom).astype(loss_fm.dtype),
                             'condition/sensitivity_zero_rho_norm': zero_rho_norm,
-                            'condition/sensitivity_zero_rho_rel': zero_rho_norm / denom,
+                            'condition/sensitivity_zero_rho_rel': (
+                                zero_rho_norm / denom).astype(loss_fm.dtype),
                             'condition/sensitivity_roll_all_norm': roll_all_norm,
-                            'condition/sensitivity_roll_all_rel': roll_all_norm / denom,
+                            'condition/sensitivity_roll_all_rel': (
+                                roll_all_norm / denom).astype(loss_fm.dtype),
                         }
 
                     sensitivity_metrics = jax.lax.cond(
