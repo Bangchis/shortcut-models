@@ -99,6 +99,7 @@ model_config = ml_collections.ConfigDict({
     'source_kernel_size': 3,
     'source_sigma_init': 0.7,
     'source_sigma_min': 0.7,
+    'source_sigma_hard_floor': 0,
     'source_eps': 1e-8,
     'loss_post_weight': 0.1,
     'posterior_temperature': 2.0,
@@ -477,8 +478,11 @@ def main(_):
                     log_radius,
                     params=grad_params,
                 )
-                log_sigma = floor_log_sigma(
-                    raw_log_sigma, FLAGS.model['source_sigma_min'])
+                if FLAGS.model['source_sigma_hard_floor']:
+                    log_sigma = floor_log_sigma(
+                        raw_log_sigma, FLAGS.model['source_sigma_min'])
+                else:
+                    log_sigma = raw_log_sigma
                 x_0 = sample_source_gaussian(x0_key, mu_x0, log_sigma)
                 x_t = (1 - t_full) * x_0 + t_full * images
                 v_t = images - x_0

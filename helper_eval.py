@@ -123,8 +123,11 @@ def eval_model(
                 z, x_base, sampled_modes, angular_codes, log_radius)
             mu_x0, raw_log_sigma, _ = call_source(
                 train_state, z, x_base, sampled_modes, angular_codes, log_radius)
-            log_sigma = floor_log_sigma(
-                raw_log_sigma, FLAGS.model['source_sigma_min'])
+            if FLAGS.model['source_sigma_hard_floor']:
+                log_sigma = floor_log_sigma(
+                    raw_log_sigma, FLAGS.model['source_sigma_min'])
+            else:
+                log_sigma = raw_log_sigma
             eps_x0 = shard_data(jax.random.normal(x0_key, batch_shape))
             return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
@@ -181,8 +184,11 @@ def eval_model(
                 z, x_base, sampled_modes, angular_codes, log_radius)
             mu_x0, raw_log_sigma, _ = call_source(
                 train_state, z, x_base, sampled_modes, angular_codes, log_radius)
-            log_sigma = floor_log_sigma(
-                raw_log_sigma, FLAGS.model['source_sigma_min'])
+            if FLAGS.model['source_sigma_hard_floor']:
+                log_sigma = floor_log_sigma(
+                    raw_log_sigma, FLAGS.model['source_sigma_min'])
+            else:
+                log_sigma = raw_log_sigma
             eps_x0 = shard_data(jax.random.normal(x0_key, latents.shape))
             return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
