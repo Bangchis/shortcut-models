@@ -5,8 +5,15 @@ import jax
 import jax.numpy as jnp
 
 
-def sample_source_gaussian(key, mu, log_sigma):
+def floor_log_sigma(log_sigma, sigma_min):
+    log_sigma_min = jnp.log(jnp.asarray(sigma_min, dtype=log_sigma.dtype))
+    return jnp.maximum(log_sigma, log_sigma_min)
+
+
+def sample_source_gaussian(key, mu, log_sigma, sigma_min=None):
     eps = jax.random.normal(key, mu.shape)
+    if sigma_min is not None:
+        log_sigma = floor_log_sigma(log_sigma, sigma_min)
     return mu + eps * jnp.exp(log_sigma)
 
 

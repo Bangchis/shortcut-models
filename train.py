@@ -36,7 +36,12 @@ from gmm_utils import (
     standardize_latents,
     temperature_smooth_probs,
 )
-from moe_source import SourceBaseNet, sample_source_gaussian, source_sigma_floor_loss
+from moe_source import (
+    SourceBaseNet,
+    floor_log_sigma,
+    sample_source_gaussian,
+    source_sigma_floor_loss,
+)
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
@@ -464,7 +469,7 @@ def main(_):
                     eps=FLAGS.model['source_eps'],
                 )
                 z = jax.random.normal(z_key, images.shape)
-                mu_x0, log_sigma, delta_mu = train_state.call_source(
+                mu_x0, raw_log_sigma, delta_mu = train_state.call_source(
                     z,
                     x_base,
                     mode_indices,
@@ -472,6 +477,8 @@ def main(_):
                     log_radius,
                     params=grad_params,
                 )
+                log_sigma = floor_log_sigma(
+                    raw_log_sigma, FLAGS.model['source_sigma_min'])
                 x_0 = sample_source_gaussian(x0_key, mu_x0, log_sigma)
                 x_t = (1 - t_full) * x_0 + t_full * images
                 v_t = images - x_0
@@ -510,7 +517,7 @@ def main(_):
                 loss_post = jnp.mean(categorical_kl(
                     q1_target, q0, eps=FLAGS.model['source_eps']))
                 loss_var = source_sigma_floor_loss(
-                    log_sigma, FLAGS.model['source_sigma_min'])
+                    raw_log_sigma, FLAGS.model['source_sigma_min'])
                 u_mu = local_coordinates_from_standardized(
                     mu_x0_std,
                     mode_indices,
@@ -524,6 +531,11 @@ def main(_):
                 align_cos = jnp.sum(s_mu * target_dirs, axis=-1)
                 loss_align = jnp.mean(1.0 - align_cos)
                 sigma = jnp.exp(log_sigma)
+                raw_sigma = jnp.exp(raw_log_sigma)
+                log_sigma_min = jnp.log(jnp.asarray(
+                    FLAGS.model['source_sigma_min'], dtype=raw_log_sigma.dtype))
+                sigma_floor_frac = jnp.mean(
+                    (raw_log_sigma < log_sigma_min).astype(jnp.float32))
                 x0_minus_base_norm = jnp.sqrt(jnp.mean(jnp.square(x_0 - x_base)))
                 delta_mu_norm = jnp.sqrt(jnp.mean(jnp.square(delta_mu)))
                 q0_entropy = jnp.mean(categorical_entropy(
@@ -551,6 +563,10 @@ def main(_):
                     'source/sigma_mean': jnp.mean(sigma),
                     'source/sigma_min': jnp.min(sigma),
                     'source/sigma_max': jnp.max(sigma),
+                    'source/sigma_raw_mean': jnp.mean(raw_sigma),
+                    'source/sigma_raw_min': jnp.min(raw_sigma),
+                    'source/sigma_raw_max': jnp.max(raw_sigma),
+                    'source/sigma_floor_frac': sigma_floor_frac,
                     'source/x0_minus_base_norm': x0_minus_base_norm,
                     'source/delta_mu_norm': delta_mu_norm,
                     'source/base_norm': jnp.sqrt(jnp.mean(jnp.square(x_base))),

@@ -13,6 +13,7 @@ from gmm_utils import (
     posterior_from_standardized,
     sample_lognormal_radius,
 )
+from moe_source import floor_log_sigma
 
 def eval_model(
     FLAGS,
@@ -120,8 +121,10 @@ def eval_model(
             )
             z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
                 z, x_base, sampled_modes, angular_codes, log_radius)
-            mu_x0, log_sigma, _ = call_source(
+            mu_x0, raw_log_sigma, _ = call_source(
                 train_state, z, x_base, sampled_modes, angular_codes, log_radius)
+            log_sigma = floor_log_sigma(
+                raw_log_sigma, FLAGS.model['source_sigma_min'])
             eps_x0 = shard_data(jax.random.normal(x0_key, batch_shape))
             return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
@@ -176,8 +179,10 @@ def eval_model(
             z = jax.random.normal(z_key, latents.shape)
             z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
                 z, x_base, sampled_modes, angular_codes, log_radius)
-            mu_x0, log_sigma, _ = call_source(
+            mu_x0, raw_log_sigma, _ = call_source(
                 train_state, z, x_base, sampled_modes, angular_codes, log_radius)
+            log_sigma = floor_log_sigma(
+                raw_log_sigma, FLAGS.model['source_sigma_min'])
             eps_x0 = shard_data(jax.random.normal(x0_key, latents.shape))
             return mu_x0 + eps_x0 * jnp.exp(log_sigma)
 
