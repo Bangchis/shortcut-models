@@ -204,6 +204,8 @@ model_config = ml_collections.ConfigDict({
     'moe_condition_use_geometry': 1,
     'moe_geometry_channels': 64,
     'moe_geometry_scale': 1.0,
+    'condition_sensitivity_metrics': 1,
+    'condition_sensitivity_interval': 1000,
     'source_condition_dim': 64,
     'source_channels': 128,
     'source_num_blocks': 6,
@@ -647,6 +649,16 @@ def main(_):
                 v_t_norm = jnp.sqrt(jnp.mean(jnp.square(v_t)))
                 v_prime_norm = jnp.sqrt(jnp.mean(jnp.square(v_prime)))
                 v_residual_norm = jnp.sqrt(jnp.mean(jnp.square(v_prime - v_t)))
+                conditioning_norm = jnp.sqrt(jnp.mean(
+                    jnp.square(activations['conditioning'])))
+                moe_condition_embed_norm = jnp.sqrt(jnp.mean(
+                    jnp.square(activations['moe_condition_embed'])))
+                if FLAGS.model['moe_condition_use_geometry']:
+                    moe_geometry_embed_norm = jnp.sqrt(jnp.mean(
+                        jnp.square(activations['moe_geometry_embed'])))
+                else:
+                    moe_geometry_embed_norm = jnp.asarray(
+                        0.0, dtype=loss_fm.dtype)
                 source_center_cos = jnp.mean(jnp.sum(
                     source_dirs * target_centers, axis=-1))
                 target_center_cos = jnp.mean(jnp.sum(
@@ -680,6 +692,92 @@ def main(_):
                 )
                 entangle_metrics = _same_condition_pair_metrics(
                     x_t, v_t, condition_ids, eps=FLAGS.model['source_eps'])
+                zero_sensitivity = {
+                    'condition/sensitivity_ran': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_all_norm': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_all_rel': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_geometry_norm': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_geometry_rel': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_rho_norm': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_zero_rho_rel': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_roll_all_norm': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                    'condition/sensitivity_roll_all_rel': jnp.asarray(
+                        0.0, dtype=loss_fm.dtype),
+                }
+                if FLAGS.model['condition_sensitivity_metrics']:
+                    sensitivity_interval = max(
+                        int(FLAGS.model['condition_sensitivity_interval']), 1)
+                    do_sensitivity = (
+                        (train_state.step + 1) % sensitivity_interval == 0)
+
+                    def sensitivity_true(_):
+                        zero_condition = jnp.zeros_like(moe_condition)
+                        zero_geometry = jnp.zeros_like(moe_geometry)
+                        rho_zero_condition = moe_condition.at[:, 2].set(0.0)
+                        rolled_condition = jnp.roll(
+                            moe_condition, shift=1, axis=0)
+                        rolled_geometry = jnp.roll(
+                            moe_geometry, shift=1, axis=0)
+
+                        def call_sensitivity(condition, geometry):
+                            return train_state.call_model(
+                                x_t,
+                                t,
+                                dt_base,
+                                labels_dropped,
+                                moe_condition=condition,
+                                moe_geometry=geometry,
+                                train=False,
+                                params=grad_params,
+                            )
+
+                        v_zero_all = call_sensitivity(
+                            zero_condition, zero_geometry)
+                        v_zero_geometry = call_sensitivity(
+                            moe_condition, zero_geometry)
+                        v_zero_rho = call_sensitivity(
+                            rho_zero_condition, moe_geometry)
+                        v_roll_all = call_sensitivity(
+                            rolled_condition, rolled_geometry)
+
+                        def delta_norm(v_alt):
+                            return jnp.sqrt(jnp.mean(jnp.square(
+                                v_alt - v_prime)))
+
+                        zero_all_norm = delta_norm(v_zero_all)
+                        zero_geometry_norm = delta_norm(v_zero_geometry)
+                        zero_rho_norm = delta_norm(v_zero_rho)
+                        roll_all_norm = delta_norm(v_roll_all)
+                        denom = v_prime_norm + FLAGS.model['source_eps']
+                        return {
+                            'condition/sensitivity_ran': jnp.asarray(
+                                1.0, dtype=loss_fm.dtype),
+                            'condition/sensitivity_zero_all_norm': zero_all_norm,
+                            'condition/sensitivity_zero_all_rel': zero_all_norm / denom,
+                            'condition/sensitivity_zero_geometry_norm': zero_geometry_norm,
+                            'condition/sensitivity_zero_geometry_rel': zero_geometry_norm / denom,
+                            'condition/sensitivity_zero_rho_norm': zero_rho_norm,
+                            'condition/sensitivity_zero_rho_rel': zero_rho_norm / denom,
+                            'condition/sensitivity_roll_all_norm': roll_all_norm,
+                            'condition/sensitivity_roll_all_rel': roll_all_norm / denom,
+                        }
+
+                    sensitivity_metrics = jax.lax.cond(
+                        do_sensitivity,
+                        sensitivity_true,
+                        lambda _: zero_sensitivity,
+                        operand=None,
+                    )
+                else:
+                    sensitivity_metrics = zero_sensitivity
                 loss = loss_fm
 
                 info = {
@@ -720,6 +818,15 @@ def main(_):
                         jnp.mean(jnp.square(moe_geometry))),
                     'condition/geometry_scale': jnp.asarray(
                         FLAGS.model['moe_geometry_scale'], dtype=loss_fm.dtype),
+                    'condition/conditioning_norm': conditioning_norm,
+                    'condition/moe_condition_embed_norm': moe_condition_embed_norm,
+                    'condition/moe_condition_embed_rel': (
+                        moe_condition_embed_norm
+                        / (conditioning_norm + FLAGS.model['source_eps'])),
+                    'condition/moe_geometry_embed_norm': moe_geometry_embed_norm,
+                    'condition/moe_geometry_embed_rel': (
+                        moe_geometry_embed_norm
+                        / (conditioning_norm + FLAGS.model['source_eps'])),
                     'posterior/q1_entropy': jnp.mean(categorical_entropy(
                         q1, eps=FLAGS.model['source_eps'])),
                     'angular/source_alignment_cosine': source_center_cos,
@@ -730,6 +837,7 @@ def main(_):
                     'dropped_ratio': jnp.mean(
                         labels_dropped == FLAGS.model['num_classes']),
                     **entangle_metrics,
+                    **sensitivity_metrics,
                     **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
                 }
                 for idx in range(FLAGS.model['gmm_num_modes']):

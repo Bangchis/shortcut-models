@@ -239,6 +239,13 @@ training/entangle/velocity_cos_same_c
 training/activations/moe_condition_embed
 training/activations/moe_geometry_embed
 training/condition/geometry_map_norm
+training/condition/moe_condition_embed_rel
+training/condition/moe_geometry_embed_rel
+training/condition/sensitivity_ran
+training/condition/sensitivity_zero_all_rel
+training/condition/sensitivity_zero_geometry_rel
+training/condition/sensitivity_zero_rho_rel
+training/condition/sensitivity_roll_all_rel
 ```
 
 `training_summary.csv` is written from the full scalar training metric dict. If
@@ -256,6 +263,16 @@ Interpretation:
 - If `moe_condition_embed` stays tiny and changing `c` has no effect, DiT is
   ignoring the condition.
 - If `moe_geometry_embed` stays tiny, the CNN geometry path is not contributing.
+- `sensitivity_zero_all_rel` measures output change when all MoE condition
+  signals are zeroed.
+- `sensitivity_zero_geometry_rel` measures output change when only geometry is
+  zeroed.
+- `sensitivity_zero_rho_rel` measures output change when only `rho` is set to
+  zero.
+- `sensitivity_roll_all_rel` measures output change when `(k,a,rho,geom)` is
+  replaced by another batch sample's condition. These sensitivity metrics run
+  only every `condition_sensitivity_interval` steps; `sensitivity_ran=1` marks
+  rows where they were actually computed.
 
 # Suggested Hyperparameters
 
@@ -270,6 +287,8 @@ source_direction_noise = 2.0
 moe_condition_use_geometry = 1
 moe_geometry_channels = 64
 moe_geometry_scale = 1.0
+condition_sensitivity_metrics = 1
+condition_sensitivity_interval = 1000
 ```
 
 Sweep if baseline is weak:
@@ -372,6 +391,8 @@ Train:
   --model.moe_condition_use_geometry=1 \
   --model.moe_geometry_channels=64 \
   --model.moe_geometry_scale=1.0 \
+  --model.condition_sensitivity_metrics=1 \
+  --model.condition_sensitivity_interval=1000 \
   --model.cfg_scale=0 \
   --model.class_dropout_prob=1 \
   --model.num_classes=1 \
@@ -416,6 +437,8 @@ Inference/FID-only run from a checkpoint:
   --model.moe_condition_use_geometry=1 \
   --model.moe_geometry_channels=64 \
   --model.moe_geometry_scale=1.0 \
+  --model.condition_sensitivity_metrics=1 \
+  --model.condition_sensitivity_interval=1000 \
   --model.cfg_scale=0 \
   --model.class_dropout_prob=1 \
   --model.num_classes=1 \
