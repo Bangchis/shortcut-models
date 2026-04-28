@@ -1,4 +1,6 @@
 from typing import Any
+import csv
+import os
 import jax.numpy as jnp
 from absl import app, flags
 from functools import partial
@@ -43,6 +45,50 @@ from moe_source import (
     source_sigma_floor_loss,
 )
 
+
+def _parse_csv_steps(step_text):
+    if not step_text:
+        return set()
+    steps = set()
+    for item in step_text.split(','):
+        item = item.strip()
+        if item:
+            steps.add(int(item))
+    return steps
+
+
+def _csv_scalar(value):
+    arr = np.asarray(value)
+    if arr.size != 1:
+        return ''
+    item = arr.reshape(()).item()
+    if isinstance(item, (np.integer, int)):
+        return int(item)
+    if isinstance(item, (np.floating, float)):
+        return float(item)
+    return item
+
+
+def _write_summary_csv(path, step, metrics):
+    if path is None:
+        return
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    row = {'step': int(step)}
+    row.update({key: _csv_scalar(value) for key, value in metrics.items()})
+    file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+    if file_exists:
+        with open(path, 'r', newline='') as f:
+            fieldnames = next(csv.reader(f))
+    else:
+        fieldnames = ['step'] + sorted(metrics.keys())
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(
+            f, fieldnames=fieldnames, extrasaction='ignore')
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
 flags.DEFINE_string('tfds_data_dir', None, 'Optional TFDS data directory.')
@@ -56,6 +102,13 @@ flags.DEFINE_integer('seed', 10, 'Random seed.')
 flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
 flags.DEFINE_integer('save_interval', 100000, 'Eval interval.')
+flags.DEFINE_string(
+    'summary_csv_path', None,
+    'Optional CSV path for scalar training summaries. Defaults to '
+    '<save_dir>/training_summary.csv when save_dir is set.')
+flags.DEFINE_string(
+    'summary_csv_steps', '',
+    'Comma-separated step list for CSV summaries. Empty means every log step.')
 flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
@@ -673,6 +726,11 @@ def main(_):
     # Train Loop
     ###################################
 
+    summary_csv_steps = _parse_csv_steps(FLAGS.summary_csv_steps)
+    summary_csv_path = FLAGS.summary_csv_path
+    if summary_csv_path is None and FLAGS.save_dir is not None:
+        summary_csv_path = os.path.join(FLAGS.save_dir, 'training_summary.csv')
+
     for i in tqdm.tqdm(range(1 + start_step, FLAGS.max_steps + 1 + start_step),
                        smoothing=0.1,
                        dynamic_ncols=True):
@@ -688,7 +746,10 @@ def main(_):
         train_state, update_info = update(
             train_state, train_state_teacher, batch_images, batch_labels)
 
-        if i % FLAGS.log_interval == 0 or i == 1:
+        should_log = i % FLAGS.log_interval == 0 or i == 1
+        should_write_summary = (
+            should_log if not summary_csv_steps else i in summary_csv_steps)
+        if should_log or should_write_summary:
             update_info = jax.device_get(update_info)
             update_info = jax.tree_map(lambda x: np.array(x), update_info)
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
@@ -706,7 +767,10 @@ def main(_):
             train_metrics['training/loss_valid'] = valid_update_info['loss']
 
             if jax.process_index() == 0:
-                wandb.log(train_metrics, step=i)
+                if should_log:
+                    wandb.log(train_metrics, step=i)
+                if should_write_summary:
+                    _write_summary_csv(summary_csv_path, i, train_metrics)
 
         if FLAGS.model['train_type'] == 'progressive':
             num_sections = np.log2(
