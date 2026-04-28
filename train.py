@@ -89,6 +89,13 @@ def _write_summary_csv(path, step, metrics):
         writer.writerow(row)
 
 
+def _upload_summary_csv_to_wandb(path):
+    if path is None or wandb.run is None:
+        return
+    base_path = os.path.dirname(path) or '.'
+    wandb.save(path, base_path=base_path, policy='now')
+
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
 flags.DEFINE_string('tfds_data_dir', None, 'Optional TFDS data directory.')
@@ -109,6 +116,9 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'summary_csv_steps', '',
     'Comma-separated step list for CSV summaries. Empty means every log step.')
+flags.DEFINE_integer(
+    'summary_csv_wandb_upload', 1,
+    'Upload the summary CSV to W&B run files after each CSV write.')
 flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
@@ -771,6 +781,8 @@ def main(_):
                     wandb.log(train_metrics, step=i)
                 if should_write_summary:
                     _write_summary_csv(summary_csv_path, i, train_metrics)
+                    if FLAGS.summary_csv_wandb_upload:
+                        _upload_summary_csv_to_wandb(summary_csv_path)
 
         if FLAGS.model['train_type'] == 'progressive':
             num_sections = np.log2(
