@@ -388,6 +388,73 @@ def build_source_base(
     return x_base_flat.reshape((modes.shape[0],) + tuple(latent_shape)), x_base_std
 
 
+def radius_to_rho(radius, modes, angular_codes, radius_log_mean, radius_log_std, eps=1e-8):
+    log_radius = jnp.log(jnp.maximum(radius, eps))
+    log_mean = radius_log_mean[modes, angular_codes]
+    log_std = jnp.maximum(radius_log_std[modes, angular_codes], eps)
+    return (log_radius - log_mean) / log_std, log_radius
+
+
+def rho_to_radius(rho, modes, angular_codes, radius_log_mean, radius_log_std):
+    log_mean = radius_log_mean[modes, angular_codes]
+    log_std = radius_log_std[modes, angular_codes]
+    log_radius = log_mean + log_std * rho
+    return jnp.exp(log_radius), log_radius
+
+
+def make_moe_condition(modes, angular_codes, rho):
+    return jnp.stack(
+        [
+            modes.astype(jnp.float32),
+            angular_codes.astype(jnp.float32),
+            rho.astype(jnp.float32),
+        ],
+        axis=-1,
+    )
+
+
+def sample_local_direction(key, centers, direction_noise, eps=1e-8):
+    dim = centers.shape[-1]
+    noise = jax.random.normal(key, centers.shape)
+    tangent = noise - jnp.sum(noise * centers, axis=-1, keepdims=True) * centers
+    tangent = tangent / jnp.sqrt(jnp.asarray(dim, dtype=tangent.dtype))
+    direction = centers + direction_noise * tangent
+    return directions_from_local(direction, eps=eps)
+
+
+def build_conditional_source(
+    key,
+    modes,
+    angular_codes,
+    rho,
+    latent_shape,
+    mean,
+    std,
+    standardize_eps,
+    mu,
+    var,
+    angular_centers,
+    radius_log_mean,
+    radius_log_std,
+    eta,
+    kappa,
+    direction_noise,
+    eps=1e-8,
+):
+    radius, log_radius = rho_to_radius(
+        rho, modes, angular_codes, radius_log_mean, radius_log_std)
+    mode_mu = mu[modes]
+    mode_var = jnp.maximum(var[modes], eps)
+    centers = angular_centers[modes, angular_codes]
+    source_dirs = sample_local_direction(
+        key, centers, direction_noise=direction_noise, eps=eps)
+    local_source = kappa * radius[:, None] * source_dirs
+    x0_std = mode_mu + (mode_var ** (0.5 * eta)) * local_source
+    x0_flat = unstandardize_latents(x0_std, mean, std, standardize_eps)
+    x0 = x0_flat.reshape((modes.shape[0],) + tuple(latent_shape))
+    return x0, x0_std, source_dirs, radius, log_radius
+
+
 def sample_lognormal_radius(key, modes, angular_codes, radius_log_mean, radius_log_std):
     log_mean = radius_log_mean[modes, angular_codes]
     log_std = radius_log_std[modes, angular_codes]

@@ -24,26 +24,18 @@ from model import DiT
 from helper_eval import eval_model
 from helper_inference import do_inference
 from gmm_utils import (
-    assign_angular_codes,
-    build_source_base,
+    build_conditional_source,
     categorical_entropy,
-    categorical_kl,
     directions_from_local,
     flatten_and_standardize,
     flatten_latents,
     load_gmm_stats,
     local_coordinates_from_standardized,
+    make_moe_condition,
     posterior_from_standardized,
-    sample_lognormal_radius,
-    standardize_latents,
-    temperature_smooth_probs,
+    radius_to_rho,
 )
-from moe_source import (
-    SourceBaseNet,
-    floor_log_sigma,
-    sample_source_gaussian,
-    source_sigma_floor_loss,
-)
+from moe_source import SourceBaseNet
 
 
 def _parse_csv_steps(step_text):
@@ -94,6 +86,39 @@ def _upload_summary_csv_to_wandb(path):
         return
     base_path = os.path.dirname(path) or '.'
     wandb.save(path, base_path=base_path, policy='now')
+
+
+def _same_condition_pair_metrics(x_t, v_t, condition_ids, eps=1e-8):
+    x_flat = flatten_latents(x_t)
+    v_flat = flatten_latents(v_t)
+    dim = x_flat.shape[-1]
+    x_sq = jnp.mean(jnp.square(x_flat), axis=-1)
+    v_sq = jnp.mean(jnp.square(v_flat), axis=-1)
+    x_dist_sq = jnp.maximum(
+        x_sq[:, None] + x_sq[None, :] - 2.0 * (x_flat @ x_flat.T) / dim,
+        0.0,
+    )
+    v_dist_sq = jnp.maximum(
+        v_sq[:, None] + v_sq[None, :] - 2.0 * (v_flat @ v_flat.T) / dim,
+        0.0,
+    )
+    v_norm = jnp.sqrt(jnp.maximum(v_sq, eps))
+    v_cos = (v_flat @ v_flat.T) / dim / (v_norm[:, None] * v_norm[None, :] + eps)
+    same = condition_ids[:, None] == condition_ids[None, :]
+    not_diag = ~jnp.eye(condition_ids.shape[0], dtype=bool)
+    mask = same & not_diag
+    mask_f = mask.astype(jnp.float32)
+    denom = jnp.maximum(jnp.sum(mask_f), 1.0)
+    x_dist = jnp.sqrt(x_dist_sq + eps)
+    v_dist = jnp.sqrt(v_dist_sq + eps)
+    return {
+        'entangle/same_c_pair_count': jnp.sum(mask_f),
+        'entangle/xt_pair_dist_same_c': jnp.sum(x_dist * mask_f) / denom,
+        'entangle/v_pair_dist_same_c': jnp.sum(v_dist * mask_f) / denom,
+        'entangle/path_lipschitz_proxy': jnp.sum(
+            (v_dist / (x_dist + eps)) * mask_f) / denom,
+        'entangle/velocity_cos_same_c': jnp.sum(v_cos * mask_f) / denom,
+    }
 
 
 FLAGS = flags.FLAGS
@@ -156,6 +181,9 @@ model_config = ml_collections.ConfigDict({
     'gmm_num_modes': 16,
     'angular_num_submodes': 4,
     'local_eta': 0.5,
+    'source_variant': 'conditional-analytic',
+    'source_kappa': 1.4,
+    'source_direction_noise': 2.0,
     'source_condition_dim': 64,
     'source_channels': 128,
     'source_num_blocks': 6,
@@ -165,10 +193,10 @@ model_config = ml_collections.ConfigDict({
     'source_sigma_hard_floor': 0,
     'source_sensitivity_metrics': 1,
     'source_eps': 1e-8,
-    'loss_post_weight': 0.1,
+    'loss_post_weight': 0.0,
     'posterior_temperature': 2.0,
-    'loss_var_weight': 0.05,
-    'loss_align_weight': 0.01,
+    'loss_var_weight': 0.0,
+    'loss_align_weight': 0.0,
 
     # ===== Khoat Flow Matching defaults =====
     'kfm_p_min': 0.20,          # P_min = 75%
@@ -315,9 +343,18 @@ def main(_):
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
         'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow', 'khoat-fm')) else True,
+        'moe_conditioning': (
+            FLAGS.model['train_type'] == 'naive-moe-source'
+            and FLAGS.model['source_variant'] == 'conditional-analytic'
+        ),
+        'gmm_num_modes': FLAGS.model['gmm_num_modes'],
+        'angular_num_submodes': FLAGS.model['angular_num_submodes'],
     }
     model_def = DiT(**dit_args)
-    if FLAGS.model.train_type == 'naive-moe-source':
+    if (
+        FLAGS.model.train_type == 'naive-moe-source'
+        and FLAGS.model['source_variant'] == 'source-net'
+    ):
         source_model_def = SourceBaseNet(
             num_modes=FLAGS.model['gmm_num_modes'],
             angular_num_submodes=FLAGS.model['angular_num_submodes'],
@@ -461,11 +498,14 @@ def main(_):
                 labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
 
         if FLAGS.model['train_type'] == 'naive-moe-source':
+            if FLAGS.model['source_variant'] != 'conditional-analytic':
+                raise ValueError(
+                    "Only --model.source_variant=conditional-analytic is "
+                    "supported for the current naive-moe-source path.")
 
             def loss_fn(grad_params):
-                label_key, time_key, z_key, radius_key, x0_key, sens_key = (
-                    jax.random.split(targets_key, 6))
-                z_sens_key, _ = jax.random.split(sens_key)
+                label_key, time_key, direction_key = jax.random.split(
+                    targets_key, 3)
 
                 labels_dropout = jax.random.bernoulli(
                     label_key,
@@ -503,52 +543,57 @@ def main(_):
                 )
                 q1 = jax.lax.stop_gradient(q1)
                 mode_indices = jnp.argmax(q1, axis=-1).astype(jnp.int32)
-                angular_indices, _ = assign_angular_codes(
+                local_coords = local_coordinates_from_standardized(
                     latents_std,
                     mode_indices,
                     gmm_state['mu'],
                     gmm_state['var'],
-                    gmm_state['angular_centers'],
                     gmm_local_eta,
                     eps=FLAGS.model['source_eps'],
                 )
-                angular_indices = angular_indices.astype(jnp.int32)
-                radius, log_radius = sample_lognormal_radius(
-                    radius_key,
+                target_radius = jnp.linalg.norm(local_coords, axis=-1)
+                target_dirs = directions_from_local(
+                    local_coords, eps=FLAGS.model['source_eps'])
+                target_centers_all = gmm_state['angular_centers'][mode_indices]
+                angular_scores = jnp.einsum(
+                    'bd,bad->ba', target_dirs, target_centers_all)
+                angular_indices = jnp.argmax(
+                    angular_scores, axis=-1).astype(jnp.int32)
+                target_centers = gmm_state['angular_centers'][
+                    mode_indices, angular_indices]
+                rho, log_radius = radius_to_rho(
+                    target_radius,
                     mode_indices,
                     angular_indices,
                     gmm_state['radius_log_mean'],
                     gmm_state['radius_log_std'],
-                )
-                x_base, _ = build_source_base(
-                    mode_indices,
-                    angular_indices,
-                    radius,
-                    images.shape[1:],
-                    gmm_state['mean'],
-                    gmm_state['std'],
-                    gmm_standardize_eps,
-                    gmm_state['mu'],
-                    gmm_state['var'],
-                    gmm_state['angular_centers'],
-                    gmm_local_eta,
                     eps=FLAGS.model['source_eps'],
                 )
-                z = jax.random.normal(z_key, images.shape)
-                mu_x0, raw_log_sigma, delta_mu = train_state.call_source(
-                    z,
-                    x_base,
-                    mode_indices,
-                    angular_indices,
-                    log_radius,
-                    params=grad_params,
-                )
-                if FLAGS.model['source_sigma_hard_floor']:
-                    log_sigma = floor_log_sigma(
-                        raw_log_sigma, FLAGS.model['source_sigma_min'])
-                else:
-                    log_sigma = raw_log_sigma
-                x_0 = sample_source_gaussian(x0_key, mu_x0, log_sigma)
+                moe_condition = make_moe_condition(
+                    mode_indices, angular_indices, rho)
+
+                x_0, x0_std, source_dirs, source_radius, source_log_radius = (
+                    build_conditional_source(
+                        direction_key,
+                        mode_indices,
+                        angular_indices,
+                        rho,
+                        images.shape[1:],
+                        gmm_state['mean'],
+                        gmm_state['std'],
+                        gmm_standardize_eps,
+                        gmm_state['mu'],
+                        gmm_state['var'],
+                        gmm_state['angular_centers'],
+                        gmm_state['radius_log_mean'],
+                        gmm_state['radius_log_std'],
+                        gmm_local_eta,
+                        FLAGS.model['source_kappa'],
+                        FLAGS.model['source_direction_noise'],
+                        eps=FLAGS.model['source_eps'],
+                    ))
+                x_0 = jax.lax.stop_gradient(x_0)
+                source_dirs = jax.lax.stop_gradient(source_dirs)
                 x_t = (1 - t_full) * x_0 + t_full * images
                 v_t = images - x_0
                 dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
@@ -559,6 +604,7 @@ def main(_):
                     t,
                     dt_base,
                     labels_dropped,
+                    moe_condition=moe_condition,
                     train=True,
                     rngs={'dropout': dropout_key},
                     params=grad_params,
@@ -566,134 +612,102 @@ def main(_):
                 )
                 mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
                 loss_fm = jnp.mean(mse_v)
-                mu_x0_std = standardize_latents(
-                    flatten_latents(mu_x0),
+                v_t_norm = jnp.sqrt(jnp.mean(jnp.square(v_t)))
+                v_prime_norm = jnp.sqrt(jnp.mean(jnp.square(v_prime)))
+                v_residual_norm = jnp.sqrt(jnp.mean(jnp.square(v_prime - v_t)))
+                source_center_cos = jnp.mean(jnp.sum(
+                    source_dirs * target_centers, axis=-1))
+                target_center_cos = jnp.mean(jnp.sum(
+                    target_dirs * target_centers, axis=-1))
+                source_target_direction_cos = jnp.mean(jnp.sum(
+                    source_dirs * target_dirs, axis=-1))
+                x0_std_back = flatten_and_standardize(
+                    x_0,
                     gmm_state['mean'],
                     gmm_state['std'],
                     gmm_standardize_eps,
                 )
-                q0 = posterior_from_standardized(
-                    mu_x0_std,
-                    gmm_state['log_pi'],
-                    gmm_state['mu'],
-                    gmm_state['var'],
+                x0_roundtrip_std_error = jnp.sqrt(jnp.mean(
+                    jnp.square(x0_std_back - x0_std)))
+                condition_ids = (
+                    mode_indices * FLAGS.model['angular_num_submodes']
+                    + angular_indices
                 )
-                q1_target = jax.lax.stop_gradient(temperature_smooth_probs(
-                    q1,
-                    FLAGS.model['posterior_temperature'],
-                    eps=FLAGS.model['source_eps'],
-                ))
-                loss_post = jnp.mean(categorical_kl(
-                    q1_target, q0, eps=FLAGS.model['source_eps']))
-                loss_var = source_sigma_floor_loss(
-                    raw_log_sigma, FLAGS.model['source_sigma_min'])
-                u_mu = local_coordinates_from_standardized(
-                    mu_x0_std,
-                    mode_indices,
-                    gmm_state['mu'],
-                    gmm_state['var'],
-                    gmm_local_eta,
-                    eps=FLAGS.model['source_eps'],
+                num_condition_codes = (
+                    FLAGS.model['gmm_num_modes']
+                    * FLAGS.model['angular_num_submodes']
                 )
-                s_mu = directions_from_local(u_mu, eps=FLAGS.model['source_eps'])
-                target_dirs = gmm_state['angular_centers'][mode_indices, angular_indices]
-                align_cos = jnp.sum(s_mu * target_dirs, axis=-1)
-                loss_align = jnp.mean(1.0 - align_cos)
-                sigma = jnp.exp(log_sigma)
-                raw_sigma = jnp.exp(raw_log_sigma)
-                log_sigma_min = jnp.log(jnp.asarray(
-                    FLAGS.model['source_sigma_min'], dtype=raw_log_sigma.dtype))
-                sigma_floor_frac = jnp.mean(
-                    (raw_log_sigma < log_sigma_min).astype(jnp.float32))
-                x0_minus_base_norm = jnp.sqrt(jnp.mean(jnp.square(x_0 - x_base)))
-                x0_minus_x1_norm = jnp.sqrt(jnp.mean(jnp.square(x_0 - images)))
-                mu_x0_minus_x1_norm = jnp.sqrt(
-                    jnp.mean(jnp.square(mu_x0 - images)))
-                base_minus_x1_norm = jnp.sqrt(
-                    jnp.mean(jnp.square(x_base - images)))
-                delta_mu_norm = jnp.sqrt(jnp.mean(jnp.square(delta_mu)))
-                if FLAGS.model['source_sensitivity_metrics']:
-                    z_alt = jax.random.normal(z_sens_key, images.shape)
-                    mu_x0_z_alt, _, _ = train_state.call_source(
-                        z_alt,
-                        x_base,
-                        mode_indices,
-                        angular_indices,
-                        log_radius,
-                        params=grad_params,
-                    )
-                    angular_alt = (
-                        angular_indices + 1
-                    ) % FLAGS.model['angular_num_submodes']
-                    mu_x0_a_alt, _, _ = train_state.call_source(
-                        z,
-                        x_base,
-                        mode_indices,
-                        angular_alt,
-                        log_radius,
-                        params=grad_params,
-                    )
-                    z_sensitivity_mu = jnp.sqrt(
-                        jnp.mean(jnp.square(mu_x0_z_alt - mu_x0)))
-                    angular_sensitivity_mu = jnp.sqrt(
-                        jnp.mean(jnp.square(mu_x0_a_alt - mu_x0)))
-                else:
-                    z_sensitivity_mu = jnp.asarray(0.0, dtype=images.dtype)
-                    angular_sensitivity_mu = jnp.asarray(0.0, dtype=images.dtype)
-                q0_entropy = jnp.mean(categorical_entropy(
-                    q0, eps=FLAGS.model['source_eps']))
-                q1_entropy = jnp.mean(categorical_entropy(
-                    q1, eps=FLAGS.model['source_eps']))
-                posterior_agreement = jnp.mean(
-                    (jnp.argmax(q0, axis=-1) == mode_indices).astype(jnp.float32))
-                angular_alignment = jnp.mean(align_cos)
-                loss = (
-                    loss_fm
-                    + FLAGS.model['loss_post_weight'] * loss_post
-                    + FLAGS.model['loss_var_weight'] * loss_var
-                    + FLAGS.model['loss_align_weight'] * loss_align
+                condition_code_probs = (
+                    jnp.bincount(condition_ids, length=num_condition_codes)
+                    .astype(jnp.float32)
+                    / images.shape[0]
                 )
+                condition_code_entropy = -jnp.sum(
+                    condition_code_probs
+                    * jnp.log(jnp.maximum(condition_code_probs, FLAGS.model['source_eps']))
+                )
+                entangle_metrics = _same_condition_pair_metrics(
+                    x_t, v_t, condition_ids, eps=FLAGS.model['source_eps'])
+                loss = loss_fm
 
                 info = {
                     'loss': loss,
                     'loss/fm': loss_fm,
-                    'loss/post': loss_post,
-                    'loss/var': loss_var,
-                    'loss/align': loss_align,
+                    'loss/post': jnp.asarray(0.0, dtype=loss_fm.dtype),
+                    'loss/var': jnp.asarray(0.0, dtype=loss_fm.dtype),
+                    'loss/align': jnp.asarray(0.0, dtype=loss_fm.dtype),
                     'source/x0_sample_norm': jnp.sqrt(jnp.mean(jnp.square(x_0))),
-                    'source/mu_x0_norm': jnp.sqrt(jnp.mean(jnp.square(mu_x0))),
-                    'source/sigma_mean': jnp.mean(sigma),
-                    'source/sigma_min': jnp.min(sigma),
-                    'source/sigma_max': jnp.max(sigma),
-                    'source/sigma_raw_mean': jnp.mean(raw_sigma),
-                    'source/sigma_raw_min': jnp.min(raw_sigma),
-                    'source/sigma_raw_max': jnp.max(raw_sigma),
-                    'source/sigma_floor_frac': sigma_floor_frac,
-                    'source/x0_minus_base_norm': x0_minus_base_norm,
-                    'source/x0_minus_x1_norm': x0_minus_x1_norm,
-                    'source/mu_x0_minus_x1_norm': mu_x0_minus_x1_norm,
-                    'source/base_minus_x1_norm': base_minus_x1_norm,
-                    'source/delta_mu_norm': delta_mu_norm,
-                    'source/base_norm': jnp.sqrt(jnp.mean(jnp.square(x_base))),
-                    'condition/z_sensitivity_mu': z_sensitivity_mu,
-                    'condition/angular_sensitivity_mu': angular_sensitivity_mu,
-                    'posterior/agreement_argmax_mu_x0_x1': posterior_agreement,
-                    'posterior/q0_entropy': q0_entropy,
-                    'posterior/q1_entropy': q1_entropy,
-                    'angular/source_alignment_cosine': angular_alignment,
-                    'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                    'source/x1_norm': jnp.sqrt(jnp.mean(jnp.square(images))),
+                    'source/x0_minus_x1_norm': jnp.sqrt(
+                        jnp.mean(jnp.square(x_0 - images))),
+                    'source/target_radius_mean': jnp.mean(target_radius),
+                    'source/target_radius_std': jnp.std(target_radius),
+                    'source/source_radius_mean': jnp.mean(source_radius),
+                    'source/effective_radius_mean': jnp.mean(
+                        FLAGS.model['source_kappa'] * source_radius),
+                    'source/source_log_radius_mean': jnp.mean(source_log_radius),
+                    'source/source_center_cos': source_center_cos,
+                    'source/target_center_cos': target_center_cos,
+                    'source/source_target_direction_cos': source_target_direction_cos,
+                    'source/kappa': jnp.asarray(
+                        FLAGS.model['source_kappa'], dtype=loss_fm.dtype),
+                    'source/direction_noise': jnp.asarray(
+                        FLAGS.model['source_direction_noise'], dtype=loss_fm.dtype),
+                    'source/x0_std_roundtrip_error': x0_roundtrip_std_error,
+                    'condition/rho_mean': jnp.mean(rho),
+                    'condition/rho_abs_mean': jnp.mean(jnp.abs(rho)),
+                    'condition/rho_std': jnp.std(rho),
+                    'condition/rho_min': jnp.min(rho),
+                    'condition/rho_max': jnp.max(rho),
+                    'condition/log_radius_mean': jnp.mean(log_radius),
+                    'condition/source_log_radius_mean': jnp.mean(source_log_radius),
+                    'condition/code_entropy_batch': condition_code_entropy,
+                    'condition/effective_codes_batch': jnp.exp(
+                        condition_code_entropy),
+                    'posterior/q1_entropy': jnp.mean(categorical_entropy(
+                        q1, eps=FLAGS.model['source_eps'])),
+                    'angular/source_alignment_cosine': source_center_cos,
+                    'angular/target_alignment_cosine': target_center_cos,
+                    'v_magnitude_target': v_t_norm,
+                    'v_magnitude_prime': v_prime_norm,
+                    'v_residual_norm': v_residual_norm,
                     'dropped_ratio': jnp.mean(
                         labels_dropped == FLAGS.model['num_classes']),
+                    **entangle_metrics,
                     **{'activations/' + k: jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
                 }
                 for idx in range(FLAGS.model['gmm_num_modes']):
                     info[f'condition/mode_usage_{idx}'] = jnp.mean(
                         (mode_indices == idx).astype(jnp.float32))
                     info[f'posterior/q1_mean_{idx}'] = jnp.mean(q1[:, idx])
-                    info[f'posterior/q0_mean_{idx}'] = jnp.mean(q0[:, idx])
                 for idx in range(FLAGS.model['angular_num_submodes']):
                     info[f'condition/angular_usage_{idx}'] = jnp.mean(
                         (angular_indices == idx).astype(jnp.float32))
+                for idx in range(
+                    FLAGS.model['gmm_num_modes']
+                    * FLAGS.model['angular_num_submodes']
+                ):
+                    info[f'condition/code_usage_{idx}'] = condition_code_probs[idx]
 
                 return loss, info
 
@@ -758,7 +772,11 @@ def main(_):
         info['update_norm'] = optax.global_norm(updates)
         info['param_norm'] = optax.global_norm(new_params)
         info['lr'] = lr_schedule(train_state.step)
-        if FLAGS.model['train_type'] == 'naive-moe-source':
+        if (
+            FLAGS.model['train_type'] == 'naive-moe-source'
+            and isinstance(grads, dict)
+            and 'source' in grads
+        ):
             info['grad/source_total_norm'] = optax.global_norm(grads['source'])
 
         train_state = train_state.replace(

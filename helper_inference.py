@@ -8,8 +8,10 @@ import matplotlib.pyplot as plt
 import os
 from functools import partial
 from absl import app, flags
-from gmm_utils import build_source_base, sample_lognormal_radius
-from moe_source import floor_log_sigma
+from gmm_utils import (
+    build_conditional_source,
+    make_moe_condition,
+)
 
 flags.DEFINE_integer('inference_timesteps', 128, 'Number of timesteps for inference.')
 flags.DEFINE_integer('inference_generations', 4096, 'Number of generations for inference.')
@@ -59,29 +61,36 @@ def do_inference(
             img = np.array(img)
             return img
         
-        @partial(jax.jit, static_argnums=(5,))
-        def call_model(train_state, images, t, dt, labels, use_ema=True):
+        @partial(jax.jit, static_argnames=('use_ema',))
+        def call_model(
+            train_state,
+            images,
+            t,
+            dt,
+            labels,
+            moe_condition,
+            use_ema=True,
+        ):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_model_ema
             else:
                 call_fn = train_state.call_model
-            output = call_fn(images, t, dt, labels, train=False)
+            output = call_fn(
+                images,
+                t,
+                dt,
+                labels,
+                moe_condition=moe_condition,
+                train=False,
+            )
             return output
-
-        @partial(jax.jit, static_argnums=(6,))
-        def call_source(train_state, z, x_base, modes, angular_codes, log_radius, use_ema=True):
-            if use_ema and FLAGS.model.use_ema:
-                call_fn = train_state.call_source_ema
-            else:
-                call_fn = train_state.call_source
-            return call_fn(z, x_base, modes, angular_codes, log_radius)
 
         def sample_source_prior(sample_key):
             if FLAGS.model.train_type != 'naive-moe-source':
                 latents = jax.random.normal(sample_key, images_shape)
-                return shard_data(latents)
-            z_key, mode_key, angular_key, radius_key, x0_key = jax.random.split(sample_key, 5)
-            z = jax.random.normal(z_key, images_shape)
+                return shard_data(latents), None
+            mode_key, angular_key, rho_key, direction_key = jax.random.split(
+                sample_key, 4)
             sampled_modes = jax.random.categorical(
                 mode_key,
                 jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
@@ -93,17 +102,12 @@ def do_inference(
                 jnp.log(jnp.maximum(angular_probs, 1e-8)),
                 axis=-1,
             )
-            radius, log_radius = sample_lognormal_radius(
-                radius_key,
+            rho = jax.random.normal(rho_key, (images_shape[0],))
+            x0, _, _, _, _ = build_conditional_source(
+                direction_key,
                 sampled_modes,
                 angular_codes,
-                gmm_state['radius_log_mean'],
-                gmm_state['radius_log_std'],
-            )
-            x_base, _ = build_source_base(
-                sampled_modes,
-                angular_codes,
-                radius,
+                rho,
                 images_shape[1:],
                 gmm_state['mean'],
                 gmm_state['std'],
@@ -111,20 +115,16 @@ def do_inference(
                 gmm_state['mu'],
                 gmm_state['var'],
                 gmm_state['angular_centers'],
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
                 source_local_eta,
+                FLAGS.model['source_kappa'],
+                FLAGS.model['source_direction_noise'],
                 eps=FLAGS.model['source_eps'],
             )
-            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
-                z, x_base, sampled_modes, angular_codes, log_radius)
-            mu_x0, raw_log_sigma, _ = call_source(
-                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
-            if FLAGS.model['source_sigma_hard_floor']:
-                log_sigma = floor_log_sigma(
-                    raw_log_sigma, FLAGS.model['source_sigma_min'])
-            else:
-                log_sigma = raw_log_sigma
-            eps_x0 = shard_data(jax.random.normal(x0_key, images_shape))
-            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
+            moe_condition = make_moe_condition(
+                sampled_modes, angular_codes, rho)
+            return shard_data(x0, moe_condition)
         
         if FLAGS.mode == 'interpolate':
             seed = 5
@@ -137,7 +137,8 @@ def do_inference(
             t_vector = jnp.full((FLAGS.batch_size, ), 0)
             dt_vector = jnp.zeros_like(t_vector)
             cfg_scale = FLAGS.inference_cfg_scale
-            v = call_model(train_state, x, t_vector, dt_vector, labels)
+            v = call_model(
+                train_state, x, t_vector, dt_vector, labels, None)
             x = x + v * 1.0
             x = vae_decode(x) # Image is in [-1, 1] space.
             x_render = np.array(jax.experimental.multihost_utils.process_allgather(x))
@@ -161,7 +162,7 @@ def do_inference(
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
-            x = sample_source_prior(eps_key)
+            x, moe_condition = sample_source_prior(eps_key)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             labels = shard_data(labels)
             x0_initial = x  # initial noise for ti==0 special-case
@@ -179,12 +180,20 @@ def do_inference(
                     # print(dt_base)
                 t_vector, dt_base = shard_data(t_vector, dt_base)
                 if cfg_scale == 1:
-                    v = call_model(train_state, x, t_vector, dt_base, labels)
+                    v = call_model(
+                        train_state, x, t_vector, dt_base,
+                        labels, moe_condition)
                 elif cfg_scale == 0:
-                    v = call_model(train_state, x, t_vector, dt_base, labels_uncond)
+                    v = call_model(
+                        train_state, x, t_vector, dt_base,
+                        labels_uncond, moe_condition)
                 else:
-                    v_pred_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
-                    v_pred_label = call_model(train_state, x, t_vector, dt_base, labels)
+                    v_pred_uncond = call_model(
+                        train_state, x, t_vector, dt_base,
+                        labels_uncond, moe_condition)
+                    v_pred_label = call_model(
+                        train_state, x, t_vector, dt_base,
+                        labels, moe_condition)
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                 if FLAGS.model.train_type == 'khoat-fm':

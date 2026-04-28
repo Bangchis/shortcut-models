@@ -103,6 +103,52 @@ class LabelEmbedder(nn.Module):
                                    embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
         embeddings = embedding_table(labels)
         return embeddings
+
+
+class MoEConditionEmbedder(nn.Module):
+    """
+    Embeds latent MoE condition c=(k, a, rho) into DiT conditioning space.
+    """
+    num_modes: int
+    angular_num_submodes: int
+    hidden_size: int
+    tc: TrainConfig
+
+    @nn.compact
+    def __call__(self, condition):
+        modes = condition[:, 0].astype(jnp.int32)
+        angular_codes = condition[:, 1].astype(jnp.int32)
+        rho = condition[:, 2:3].astype(jnp.float32)
+        mode_embed = nn.Embed(
+            self.num_modes,
+            self.hidden_size,
+            embedding_init=nn.initializers.normal(0.02),
+            dtype=self.tc.dtype,
+            name='mode_embed',
+        )(modes)
+        angular_embed = nn.Embed(
+            self.angular_num_submodes,
+            self.hidden_size,
+            embedding_init=nn.initializers.normal(0.02),
+            dtype=self.tc.dtype,
+            name='angular_embed',
+        )(angular_codes)
+        rho_embed = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(0.02),
+            bias_init=self.tc.kern_init('moe_rho_bias'),
+            dtype=self.tc.dtype,
+            name='rho_dense_0',
+        )(rho)
+        rho_embed = nn.silu(rho_embed)
+        rho_embed = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(0.02),
+            bias_init=self.tc.kern_init('moe_rho_bias'),
+            dtype=self.tc.dtype,
+            name='rho_dense_1',
+        )(rho_embed)
+        return mode_embed + angular_embed + rho_embed
     
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
@@ -232,9 +278,21 @@ class DiT(nn.Module):
     ignore_dt: bool = False
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
+    moe_conditioning: bool = False
+    gmm_num_modes: int = 1
+    angular_num_submodes: int = 1
 
     @nn.compact
-    def __call__(self, x, t, dt, y, train=False, return_activations=False):
+    def __call__(
+        self,
+        x,
+        t,
+        dt,
+        y,
+        moe_condition=None,
+        train=False,
+        return_activations=False,
+    ):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         print("DiT: Input of shape", x.shape, "dtype", x.dtype)
         activations = {}
@@ -262,6 +320,17 @@ class DiT(nn.Module):
         dte = TimestepEmbedder(self.hidden_size, tc=tc)(dt) # (B, hidden_size)
         ye = LabelEmbedder(self.num_classes, self.hidden_size, tc=tc)(y) # (B, hidden_size)
         c = te + ye + dte
+        if self.moe_conditioning:
+            if moe_condition is None:
+                moe_condition = jnp.zeros((batch_size, 3), dtype=jnp.float32)
+            ce = MoEConditionEmbedder(
+                self.gmm_num_modes,
+                self.angular_num_submodes,
+                self.hidden_size,
+                tc=tc,
+            )(moe_condition)
+            c = c + ce
+            activations['moe_condition_embed'] = ce
         
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = te

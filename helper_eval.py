@@ -8,12 +8,13 @@ import matplotlib.pyplot as plt
 from functools import partial
 from gmm_utils import (
     assign_angular_codes,
-    build_source_base,
+    build_conditional_source,
     flatten_and_standardize,
+    local_coordinates_from_standardized,
+    make_moe_condition,
     posterior_from_standardized,
-    sample_lognormal_radius,
+    radius_to_rho,
 )
-from moe_source import floor_log_sigma
 
 def eval_model(
     FLAGS,
@@ -65,28 +66,35 @@ def eval_model(
             img = np.array(img)
             return img
         
-        @partial(jax.jit, static_argnums=(5,))
-        def call_model(train_state, images, t, dt, labels, use_ema=True):
+        @partial(jax.jit, static_argnames=('use_ema',))
+        def call_model(
+            train_state,
+            images,
+            t,
+            dt,
+            labels,
+            moe_condition,
+            use_ema=True,
+        ):
             if use_ema and FLAGS.model.use_ema:
                 call_fn = train_state.call_model_ema
             else:
                 call_fn = train_state.call_model
-            output = call_fn(images, t, dt, labels, train=False)
+            output = call_fn(
+                images,
+                t,
+                dt,
+                labels,
+                moe_condition=moe_condition,
+                train=False,
+            )
             return output
-
-        @partial(jax.jit, static_argnums=(6,))
-        def call_source(train_state, z, x_base, modes, angular_codes, log_radius, use_ema=True):
-            if use_ema and FLAGS.model.use_ema:
-                call_fn = train_state.call_source_ema
-            else:
-                call_fn = train_state.call_source
-            return call_fn(z, x_base, modes, angular_codes, log_radius)
 
         def sample_source_prior(sample_key, batch_shape):
             if FLAGS.model.train_type != 'naive-moe-source':
-                return shard_data(jax.random.normal(sample_key, batch_shape))
-            z_key, mode_key, angular_key, radius_key, x0_key = jax.random.split(sample_key, 5)
-            z = jax.random.normal(z_key, batch_shape)
+                return shard_data(jax.random.normal(sample_key, batch_shape)), None
+            mode_key, angular_key, rho_key, direction_key = jax.random.split(
+                sample_key, 4)
             sampled_modes = jax.random.categorical(
                 mode_key,
                 jnp.log(jnp.maximum(gmm_state['pi'], 1e-8)),
@@ -98,17 +106,12 @@ def eval_model(
                 jnp.log(jnp.maximum(angular_probs, 1e-8)),
                 axis=-1,
             )
-            radius, log_radius = sample_lognormal_radius(
-                radius_key,
+            rho = jax.random.normal(rho_key, (batch_shape[0],))
+            x0, _, _, _, _ = build_conditional_source(
+                direction_key,
                 sampled_modes,
                 angular_codes,
-                gmm_state['radius_log_mean'],
-                gmm_state['radius_log_std'],
-            )
-            x_base, _ = build_source_base(
-                sampled_modes,
-                angular_codes,
-                radius,
+                rho,
                 batch_shape[1:],
                 gmm_state['mean'],
                 gmm_state['std'],
@@ -116,25 +119,21 @@ def eval_model(
                 gmm_state['mu'],
                 gmm_state['var'],
                 gmm_state['angular_centers'],
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
                 source_local_eta,
+                FLAGS.model['source_kappa'],
+                FLAGS.model['source_direction_noise'],
                 eps=FLAGS.model['source_eps'],
             )
-            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
-                z, x_base, sampled_modes, angular_codes, log_radius)
-            mu_x0, raw_log_sigma, _ = call_source(
-                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
-            if FLAGS.model['source_sigma_hard_floor']:
-                log_sigma = floor_log_sigma(
-                    raw_log_sigma, FLAGS.model['source_sigma_min'])
-            else:
-                log_sigma = raw_log_sigma
-            eps_x0 = shard_data(jax.random.normal(x0_key, batch_shape))
-            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
+            moe_condition = make_moe_condition(
+                sampled_modes, angular_codes, rho)
+            return shard_data(x0, moe_condition)
 
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
-                return latents
-            z_key, radius_key, x0_key = jax.random.split(sample_key, 3)
+                return latents, None
+            direction_key = sample_key
             latents_std = flatten_and_standardize(
                 latents,
                 gmm_state['mean'],
@@ -158,17 +157,28 @@ def eval_model(
                 eps=FLAGS.model['source_eps'],
             )
             angular_codes = angular_codes.astype(jnp.int32)
-            radius, log_radius = sample_lognormal_radius(
-                radius_key,
+            local_coords = local_coordinates_from_standardized(
+                latents_std,
+                sampled_modes,
+                gmm_state['mu'],
+                gmm_state['var'],
+                source_local_eta,
+                eps=FLAGS.model['source_eps'],
+            )
+            radius = jnp.linalg.norm(local_coords, axis=-1)
+            rho, _ = radius_to_rho(
+                radius,
                 sampled_modes,
                 angular_codes,
                 gmm_state['radius_log_mean'],
                 gmm_state['radius_log_std'],
+                eps=FLAGS.model['source_eps'],
             )
-            x_base, _ = build_source_base(
+            x0, _, _, _, _ = build_conditional_source(
+                direction_key,
                 sampled_modes,
                 angular_codes,
-                radius,
+                rho,
                 latents.shape[1:],
                 gmm_state['mean'],
                 gmm_state['std'],
@@ -176,21 +186,16 @@ def eval_model(
                 gmm_state['mu'],
                 gmm_state['var'],
                 gmm_state['angular_centers'],
+                gmm_state['radius_log_mean'],
+                gmm_state['radius_log_std'],
                 source_local_eta,
+                FLAGS.model['source_kappa'],
+                FLAGS.model['source_direction_noise'],
                 eps=FLAGS.model['source_eps'],
             )
-            z = jax.random.normal(z_key, latents.shape)
-            z, x_base, sampled_modes, angular_codes, log_radius = shard_data(
-                z, x_base, sampled_modes, angular_codes, log_radius)
-            mu_x0, raw_log_sigma, _ = call_source(
-                train_state, z, x_base, sampled_modes, angular_codes, log_radius)
-            if FLAGS.model['source_sigma_hard_floor']:
-                log_sigma = floor_log_sigma(
-                    raw_log_sigma, FLAGS.model['source_sigma_min'])
-            else:
-                log_sigma = raw_log_sigma
-            eps_x0 = shard_data(jax.random.normal(x0_key, latents.shape))
-            return mu_x0 + eps_x0 * jnp.exp(log_sigma)
+            moe_condition = make_moe_condition(
+                sampled_modes, angular_codes, rho)
+            return shard_data(x0, moe_condition)
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:
@@ -241,9 +246,14 @@ def eval_model(
         print("One-step Denoising at various t.")
         if 'latent' in FLAGS.dataset_name:
             eps = eps_valid
+        posterior_moe_condition = None
         if FLAGS.model.train_type == 'naive-moe-source':
-            eps = sample_source_posterior(jax.random.fold_in(key, 17), valid_images)
+            eps, posterior_moe_condition = sample_source_posterior(
+                jax.random.fold_in(key, 17), valid_images)
             eps = jax.experimental.multihost_utils.process_allgather(eps)[0]
+            posterior_moe_condition = (
+                jax.experimental.multihost_utils.process_allgather(
+                    posterior_moe_condition)[0])
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -260,10 +270,25 @@ def eval_model(
                     t = 1 - dt
                 eps_tile = jnp.repeat(eps, 8, axis=0)[:valid_images.shape[0]]
                 valid_images_tile = jnp.repeat(valid_images, 8, axis=0)[:valid_images.shape[0]]
+                moe_condition_tile = None
+                if posterior_moe_condition is not None:
+                    moe_condition_tile = jnp.repeat(
+                        posterior_moe_condition, 8, axis=0)[:valid_images.shape[0]]
                 t_full = t[..., None, None, None]
                 x_t = (1 - t_full) * eps_tile + t_full * valid_images_tile
-                x_t, t, dt_base = shard_data(x_t, t, dt_base)
-                v_pred = call_model(train_state, x_t, t, dt_base, valid_labels_sharded if FLAGS.model.cfg_scale != 0 else labels_uncond)
+                if moe_condition_tile is not None:
+                    x_t, t, dt_base, moe_condition_tile = shard_data(
+                        x_t, t, dt_base, moe_condition_tile)
+                else:
+                    x_t, t, dt_base = shard_data(x_t, t, dt_base)
+                v_pred = call_model(
+                    train_state,
+                    x_t,
+                    t,
+                    dt_base,
+                    valid_labels_sharded if FLAGS.model.cfg_scale != 0 else labels_uncond,
+                    moe_condition_tile,
+                )
                 x_1_pred = x_t + v_pred * (1-t[..., None, None, None])
                 x_t = jax.experimental.multihost_utils.process_allgather(x_t) # [devices, batch, H, W, C]
                 x_1_pred = jax.experimental.multihost_utils.process_allgather(x_1_pred) # [devices, batch, H, W, C]
@@ -296,9 +321,11 @@ def eval_model(
             all_x = []
             delta_t = 1.0 / denoise_timesteps
             if FLAGS.model.train_type == 'naive-moe-source':
-                x = sample_source_prior(jax.random.fold_in(key, denoise_timesteps), eps.shape)
+                x, moe_condition = sample_source_prior(
+                    jax.random.fold_in(key, denoise_timesteps), eps.shape)
             else:
                 x = shard_data(eps) # [batch, ...] (on all devices)
+                moe_condition = None
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
@@ -308,10 +335,21 @@ def eval_model(
                     dt_base = jnp.zeros_like(t_vector)
                 t_vector, dt_base = shard_data(t_vector, dt_base)
                 if not do_cfg:
-                    v = call_model(train_state, x, t_vector, dt_base, visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond)
+                    v = call_model(
+                        train_state,
+                        x,
+                        t_vector,
+                        dt_base,
+                        visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond,
+                        moe_condition,
+                    )
                 else:
-                    v_cond = call_model(train_state, x, t_vector, dt_base, visualize_labels)
-                    v_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
+                    v_cond = call_model(
+                        train_state, x, t_vector, dt_base,
+                        visualize_labels, moe_condition)
+                    v_uncond = call_model(
+                        train_state, x, t_vector, dt_base,
+                        labels_uncond, moe_condition)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
@@ -347,7 +385,7 @@ def eval_model(
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
-                x = sample_source_prior(eps_key, images_shape)
+                x, moe_condition = sample_source_prior(eps_key, images_shape)
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 labels = shard_data(labels)
                 x0_initial = x  # initial noise for ti==0 special-case
@@ -360,12 +398,20 @@ def eval_model(
                         dt_base = jnp.zeros_like(t_vector)
                     t_vector, dt_base = shard_data(t_vector, dt_base)
                     if cfg_scale == 1:
-                        v = call_model(train_state, x, t_vector, dt_base, labels)
+                        v = call_model(
+                            train_state, x, t_vector, dt_base,
+                            labels, moe_condition)
                     elif cfg_scale == 0:
-                        v = call_model(train_state, x, t_vector, dt_base, labels_uncond)
+                        v = call_model(
+                            train_state, x, t_vector, dt_base,
+                            labels_uncond, moe_condition)
                     else:
-                        v_pred_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
-                        v_pred_label = call_model(train_state, x, t_vector, dt_base, labels)
+                        v_pred_uncond = call_model(
+                            train_state, x, t_vector, dt_base,
+                            labels_uncond, moe_condition)
+                        v_pred_label = call_model(
+                            train_state, x, t_vector, dt_base,
+                            labels, moe_condition)
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                     if FLAGS.model['train_type'] == 'khoat-fm':
