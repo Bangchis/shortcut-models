@@ -143,13 +143,32 @@ v* = x1 - x0
 The DiT input is:
 
 ```text
-(x_t, t, k, a, rho)
+(x_t, t, k, a, rho, concat(mu_k_map, s_bar[k,a]_map))
 ```
 
 and the loss is:
 
 ```text
-L = E || v_theta(x_t, t, k, a, rho) - (x1 - x0) ||^2
+L = E || v_theta(x_t, t, k, a, rho, geom) - (x1 - x0) ||^2
+```
+
+The condition vector inside DiT is:
+
+```text
+c = t_embed + dt_embed + label_embed
+  + Embed(k)
+  + Embed(a)
+  + MLP(rho)
+  + geometry_scale * CNNGeom(concat(mu_k_map, s_bar[k,a]_map))
+```
+
+For CelebA-HQ latents:
+
+```text
+mu_k_map:       32 x 32 x 4
+s_bar[k,a]_map: 32 x 32 x 4
+geometry map:   32 x 32 x 8
+CNNGeom output: hidden_size = 768
 ```
 
 There is no SourceCNN, no posterior alignment loss, no variance floor loss,
@@ -172,7 +191,7 @@ x0 = unstandardize(x0_std)
 Then solve:
 
 ```text
-dx/dt = v_theta(x, t, k, a, rho),  x(0)=x0
+dx/dt = v_theta(x, t, k, a, rho, geom),  x(0)=x0
 ```
 
 with the same `c=(k,a,rho)` at every ODE step.
@@ -218,6 +237,8 @@ training/entangle/v_pair_dist_same_c
 training/entangle/path_lipschitz_proxy
 training/entangle/velocity_cos_same_c
 training/activations/moe_condition_embed
+training/activations/moe_geometry_embed
+training/condition/geometry_map_norm
 ```
 
 `training_summary.csv` is written from the full scalar training metric dict. If
@@ -234,6 +255,7 @@ Interpretation:
   entangled even after conditioning.
 - If `moe_condition_embed` stays tiny and changing `c` has no effect, DiT is
   ignoring the condition.
+- If `moe_geometry_embed` stays tiny, the CNN geometry path is not contributing.
 
 # Suggested Hyperparameters
 
@@ -243,19 +265,24 @@ Baseline:
 K = 16
 A = 4
 eta = 0.5
-kappa = 1.4
+kappa = 2.0
 source_direction_noise = 2.0
+moe_condition_use_geometry = 1
+moe_geometry_channels = 64
+moe_geometry_scale = 1.0
 ```
 
 Sweep if baseline is weak:
 
 ```text
-kappa in {1.2, 1.4, 1.6}
+kappa in {1.6, 2.0, 2.5}
 source_direction_noise in {1.5, 2.0, 2.5}
 eta in {0.0, 0.5}
 ```
 
-If source is too close to data, increase `kappa`. If source directions are too
+If source is too close to data, increase `kappa`. `kappa=2.0` means the local
+radius of `x0` from the GMM center is twice the local radius of `x1`.
+If source directions are too
 prototype-locked, increase `source_direction_noise`. If paths cross too much,
 try lower `source_direction_noise` or increase angular resolution `A=8`.
 
@@ -318,8 +345,8 @@ Train:
   --log_interval=1000 \
   --eval_interval=25000 \
   --save_interval=999999999 \
-  --save_dir=/kaggle/working/moe1_cond_source_k14_dn20_ckpt/ \
-  --summary_csv_path=/kaggle/working/moe1_cond_source_k14_dn20_ckpt/training_summary.csv \
+  --save_dir=/kaggle/working/moe1_cond_geom_k20_dn20_ckpt/ \
+  --summary_csv_path=/kaggle/working/moe1_cond_geom_k20_dn20_ckpt/training_summary.csv \
   --summary_csv_steps=1,1000,5000,10000,25000,50000,100000,150000,200000,250000 \
   --summary_csv_wandb_upload=1 \
   --wandb.entity=Fingerprint_Recognition \
@@ -340,8 +367,11 @@ Train:
   --model.gmm_num_modes=16 \
   --model.angular_num_submodes=4 \
   --model.local_eta=0.5 \
-  --model.source_kappa=1.4 \
+  --model.source_kappa=2.0 \
   --model.source_direction_noise=2.0 \
+  --model.moe_condition_use_geometry=1 \
+  --model.moe_geometry_channels=64 \
+  --model.moe_geometry_scale=1.0 \
   --model.cfg_scale=0 \
   --model.class_dropout_prob=1 \
   --model.num_classes=1 \
@@ -364,8 +394,8 @@ Inference/FID-only run from a checkpoint:
   --tfds_data_dir=/kaggle/input/shortcut-celebahq256/tensorflow_datasets \
   --fid_stats=/kaggle/input/shortcut-celebahq256/data/celeba256_fidstats_ours.npz \
   --batch_size=64 \
-  --load_dir=/kaggle/working/moe1_cond_source_k14_dn20_ckpt/<checkpoint_dir>/ \
-  --save_dir=/kaggle/working/moe1_cond_source_k14_dn20_eval/ \
+  --load_dir=/kaggle/working/moe1_cond_geom_k20_dn20_ckpt/<checkpoint_dir>/ \
+  --save_dir=/kaggle/working/moe1_cond_geom_k20_dn20_eval/ \
   --inference_timesteps=32 \
   --inference_generations=4096 \
   --inference_cfg_scale=0 \
@@ -381,8 +411,11 @@ Inference/FID-only run from a checkpoint:
   --model.gmm_num_modes=16 \
   --model.angular_num_submodes=4 \
   --model.local_eta=0.5 \
-  --model.source_kappa=1.4 \
+  --model.source_kappa=2.0 \
   --model.source_direction_noise=2.0 \
+  --model.moe_condition_use_geometry=1 \
+  --model.moe_geometry_channels=64 \
+  --model.moe_geometry_scale=1.0 \
   --model.cfg_scale=0 \
   --model.class_dropout_prob=1 \
   --model.num_classes=1 \

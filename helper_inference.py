@@ -10,6 +10,7 @@ from functools import partial
 from absl import app, flags
 from gmm_utils import (
     build_conditional_source,
+    build_moe_geometry,
     make_moe_condition,
 )
 
@@ -69,6 +70,7 @@ def do_inference(
             dt,
             labels,
             moe_condition,
+            moe_geometry,
             use_ema=True,
         ):
             if use_ema and FLAGS.model.use_ema:
@@ -81,6 +83,7 @@ def do_inference(
                 dt,
                 labels,
                 moe_condition=moe_condition,
+                moe_geometry=moe_geometry,
                 train=False,
             )
             return output
@@ -88,7 +91,7 @@ def do_inference(
         def sample_source_prior(sample_key):
             if FLAGS.model.train_type != 'naive-moe-source':
                 latents = jax.random.normal(sample_key, images_shape)
-                return shard_data(latents), None
+                return shard_data(latents), None, None
             mode_key, angular_key, rho_key, direction_key = jax.random.split(
                 sample_key, 4)
             sampled_modes = jax.random.categorical(
@@ -124,7 +127,14 @@ def do_inference(
             )
             moe_condition = make_moe_condition(
                 sampled_modes, angular_codes, rho)
-            return shard_data(x0, moe_condition)
+            moe_geometry = build_moe_geometry(
+                sampled_modes,
+                angular_codes,
+                images_shape[1:],
+                gmm_state['mu'],
+                gmm_state['angular_centers'],
+            )
+            return shard_data(x0, moe_condition, moe_geometry)
         
         if FLAGS.mode == 'interpolate':
             seed = 5
@@ -138,7 +148,7 @@ def do_inference(
             dt_vector = jnp.zeros_like(t_vector)
             cfg_scale = FLAGS.inference_cfg_scale
             v = call_model(
-                train_state, x, t_vector, dt_vector, labels, None)
+                train_state, x, t_vector, dt_vector, labels, None, None)
             x = x + v * 1.0
             x = vae_decode(x) # Image is in [-1, 1] space.
             x_render = np.array(jax.experimental.multihost_utils.process_allgather(x))
@@ -162,7 +172,7 @@ def do_inference(
             key = jax.random.fold_in(key, fid_it)
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
-            x, moe_condition = sample_source_prior(eps_key)
+            x, moe_condition, moe_geometry = sample_source_prior(eps_key)
             labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             labels = shard_data(labels)
             x0_initial = x  # initial noise for ti==0 special-case
@@ -182,18 +192,18 @@ def do_inference(
                 if cfg_scale == 1:
                     v = call_model(
                         train_state, x, t_vector, dt_base,
-                        labels, moe_condition)
+                        labels, moe_condition, moe_geometry)
                 elif cfg_scale == 0:
                     v = call_model(
                         train_state, x, t_vector, dt_base,
-                        labels_uncond, moe_condition)
+                        labels_uncond, moe_condition, moe_geometry)
                 else:
                     v_pred_uncond = call_model(
                         train_state, x, t_vector, dt_base,
-                        labels_uncond, moe_condition)
+                        labels_uncond, moe_condition, moe_geometry)
                     v_pred_label = call_model(
                         train_state, x, t_vector, dt_base,
-                        labels, moe_condition)
+                        labels, moe_condition, moe_geometry)
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                 if FLAGS.model.train_type == 'khoat-fm':

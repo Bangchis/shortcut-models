@@ -25,6 +25,7 @@ from helper_eval import eval_model
 from helper_inference import do_inference
 from gmm_utils import (
     build_conditional_source,
+    build_moe_geometry,
     categorical_entropy,
     directions_from_local,
     flatten_and_standardize,
@@ -198,8 +199,11 @@ model_config = ml_collections.ConfigDict({
     'angular_num_submodes': 4,
     'local_eta': 0.5,
     'source_variant': 'conditional-analytic',
-    'source_kappa': 1.4,
+    'source_kappa': 2.0,
     'source_direction_noise': 2.0,
+    'moe_condition_use_geometry': 1,
+    'moe_geometry_channels': 64,
+    'moe_geometry_scale': 1.0,
     'source_condition_dim': 64,
     'source_channels': 128,
     'source_num_blocks': 6,
@@ -365,6 +369,10 @@ def main(_):
         ),
         'gmm_num_modes': FLAGS.model['gmm_num_modes'],
         'angular_num_submodes': FLAGS.model['angular_num_submodes'],
+        'moe_condition_use_geometry': bool(
+            FLAGS.model['moe_condition_use_geometry']),
+        'moe_geometry_channels': FLAGS.model['moe_geometry_channels'],
+        'moe_geometry_scale': FLAGS.model['moe_geometry_scale'],
     }
     model_def = DiT(**dit_args)
     if (
@@ -587,6 +595,13 @@ def main(_):
                 )
                 moe_condition = make_moe_condition(
                     mode_indices, angular_indices, rho)
+                moe_geometry = build_moe_geometry(
+                    mode_indices,
+                    angular_indices,
+                    images.shape[1:],
+                    gmm_state['mu'],
+                    gmm_state['angular_centers'],
+                )
 
                 x_0, x0_std, source_dirs, source_radius, source_log_radius = (
                     build_conditional_source(
@@ -621,6 +636,7 @@ def main(_):
                     dt_base,
                     labels_dropped,
                     moe_condition=moe_condition,
+                    moe_geometry=moe_geometry,
                     train=True,
                     rngs={'dropout': dropout_key},
                     params=grad_params,
@@ -700,6 +716,10 @@ def main(_):
                     'condition/code_entropy_batch': condition_code_entropy,
                     'condition/effective_codes_batch': jnp.exp(
                         condition_code_entropy),
+                    'condition/geometry_map_norm': jnp.sqrt(
+                        jnp.mean(jnp.square(moe_geometry))),
+                    'condition/geometry_scale': jnp.asarray(
+                        FLAGS.model['moe_geometry_scale'], dtype=loss_fm.dtype),
                     'posterior/q1_entropy': jnp.mean(categorical_entropy(
                         q1, eps=FLAGS.model['source_eps'])),
                     'angular/source_alignment_cosine': source_center_cos,

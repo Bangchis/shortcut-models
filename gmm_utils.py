@@ -413,6 +413,13 @@ def make_moe_condition(modes, angular_codes, rho):
     )
 
 
+def build_moe_geometry(modes, angular_codes, latent_shape, mu, angular_centers):
+    mode_mu = mu[modes].reshape((modes.shape[0],) + tuple(latent_shape))
+    angular_dir = angular_centers[modes, angular_codes].reshape(
+        (modes.shape[0],) + tuple(latent_shape))
+    return jnp.concatenate([mode_mu, angular_dir], axis=-1)
+
+
 def sample_local_direction(key, centers, direction_noise, eps=1e-8):
     dim = centers.shape[-1]
     noise = jax.random.normal(key, centers.shape)

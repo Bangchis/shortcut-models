@@ -149,6 +149,54 @@ class MoEConditionEmbedder(nn.Module):
             name='rho_dense_1',
         )(rho_embed)
         return mode_embed + angular_embed + rho_embed
+
+
+class MoEGeometryEmbedder(nn.Module):
+    """
+    Encodes fixed GMM geometry maps concat(mu_k, s_bar[k,a]) into DiT conditioning.
+    """
+    hidden_size: int
+    channels: int
+    tc: TrainConfig
+
+    @nn.compact
+    def __call__(self, geometry):
+        x = geometry.astype(jnp.float32)
+        for idx, features in enumerate(
+            [self.channels, self.channels * 2, self.channels * 4]):
+            strides = (1, 1) if idx == 0 else (2, 2)
+            x = nn.Conv(
+                features,
+                (3, 3),
+                strides=strides,
+                padding="SAME",
+                kernel_init=self.tc.kern_init(f'moe_geometry_conv_{idx}_0'),
+                bias_init=self.tc.kern_init('bias', zero=True),
+                dtype=self.tc.dtype,
+                name=f'conv_{idx}_0',
+            )(x)
+            x = nn.LayerNorm(dtype=self.tc.dtype, name=f'ln_{idx}_0')(x)
+            x = nn.silu(x)
+            x = nn.Conv(
+                features,
+                (3, 3),
+                padding="SAME",
+                kernel_init=self.tc.kern_init(f'moe_geometry_conv_{idx}_1'),
+                bias_init=self.tc.kern_init('bias', zero=True),
+                dtype=self.tc.dtype,
+                name=f'conv_{idx}_1',
+            )(x)
+            x = nn.LayerNorm(dtype=self.tc.dtype, name=f'ln_{idx}_1')(x)
+            x = nn.silu(x)
+        x = jnp.mean(x.astype(jnp.float32), axis=(1, 2))
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(0.02),
+            bias_init=self.tc.kern_init('moe_geometry_bias'),
+            dtype=self.tc.dtype,
+            name='out_dense',
+        )(x)
+        return x
     
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
@@ -281,6 +329,9 @@ class DiT(nn.Module):
     moe_conditioning: bool = False
     gmm_num_modes: int = 1
     angular_num_submodes: int = 1
+    moe_condition_use_geometry: bool = False
+    moe_geometry_channels: int = 64
+    moe_geometry_scale: float = 1.0
 
     @nn.compact
     def __call__(
@@ -290,6 +341,7 @@ class DiT(nn.Module):
         dt,
         y,
         moe_condition=None,
+        moe_geometry=None,
         train=False,
         return_activations=False,
     ):
@@ -331,6 +383,19 @@ class DiT(nn.Module):
             )(moe_condition)
             c = c + ce
             activations['moe_condition_embed'] = ce
+            if self.moe_condition_use_geometry:
+                if moe_geometry is None:
+                    moe_geometry = jnp.zeros(
+                        (batch_size, input_size, input_size, 2 * in_channels),
+                        dtype=jnp.float32,
+                    )
+                ge = MoEGeometryEmbedder(
+                    self.hidden_size,
+                    self.moe_geometry_channels,
+                    tc=tc,
+                )(moe_geometry)
+                c = c + self.moe_geometry_scale * ge
+                activations['moe_geometry_embed'] = ge
         
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = te

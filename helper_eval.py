@@ -9,6 +9,7 @@ from functools import partial
 from gmm_utils import (
     assign_angular_codes,
     build_conditional_source,
+    build_moe_geometry,
     flatten_and_standardize,
     local_coordinates_from_standardized,
     make_moe_condition,
@@ -74,6 +75,7 @@ def eval_model(
             dt,
             labels,
             moe_condition,
+            moe_geometry,
             use_ema=True,
         ):
             if use_ema and FLAGS.model.use_ema:
@@ -86,13 +88,14 @@ def eval_model(
                 dt,
                 labels,
                 moe_condition=moe_condition,
+                moe_geometry=moe_geometry,
                 train=False,
             )
             return output
 
         def sample_source_prior(sample_key, batch_shape):
             if FLAGS.model.train_type != 'naive-moe-source':
-                return shard_data(jax.random.normal(sample_key, batch_shape)), None
+                return shard_data(jax.random.normal(sample_key, batch_shape)), None, None
             mode_key, angular_key, rho_key, direction_key = jax.random.split(
                 sample_key, 4)
             sampled_modes = jax.random.categorical(
@@ -128,11 +131,18 @@ def eval_model(
             )
             moe_condition = make_moe_condition(
                 sampled_modes, angular_codes, rho)
-            return shard_data(x0, moe_condition)
+            moe_geometry = build_moe_geometry(
+                sampled_modes,
+                angular_codes,
+                batch_shape[1:],
+                gmm_state['mu'],
+                gmm_state['angular_centers'],
+            )
+            return shard_data(x0, moe_condition, moe_geometry)
 
         def sample_source_posterior(sample_key, latents):
             if FLAGS.model.train_type != 'naive-moe-source':
-                return latents, None
+                return latents, None, None
             direction_key = sample_key
             latents_std = flatten_and_standardize(
                 latents,
@@ -195,7 +205,14 @@ def eval_model(
             )
             moe_condition = make_moe_condition(
                 sampled_modes, angular_codes, rho)
-            return shard_data(x0, moe_condition)
+            moe_geometry = build_moe_geometry(
+                sampled_modes,
+                angular_codes,
+                latents.shape[1:],
+                gmm_state['mu'],
+                gmm_state['angular_centers'],
+            )
+            return shard_data(x0, moe_condition, moe_geometry)
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:
@@ -247,13 +264,17 @@ def eval_model(
         if 'latent' in FLAGS.dataset_name:
             eps = eps_valid
         posterior_moe_condition = None
+        posterior_moe_geometry = None
         if FLAGS.model.train_type == 'naive-moe-source':
-            eps, posterior_moe_condition = sample_source_posterior(
+            eps, posterior_moe_condition, posterior_moe_geometry = sample_source_posterior(
                 jax.random.fold_in(key, 17), valid_images)
             eps = jax.experimental.multihost_utils.process_allgather(eps)[0]
             posterior_moe_condition = (
                 jax.experimental.multihost_utils.process_allgather(
                     posterior_moe_condition)[0])
+            posterior_moe_geometry = (
+                jax.experimental.multihost_utils.process_allgather(
+                    posterior_moe_geometry)[0])
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -271,14 +292,17 @@ def eval_model(
                 eps_tile = jnp.repeat(eps, 8, axis=0)[:valid_images.shape[0]]
                 valid_images_tile = jnp.repeat(valid_images, 8, axis=0)[:valid_images.shape[0]]
                 moe_condition_tile = None
+                moe_geometry_tile = None
                 if posterior_moe_condition is not None:
                     moe_condition_tile = jnp.repeat(
                         posterior_moe_condition, 8, axis=0)[:valid_images.shape[0]]
+                    moe_geometry_tile = jnp.repeat(
+                        posterior_moe_geometry, 8, axis=0)[:valid_images.shape[0]]
                 t_full = t[..., None, None, None]
                 x_t = (1 - t_full) * eps_tile + t_full * valid_images_tile
                 if moe_condition_tile is not None:
-                    x_t, t, dt_base, moe_condition_tile = shard_data(
-                        x_t, t, dt_base, moe_condition_tile)
+                    x_t, t, dt_base, moe_condition_tile, moe_geometry_tile = shard_data(
+                        x_t, t, dt_base, moe_condition_tile, moe_geometry_tile)
                 else:
                     x_t, t, dt_base = shard_data(x_t, t, dt_base)
                 v_pred = call_model(
@@ -288,6 +312,7 @@ def eval_model(
                     dt_base,
                     valid_labels_sharded if FLAGS.model.cfg_scale != 0 else labels_uncond,
                     moe_condition_tile,
+                    moe_geometry_tile,
                 )
                 x_1_pred = x_t + v_pred * (1-t[..., None, None, None])
                 x_t = jax.experimental.multihost_utils.process_allgather(x_t) # [devices, batch, H, W, C]
@@ -321,11 +346,12 @@ def eval_model(
             all_x = []
             delta_t = 1.0 / denoise_timesteps
             if FLAGS.model.train_type == 'naive-moe-source':
-                x, moe_condition = sample_source_prior(
+                x, moe_condition, moe_geometry = sample_source_prior(
                     jax.random.fold_in(key, denoise_timesteps), eps.shape)
             else:
                 x = shard_data(eps) # [batch, ...] (on all devices)
                 moe_condition = None
+                moe_geometry = None
             x0_initial = x  # initial noise for ti==0 special-case
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
@@ -342,14 +368,15 @@ def eval_model(
                         dt_base,
                         visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond,
                         moe_condition,
+                        moe_geometry,
                     )
                 else:
                     v_cond = call_model(
                         train_state, x, t_vector, dt_base,
-                        visualize_labels, moe_condition)
+                        visualize_labels, moe_condition, moe_geometry)
                     v_uncond = call_model(
                         train_state, x, t_vector, dt_base,
-                        labels_uncond, moe_condition)
+                        labels_uncond, moe_condition, moe_geometry)
                     v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
 
                 if FLAGS.model['train_type'] == 'khoat-fm':
@@ -385,7 +412,7 @@ def eval_model(
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
-                x, moe_condition = sample_source_prior(eps_key, images_shape)
+                x, moe_condition, moe_geometry = sample_source_prior(eps_key, images_shape)
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 labels = shard_data(labels)
                 x0_initial = x  # initial noise for ti==0 special-case
@@ -400,18 +427,18 @@ def eval_model(
                     if cfg_scale == 1:
                         v = call_model(
                             train_state, x, t_vector, dt_base,
-                            labels, moe_condition)
+                            labels, moe_condition, moe_geometry)
                     elif cfg_scale == 0:
                         v = call_model(
                             train_state, x, t_vector, dt_base,
-                            labels_uncond, moe_condition)
+                            labels_uncond, moe_condition, moe_geometry)
                     else:
                         v_pred_uncond = call_model(
                             train_state, x, t_vector, dt_base,
-                            labels_uncond, moe_condition)
+                            labels_uncond, moe_condition, moe_geometry)
                         v_pred_label = call_model(
                             train_state, x, t_vector, dt_base,
-                            labels, moe_condition)
+                            labels, moe_condition, moe_geometry)
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
 
                     if FLAGS.model['train_type'] == 'khoat-fm':
