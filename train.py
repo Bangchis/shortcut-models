@@ -26,6 +26,7 @@ from helper_inference import do_inference
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
 flags.DEFINE_string('dataset_data_dir', None, 'Optional TFDS data_dir.')
+flags.DEFINE_string('tfds_data_dir', None, 'Alias for --dataset_data_dir.')
 flags.DEFINE_string(
     'load_dir', None, 'Logging dir (if not None, save params).')
 flags.DEFINE_string(
@@ -97,6 +98,7 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 def main(_):
 
     np.random.seed(FLAGS.seed)
+    dataset_data_dir = FLAGS.dataset_data_dir or FLAGS.tfds_data_dir
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
     global_device_count = jax.device_count()
@@ -114,10 +116,10 @@ def main(_):
 
     dataset = get_dataset(FLAGS.dataset_name,
                           local_batch_size, True, FLAGS.debug_overfit,
-                          data_dir=FLAGS.dataset_data_dir)
+                          data_dir=dataset_data_dir)
     dataset_valid = get_dataset(
         FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit,
-        data_dir=FLAGS.dataset_data_dir)
+        data_dir=dataset_data_dir)
     example_obs, example_labels = next(dataset)
     example_obs = example_obs[:1]
     example_obs_shape = example_obs.shape
@@ -150,7 +152,7 @@ def main(_):
             raise ValueError('moe3 requires batch_size divisible by moe3_num_clusters')
         if FLAGS.mode == 'train':
             from utils.moe3 import prepare_moe3_cache
-            moe3_cache = prepare_moe3_cache(FLAGS, vae_encode)
+            moe3_cache = prepare_moe3_cache(FLAGS, vae_encode, dataset_data_dir)
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats

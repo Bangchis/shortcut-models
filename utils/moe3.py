@@ -262,7 +262,7 @@ def _balanced_spherical_kmeans(latents, num_clusters, iters, chunk_size, seed):
     return centroids.astype(np.float32), assignments.astype(np.int32)
 
 
-def prepare_moe3_cache(FLAGS, vae_encode):
+def prepare_moe3_cache(FLAGS, vae_encode, data_dir=None):
     if jax.process_count() != 1:
         raise ValueError('moe3 currently expects a single host process')
 
@@ -288,7 +288,7 @@ def prepare_moe3_cache(FLAGS, vae_encode):
             paths['train_latents'],
             FLAGS.dataset_name,
             'train',
-            FLAGS.dataset_data_dir,
+            data_dir,
             FLAGS.model.moe3_preprocess_batch_size,
             vae_encode,
             FLAGS.seed,
@@ -297,7 +297,7 @@ def prepare_moe3_cache(FLAGS, vae_encode):
             paths['val_latents'],
             FLAGS.dataset_name,
             'validation',
-            FLAGS.dataset_data_dir,
+            data_dir,
             FLAGS.model.moe3_preprocess_batch_size,
             vae_encode,
             FLAGS.seed + 1,
