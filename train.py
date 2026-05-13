@@ -1,4 +1,5 @@
 from typing import Any
+import time
 import jax.numpy as jnp
 from absl import app, flags
 from functools import partial
@@ -357,12 +358,22 @@ def main(_):
     # Train Loop
     ###################################
 
+    log_time_start = time.time()
+    log_step_start = start_step
+    log_input_seconds = 0.0
+    log_update_enqueue_seconds = 0.0
+    log_moe3_wait_seconds = 0.0
+    log_moe3_wait_max = 0.0
+    log_moe3_build_seconds = 0.0
+    log_moe3_boundaries = 0
+
     for i in tqdm.tqdm(range(1 + start_step, FLAGS.max_steps + 1 + start_step),
                        smoothing=0.1,
                        dynamic_ncols=True):
 
         # Sample data.
         moe3_info = {}
+        input_start = time.time()
         if FLAGS.model.train_type == 'moe3':
             batch_images, batch_labels, moe3_info = moe3_iter.next()
             batch_images, batch_labels = shard_data(batch_images, batch_labels)
@@ -371,16 +382,45 @@ def main(_):
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                 vae_rng, vae_key = jax.random.split(vae_rng)
                 batch_images = vae_encode(vae_key, batch_images)
+        input_seconds = time.time() - input_start
 
         # Train update.
+        update_start = time.time()
         train_state, update_info = update(
             train_state, train_state_teacher, batch_images, batch_labels)
+        update_enqueue_seconds = time.time() - update_start
+
+        log_input_seconds += input_seconds
+        log_update_enqueue_seconds += update_enqueue_seconds
+        if FLAGS.model.train_type == 'moe3':
+            wait_seconds = float(moe3_info.get('moe3/window_wait_seconds', 0.0))
+            build_seconds = float(moe3_info.get('moe3/window_build_seconds', 0.0))
+            log_moe3_wait_seconds += wait_seconds
+            log_moe3_wait_max = max(log_moe3_wait_max, wait_seconds)
+            log_moe3_build_seconds += build_seconds
+            if wait_seconds > 0.0 or build_seconds > 0.0:
+                log_moe3_boundaries += 1
 
         if i % FLAGS.log_interval == 0 or i == 1:
             update_info = jax.device_get(update_info)
+            log_elapsed_seconds = time.time() - log_time_start
+            log_steps = max(1, i - log_step_start)
             update_info = jax.tree_map(lambda x: np.array(x), update_info)
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
             update_info = {**update_info, **moe3_info}
+            update_info['flow/log_interval_seconds'] = log_elapsed_seconds
+            update_info['flow/seconds_per_step'] = log_elapsed_seconds / log_steps
+            update_info['flow/steps_per_second'] = log_steps / max(log_elapsed_seconds, 1e-12)
+            update_info['flow/input_seconds_per_step'] = log_input_seconds / log_steps
+            update_info['flow/update_enqueue_seconds_per_step'] = log_update_enqueue_seconds / log_steps
+            if FLAGS.model.train_type == 'moe3':
+                update_info['moe3/window_wait_seconds_sum'] = log_moe3_wait_seconds
+                update_info['moe3/window_wait_seconds_max'] = log_moe3_wait_max
+                update_info['moe3/window_wait_fraction'] = log_moe3_wait_seconds / max(log_elapsed_seconds, 1e-12)
+                update_info['moe3/window_wait_seconds_per_step'] = log_moe3_wait_seconds / log_steps
+                update_info['moe3/window_build_seconds_sum'] = log_moe3_build_seconds
+                update_info['moe3/window_build_to_flow_ratio'] = log_moe3_build_seconds / max(log_elapsed_seconds, 1e-12)
+                update_info['moe3/window_boundary_count'] = float(log_moe3_boundaries)
             train_metrics = {f'training/{k}': v for k,
                              v in update_info.items()}
 
@@ -403,6 +443,15 @@ def main(_):
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
+
+            log_time_start = time.time()
+            log_step_start = i
+            log_input_seconds = 0.0
+            log_update_enqueue_seconds = 0.0
+            log_moe3_wait_seconds = 0.0
+            log_moe3_wait_max = 0.0
+            log_moe3_build_seconds = 0.0
+            log_moe3_boundaries = 0
 
         if FLAGS.model['train_type'] == 'progressive':
             num_sections = np.log2(

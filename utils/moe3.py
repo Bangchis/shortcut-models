@@ -202,6 +202,7 @@ def _balanced_spherical_kmeans(latents, num_clusters, iters, chunk_size, seed):
     quotas = _quotas(latents.shape[0], num_clusters)
     assignments = None
     metric_rows = []
+    kmeans_start = time.time()
     metric_columns = [
         'iter',
         'score_mean',
@@ -239,6 +240,26 @@ def _balanced_spherical_kmeans(latents, num_clusters, iters, chunk_size, seed):
             'centroid_shift_max': float(np.max(centroid_shift)),
             'seconds': time.time() - iter_start,
         }
+        _wandb_log({
+            'moe3_kmeans/iteration': float(i + 1),
+            'moe3_kmeans/score_mean': metrics['score_mean'],
+            'moe3_kmeans/score_std': metrics['score_std'],
+            'moe3_kmeans/score_min': metrics['score_min'],
+            'moe3_kmeans/score_max': metrics['score_max'],
+            'moe3_kmeans/margin_mean': metrics['margin_mean'],
+            'moe3_kmeans/margin_min': metrics['margin_min'],
+            'moe3_kmeans/top1_match_ratio': metrics['top1_match_ratio'],
+            'moe3_kmeans/centroid_shift_mean': metrics['centroid_shift_mean'],
+            'moe3_kmeans/centroid_shift_max': metrics['centroid_shift_max'],
+            'moe3_kmeans/centroid_cos_mean': metrics['centroid_cos_mean'],
+            'moe3_kmeans/centroid_cos_max': metrics['centroid_cos_max'],
+            'moe3_kmeans/centroid_cos_min': metrics['centroid_cos_min'],
+            'moe3_kmeans/count_min': metrics['count_min'],
+            'moe3_kmeans/count_max': metrics['count_max'],
+            'moe3_kmeans/count_std': metrics['count_std'],
+            'moe3_kmeans/iter_seconds': metrics['seconds'],
+            'moe3_kmeans/elapsed_seconds': time.time() - kmeans_start,
+        }, step=i + 1)
         metric_rows.append([i + 1] + [metrics[k] for k in metric_columns[1:]])
         print(
             f"moe3 kmeans iter {i + 1}/{iters}: "
@@ -351,6 +372,7 @@ def prepare_moe3_cache(FLAGS, vae_encode, data_dir=None):
                 'latent_shape': list(train_latents.shape[1:]),
             }, f)
 
+    cache_open_start = time.time()
     cache = {
         'cache_dir': cache_dir,
         'train_latents': np.load(paths['train_latents'], mmap_mode='r'),
@@ -359,6 +381,7 @@ def prepare_moe3_cache(FLAGS, vae_encode, data_dir=None):
         'train_assignments': np.load(paths['train_assignments']).astype(np.int32),
         'val_assignments': np.load(paths['val_assignments']).astype(np.int32),
     }
+    cache_open_seconds = time.time() - cache_open_start
     train_counts = np.bincount(
         cache['train_assignments'], minlength=int(FLAGS.model.moe3_num_clusters))
     val_counts = np.bincount(
@@ -366,6 +389,7 @@ def prepare_moe3_cache(FLAGS, vae_encode, data_dir=None):
     centroid_stats = _centroid_stats(cache['centroids'])
     final_metrics = {
         'moe3_preprocess/cache_total_seconds': time.time() - cache_start,
+        'moe3_preprocess/cache_open_seconds': cache_open_seconds,
         'moe3_preprocess/train_count_min': float(np.min(train_counts)),
         'moe3_preprocess/train_count_max': float(np.max(train_counts)),
         'moe3_preprocess/train_count_std': float(np.std(train_counts)),
