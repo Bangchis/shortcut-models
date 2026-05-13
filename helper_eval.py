@@ -7,6 +7,7 @@ import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 from functools import partial
+from utils import summary_csv
 
 
 def eval_moe3_fid(
@@ -85,12 +86,14 @@ def eval_moe3_fid(
                     mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
                 priors = label_counts.astype(np.float32) / max(1, np.sum(label_counts))
                 print(f"moe3 FID for denoise_timesteps {denoise_timesteps} is {fid}")
-                wandb.log({
+                fid_metrics = {
                     f'fid/timesteps/{denoise_timesteps}': fid,
                     f'fid/moe3_label_prior_min/{denoise_timesteps}': float(np.min(priors)),
                     f'fid/moe3_label_prior_max/{denoise_timesteps}': float(np.max(priors)),
                     f'fid/moe3_label_prior_std/{denoise_timesteps}': float(np.std(priors)),
-                }, step=step)
+                }
+                wandb.log(fid_metrics, step=step)
+                summary_csv.log_both(step, fid_metrics, phase='eval')
 
 
 def eval_model(
@@ -593,5 +596,6 @@ def eval_model(
                         mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
                     print(
                         f"FID for denoise_timesteps {denoise_timesteps} is {fid}")
-                    wandb.log(
-                        {f'fid/timesteps/{denoise_timesteps}': fid}, step=step)
+                    fid_metrics = {f'fid/timesteps/{denoise_timesteps}': fid}
+                    wandb.log(fid_metrics, step=step)
+                    summary_csv.log_both(step, fid_metrics, phase='eval')

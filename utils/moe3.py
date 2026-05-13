@@ -15,13 +15,20 @@ from utils.datasets import load_tfds_split
 META_VERSION = 2
 
 
-def _wandb_log(metrics, step=0):
+def _wandb_log(metrics, step=0, phase='preprocess', summary=False):
     try:
         import wandb
     except ImportError:
-        return
-    if wandb.run is not None:
+        wandb = None
+    if wandb is not None and wandb.run is not None:
         wandb.log(metrics, step=step)
+    try:
+        from utils import summary_csv
+    except ImportError:
+        return
+    summary_csv.log_metrics(step, metrics, phase=phase)
+    if summary:
+        summary_csv.log_summary(step, metrics, phase=phase, force=True)
 
 
 def _wandb_table(name, columns, rows, step=0):
@@ -376,7 +383,7 @@ def _soft_balanced_spherical_kmeans(
             'moe3_kmeans/objective_per_sample': metrics['objective_per_sample'],
             'moe3_kmeans/iter_seconds': metrics['seconds'],
             'moe3_kmeans/elapsed_seconds': time.time() - kmeans_start,
-        }, step=i + 1)
+        }, step=i + 1, phase='kmeans')
         metric_rows.append([i + 1] + [metrics[k] for k in metric_columns[1:]])
         print(
             f"moe3 kmeans iter {i + 1}/{iters}: "
@@ -406,7 +413,7 @@ def _soft_balanced_spherical_kmeans(
             'moe3_preprocess/kmeans_final_objective_per_sample': last['objective_per_sample'],
             'moe3_preprocess/kmeans_iters': float(iters),
             'moe3_preprocess/kmeans_balance_lambda': float(balance_lambda),
-        })
+        }, summary=True)
     return centroids.astype(np.float32), assignments.astype(np.int32)
 
 
@@ -608,7 +615,7 @@ def prepare_moe3_cache(FLAGS, vae_encode, data_dir=None):
         'moe3_preprocess/centroid_cos_max': centroid_stats['centroid_cos_max'],
         'moe3_preprocess/centroid_cos_min': centroid_stats['centroid_cos_min'],
     }
-    _wandb_log(final_metrics)
+    _wandb_log(final_metrics, summary=True)
     print(
         "moe3 cluster priors: "
         f"train count min/max {np.min(train_counts)}/{np.max(train_counts)}, "

@@ -1,4 +1,5 @@
 from typing import Any
+import os
 import time
 import jax.numpy as jnp
 from absl import app, flags
@@ -20,6 +21,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
+from utils import summary_csv
 from model import DiT
 from helper_eval import eval_model, eval_moe3_fid
 from helper_inference import do_inference
@@ -42,6 +44,10 @@ flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
+flags.DEFINE_string('metrics_csv_path', None, 'Optional long-format CSV for periodic metrics.')
+flags.DEFINE_string('summary_csv_path', None, 'Optional long-format CSV for selected summary steps.')
+flags.DEFINE_string('summary_csv_steps', '', 'Comma-separated steps to write to summary CSV.')
+flags.DEFINE_integer('summary_csv_wandb_upload', 0, 'Upload summary CSV to wandb when updated.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -119,6 +125,19 @@ def main(_):
     # Create wandb logger
     if jax.process_index() == 0 and FLAGS.mode == 'train':
         setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
+        metrics_csv_path = FLAGS.metrics_csv_path
+        summary_csv_path = FLAGS.summary_csv_path
+        if FLAGS.save_dir is not None:
+            if metrics_csv_path is None:
+                metrics_csv_path = os.path.join(FLAGS.save_dir, 'training_metrics.csv')
+            if summary_csv_path is None and FLAGS.summary_csv_steps:
+                summary_csv_path = os.path.join(FLAGS.save_dir, 'training_summary.csv')
+        summary_csv.setup(
+            metrics_csv_path,
+            summary_csv_path,
+            FLAGS.summary_csv_steps,
+            FLAGS.summary_csv_wandb_upload,
+        )
 
     dataset = get_dataset(FLAGS.dataset_name,
                           local_batch_size, True, FLAGS.debug_overfit,
@@ -446,6 +465,7 @@ def main(_):
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
+                summary_csv.log_both(i, train_metrics, phase='training')
 
             log_time_start = time.time()
             log_step_start = i
