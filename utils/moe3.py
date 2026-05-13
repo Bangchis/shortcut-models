@@ -7,7 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
-import tensorflow_datasets as tfds
+
+from utils.datasets import load_tfds_split
 
 
 META_VERSION = 1
@@ -89,7 +90,8 @@ def _image_dataset(dataset_name, split, batch_size, data_dir):
         image = (image - 0.5) / 0.5
         return image
 
-    dataset = tfds.load(dataset_name, split=split, data_dir=data_dir)
+    dataset = load_tfds_split(
+        dataset_name, split, data_dir=data_dir, aliases=('celeb_a_hq',))
     dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.batch(batch_size, drop_remainder=False)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)

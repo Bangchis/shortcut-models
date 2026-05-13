@@ -2,6 +2,48 @@ import tensorflow_datasets as tfds
 import tensorflow as tf
 import numpy as np
 import jax
+import os
+
+
+def _candidate_data_dirs(data_dir):
+    if data_dir is None:
+        return []
+    return [
+        data_dir,
+        os.path.join(data_dir, 'tensorflow_datasets'),
+        os.path.join(data_dir, 'data', 'tensorflow_datasets'),
+        os.path.join(data_dir, 'data'),
+    ]
+
+
+def _has_dataset_info(path):
+    return os.path.exists(os.path.join(path, 'dataset_info.json'))
+
+
+def _find_builder_dir(data_dir, dataset_names):
+    for base_dir in _candidate_data_dirs(data_dir):
+        if _has_dataset_info(base_dir):
+            return base_dir
+        for dataset_name in dataset_names:
+            dataset_dir = os.path.join(base_dir, dataset_name)
+            if _has_dataset_info(dataset_dir):
+                return dataset_dir
+            if not os.path.isdir(dataset_dir):
+                continue
+            for version in sorted(os.listdir(dataset_dir)):
+                version_dir = os.path.join(dataset_dir, version)
+                if os.path.isdir(version_dir) and _has_dataset_info(version_dir):
+                    return version_dir
+    return None
+
+
+def load_tfds_split(tfds_name, split, data_dir=None, aliases=()):
+    builder_dir = _find_builder_dir(data_dir, (tfds_name, *aliases))
+    if builder_dir is not None:
+        print(f'Loading TFDS builder from {builder_dir}')
+        return tfds.builder_from_directory(builder_dir).as_dataset(split=split)
+    return tfds.load(tfds_name, split=split, data_dir=data_dir)
+
 
 def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False, data_dir=None):
     print("Loading dataset")
@@ -23,7 +65,7 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False, data_di
             return image, data['label']
 
         split = tfds.split_for_jax_process('train' if (is_train or debug_overfit) else 'validation', drop_remainder=True)
-        dataset = tfds.load('imagenet2012', split=split, data_dir=data_dir)
+        dataset = load_tfds_split('imagenet2012', split, data_dir=data_dir)
         dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
         if debug_overfit:
             dataset = dataset.take(8)
@@ -48,7 +90,8 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False, data_di
             return image,  data['label']
 
         split = tfds.split_for_jax_process('train' if (is_train or debug_overfit) else 'validation', drop_remainder=True)
-        dataset = tfds.load('celebahq256', split=split, data_dir=data_dir)
+        dataset = load_tfds_split(
+            'celebahq256', split, data_dir=data_dir, aliases=('celeb_a_hq',))
         dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.shuffle(20000, seed=42+jax.process_index(), reshuffle_each_iteration=True)
         dataset = dataset.repeat()
@@ -69,7 +112,7 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False, data_di
             return image, 0 # No label
 
         split = tfds.split_for_jax_process('church-train' if is_train else 'church-test', drop_remainder=True)
-        dataset = tfds.load('lsunc', split=split, data_dir=data_dir)
+        dataset = load_tfds_split('lsunc', split, data_dir=data_dir)
         dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.shuffle(10000, seed=42, reshuffle_each_iteration=True)
         dataset = dataset.repeat()
