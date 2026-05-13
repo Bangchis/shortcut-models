@@ -37,6 +37,9 @@ def do_inference(
         if FLAGS.model.use_stable_vae:
             batch_images = vae_encode(key, batch_images)
             valid_images = vae_encode(key, valid_images)
+            if FLAGS.model.train_type == 'moe3' and batch_images.shape[1] == 4 and batch_images.shape[-1] != 4:
+                batch_images = jnp.transpose(batch_images, (0, 2, 3, 1))
+                valid_images = jnp.transpose(valid_images, (0, 2, 3, 1))
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
         eps = jax.random.normal(key, batch_images.shape)
@@ -81,6 +84,11 @@ def do_inference(
         denoise_timesteps = FLAGS.inference_timesteps
         num_generations = FLAGS.inference_generations
         cfg_scale = FLAGS.inference_cfg_scale
+        moe3_centroids = None
+        if FLAGS.model.train_type == 'moe3':
+            from utils.moe3 import load_moe3_centroids, assign_labels_from_noise
+            moe3_centroids = load_moe3_centroids(FLAGS.model.moe3_cache_dir)
+            cfg_scale = 1
         x0 = []
         x1 = []
         lab = []
@@ -94,14 +102,17 @@ def do_inference(
             key = jax.random.fold_in(key, jax.process_index())
             eps_key, label_key = jax.random.split(key)
             x = jax.random.normal(eps_key, images_shape)
-            labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+            if FLAGS.model.train_type == 'moe3':
+                labels = assign_labels_from_noise(x, moe3_centroids)
+            else:
+                labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)
             x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
             delta_t = 1.0 / denoise_timesteps
             for ti in range(denoise_timesteps):
                 t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
                 t_vector = jnp.full((images_shape[0], ), t)
-                if FLAGS.model.train_type == 'naive':
+                if FLAGS.model.train_type == 'naive' or FLAGS.model.train_type == 'moe3':
                     dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
                     dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow # Smallest dt.
                 else: # shortcut

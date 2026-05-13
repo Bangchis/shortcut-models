@@ -25,6 +25,7 @@ from helper_inference import do_inference
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
+flags.DEFINE_string('dataset_data_dir', None, 'Optional TFDS data_dir.')
 flags.DEFINE_string(
     'load_dir', None, 'Logging dir (if not None, save params).')
 flags.DEFINE_string(
@@ -67,6 +68,14 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 4,  # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
+    'moe3_cache_dir': '/kaggle/working/moe3_cache',
+    'moe3_num_clusters': 32,
+    'moe3_window_length': 32,
+    'moe3_kmeans_iters': 20,
+    'moe3_preprocess_batch_size': 64,
+    'moe3_assignment_chunk_size': 4096,
+    'moe3_prefetch_windows': 1,
+    'moe3_val_quota': 0,
     'train_type': 'shortcut'  # or naive.
 })
 
@@ -104,9 +113,11 @@ def main(_):
         setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
 
     dataset = get_dataset(FLAGS.dataset_name,
-                          local_batch_size, True, FLAGS.debug_overfit)
+                          local_batch_size, True, FLAGS.debug_overfit,
+                          data_dir=FLAGS.dataset_data_dir)
     dataset_valid = get_dataset(
-        FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit)
+        FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit,
+        data_dir=FLAGS.dataset_data_dir)
     example_obs, example_labels = next(dataset)
     example_obs = example_obs[:1]
     example_obs_shape = example_obs.shape
@@ -118,10 +129,28 @@ def main(_):
             example_obs_shape = example_obs.shape
         else:
             example_obs = vae.encode(jax.random.PRNGKey(0), example_obs)
+            if FLAGS.model.train_type == 'moe3' and example_obs.shape[1] == 4 and example_obs.shape[-1] != 4:
+                example_obs = jnp.transpose(example_obs, (0, 2, 3, 1))
         example_obs_shape = example_obs.shape
         vae_rng = jax.random.PRNGKey(42)
         vae_encode = jax.jit(vae.encode)
         vae_decode = jax.jit(vae.decode)
+
+    moe3_cache = None
+    if FLAGS.model.train_type == 'moe3':
+        if not FLAGS.model.use_stable_vae:
+            raise ValueError('moe3 requires --model.use_stable_vae 1')
+        if FLAGS.model.cfg_scale != 1:
+            raise ValueError('moe3 requires --model.cfg_scale 1')
+        if FLAGS.model.class_dropout_prob != 0:
+            raise ValueError('moe3 requires --model.class_dropout_prob 0')
+        if FLAGS.model.num_classes != FLAGS.model.moe3_num_clusters:
+            raise ValueError('moe3 requires --model.num_classes == --model.moe3_num_clusters')
+        if FLAGS.batch_size % FLAGS.model.moe3_num_clusters != 0:
+            raise ValueError('moe3 requires batch_size divisible by moe3_num_clusters')
+        if FLAGS.mode == 'train':
+            from utils.moe3 import prepare_moe3_cache
+            moe3_cache = prepare_moe3_cache(FLAGS, vae_encode)
 
     if FLAGS.fid_stats is not None:
         from utils.fid import get_fid_network, fid_from_stats
@@ -243,6 +272,10 @@ def main(_):
             from baselines.targets_naive import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(
                 FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'moe3':
+            from baselines.targets_moe3 import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(
+                FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
         elif FLAGS.model['train_type'] == 'shortcut':
             from targets_shortcut import get_targets
             x_t, v_t, t, dt_base, labels, info = get_targets(
@@ -305,6 +338,19 @@ def main(_):
                      fid_from_stats, truth_fid_stats)
         return
 
+    moe3_iter = None
+    if FLAGS.model.train_type == 'moe3':
+        from utils.moe3 import Moe3WindowIterator
+        if moe3_cache is None:
+            raise ValueError('moe3 training requires a prepared cache')
+        moe3_iter = Moe3WindowIterator(
+            moe3_cache,
+            FLAGS.batch_size,
+            FLAGS.model.moe3_window_length,
+            FLAGS.seed + jax.process_index(),
+            FLAGS.model.moe3_prefetch_windows,
+        )
+
     ###################################
     # Train Loop
     ###################################
@@ -314,7 +360,11 @@ def main(_):
                        dynamic_ncols=True):
 
         # Sample data.
-        if not FLAGS.debug_overfit or i == 1:
+        moe3_info = {}
+        if FLAGS.model.train_type == 'moe3':
+            batch_images, batch_labels, moe3_info = moe3_iter.next()
+            batch_images, batch_labels = shard_data(batch_images, batch_labels)
+        elif not FLAGS.debug_overfit or i == 1:
             batch_images, batch_labels = shard_data(*next(dataset))
             if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
                 vae_rng, vae_key = jax.random.split(vae_rng)
@@ -328,12 +378,20 @@ def main(_):
             update_info = jax.device_get(update_info)
             update_info = jax.tree_map(lambda x: np.array(x), update_info)
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
+            update_info = {**update_info, **moe3_info}
             train_metrics = {f'training/{k}': v for k,
                              v in update_info.items()}
 
-            valid_images, valid_labels = shard_data(*next(dataset_valid))
-            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
-                valid_images = vae_encode(vae_rng, valid_images)
+            if FLAGS.model.train_type == 'moe3':
+                valid_batch_size = FLAGS.batch_size
+                if FLAGS.model.moe3_val_quota > 0:
+                    valid_batch_size = FLAGS.model.moe3_val_quota * FLAGS.model.moe3_num_clusters
+                valid_images, valid_labels = moe3_iter.validation_batch(i, valid_batch_size)
+                valid_images, valid_labels = shard_data(valid_images, valid_labels)
+            else:
+                valid_images, valid_labels = shard_data(*next(dataset_valid))
+                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                    valid_images = vae_encode(vae_rng, valid_images)
             _, valid_update_info = update(
                 train_state, train_state_teacher, valid_images, valid_labels)
             valid_update_info = jax.device_get(valid_update_info)
@@ -351,7 +409,7 @@ def main(_):
                 train_state_teacher = jax.jit(
                     lambda x: x, out_shardings=train_state_sharding)(train_state)
 
-        if i % FLAGS.eval_interval == 0:
+        if i % FLAGS.eval_interval == 0 and FLAGS.model.train_type != 'moe3':
             eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
                        get_fid_activations, imagenet_labels, visualize_labels,
                        fid_from_stats, truth_fid_stats)
