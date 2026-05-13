@@ -9,6 +9,90 @@ from matplotlib.ticker import AutoMinorLocator
 from functools import partial
 
 
+def eval_moe3_fid(
+    FLAGS,
+    train_state,
+    step,
+    shard_data,
+    vae_decode,
+    get_fid_activations,
+    fid_from_stats,
+    truth_fid_stats,
+    image_shape,
+):
+    if FLAGS.fid_stats is None or get_fid_activations is None:
+        return
+
+    from utils.moe3 import load_moe3_inference_state, assign_labels_from_noise
+
+    with jax.spmd_mode('allow_all'):
+        centroids, bias = load_moe3_inference_state(FLAGS.model.moe3_cache_dir)
+
+        @partial(jax.jit, static_argnums=(5,))
+        def call_model(train_state, images, t, dt, labels, use_ema=True):
+            if use_ema and FLAGS.model.use_ema:
+                call_fn = train_state.call_model_ema
+            else:
+                call_fn = train_state.call_model
+            return call_fn(images, t, dt, labels, train=False)
+
+        def do_fid_calc(denoise_timesteps):
+            activations = []
+            label_counts = np.zeros((FLAGS.model.num_classes,), dtype=np.int64)
+            num_generations = 4096
+            num_batches = num_generations // FLAGS.batch_size
+            print(f"Calc moe3 FID for denoise_timesteps {denoise_timesteps}")
+            for fid_it in tqdm.tqdm(range(num_batches)):
+                key = jax.random.PRNGKey(42)
+                key = jax.random.fold_in(key, fid_it)
+                key = jax.random.fold_in(key, jax.process_index())
+                x = jax.random.normal(key, image_shape)
+                labels = assign_labels_from_noise(x, centroids, bias)
+                label_counts += np.bincount(
+                    np.asarray(labels), minlength=FLAGS.model.num_classes)
+                x, labels = shard_data(x, labels)
+
+                delta_t = 1.0 / denoise_timesteps
+                for ti in range(denoise_timesteps):
+                    t = ti / denoise_timesteps
+                    t_vector = jnp.full((image_shape[0],), t)
+                    dt_flow = np.log2(FLAGS.model.denoise_timesteps).astype(jnp.int32)
+                    dt_base = jnp.ones(image_shape[0], dtype=jnp.int32) * dt_flow
+                    t_vector, dt_base = shard_data(t_vector, dt_base)
+                    v = call_model(train_state, x, t_vector, dt_base, labels)
+                    x = x + v * delta_t
+
+                if FLAGS.model.use_stable_vae:
+                    x = vae_decode(x)
+                x = jax.image.resize(
+                    x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
+                x = jnp.clip(x, -1, 1)
+                acts = get_fid_activations(x)[..., 0, 0, :]
+                acts = jax.experimental.multihost_utils.process_allgather(acts)
+                activations.append(np.array(acts))
+            return activations, label_counts
+
+        denoise_timesteps_list = list(dict.fromkeys(
+            [1, 4, 32, int(FLAGS.model.denoise_timesteps)]))
+        for denoise_timesteps in denoise_timesteps_list:
+            activations, label_counts = do_fid_calc(int(denoise_timesteps))
+            if jax.process_index() == 0:
+                activations = np.concatenate(activations, axis=0)
+                activations = activations.reshape((-1, activations.shape[-1]))
+                mu1 = np.mean(activations, axis=0)
+                sigma1 = np.cov(activations, rowvar=False)
+                fid = fid_from_stats(
+                    mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
+                priors = label_counts.astype(np.float32) / max(1, np.sum(label_counts))
+                print(f"moe3 FID for denoise_timesteps {denoise_timesteps} is {fid}")
+                wandb.log({
+                    f'fid/timesteps/{denoise_timesteps}': fid,
+                    f'fid/moe3_label_prior_min/{denoise_timesteps}': float(np.min(priors)),
+                    f'fid/moe3_label_prior_max/{denoise_timesteps}': float(np.max(priors)),
+                    f'fid/moe3_label_prior_std/{denoise_timesteps}': float(np.std(priors)),
+                }, step=step)
+
+
 def eval_model(
     FLAGS,
     train_state,

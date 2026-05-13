@@ -21,7 +21,7 @@ from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
 from model import DiT
-from helper_eval import eval_model
+from helper_eval import eval_model, eval_moe3_fid
 from helper_inference import do_inference
 
 FLAGS = flags.FLAGS
@@ -463,10 +463,23 @@ def main(_):
                 train_state_teacher = jax.jit(
                     lambda x: x, out_shardings=train_state_sharding)(train_state)
 
-        if i % FLAGS.eval_interval == 0 and FLAGS.model.train_type != 'moe3':
-            eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
-                       get_fid_activations, imagenet_labels, visualize_labels,
-                       fid_from_stats, truth_fid_stats)
+        if i % FLAGS.eval_interval == 0:
+            if FLAGS.model.train_type == 'moe3':
+                eval_moe3_fid(
+                    FLAGS,
+                    train_state,
+                    i,
+                    shard_data,
+                    vae_decode,
+                    get_fid_activations,
+                    fid_from_stats,
+                    truth_fid_stats,
+                    (local_batch_size, *example_obs_shape[1:]),
+                )
+            else:
+                eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                           get_fid_activations, imagenet_labels, visualize_labels,
+                           fid_from_stats, truth_fid_stats)
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             train_state_gather = jax.experimental.multihost_utils.process_allgather(
