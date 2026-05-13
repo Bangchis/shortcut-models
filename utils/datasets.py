@@ -8,6 +8,7 @@ import os
 def _candidate_data_dirs(data_dir):
     if data_dir is None:
         return []
+    data_dir = os.path.abspath(os.path.expanduser(data_dir))
     return [
         data_dir,
         os.path.join(data_dir, 'tensorflow_datasets'),
@@ -20,7 +21,24 @@ def _has_dataset_info(path):
     return os.path.exists(os.path.join(path, 'dataset_info.json'))
 
 
+def _dataset_info_dirs(base_dir, max_depth=5):
+    if not os.path.isdir(base_dir):
+        return []
+    base_depth = base_dir.rstrip(os.sep).count(os.sep)
+    matches = []
+    for root, dirs, files in os.walk(base_dir):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        if depth > max_depth:
+            dirs[:] = []
+            continue
+        if 'dataset_info.json' in files:
+            matches.append(root)
+            dirs[:] = []
+    return matches
+
+
 def _find_builder_dir(data_dir, dataset_names):
+    dataset_names = tuple(dataset_names)
     for base_dir in _candidate_data_dirs(data_dir):
         if _has_dataset_info(base_dir):
             return base_dir
@@ -34,6 +52,15 @@ def _find_builder_dir(data_dir, dataset_names):
                 version_dir = os.path.join(dataset_dir, version)
                 if os.path.isdir(version_dir) and _has_dataset_info(version_dir):
                     return version_dir
+        matches = _dataset_info_dirs(base_dir)
+        named_matches = [
+            path for path in matches
+            if any(name in path.split(os.sep) for name in dataset_names)
+        ]
+        if named_matches:
+            return sorted(named_matches)[0]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -42,6 +69,8 @@ def load_tfds_split(tfds_name, split, data_dir=None, aliases=()):
     if builder_dir is not None:
         print(f'Loading TFDS builder from {builder_dir}')
         return tfds.builder_from_directory(builder_dir).as_dataset(split=split)
+    if data_dir is not None:
+        print(f'No TFDS builder directory found under {data_dir}; falling back to tfds.load({tfds_name})')
     return tfds.load(tfds_name, split=split, data_dir=data_dir)
 
 
