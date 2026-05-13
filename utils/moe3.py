@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
+import tensorflow_datasets as tfds
 
 from utils.datasets import load_tfds_split
 
