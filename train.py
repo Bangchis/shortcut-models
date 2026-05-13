@@ -74,8 +74,13 @@ model_config = ml_collections.ConfigDict({
     'moe3_num_clusters': 32,
     'moe3_window_length': 32,
     'moe3_kmeans_iters': 20,
+    'moe3_balance_lambda': 0.2,
+    'moe3_balance_min_factor': 0.5,
+    'moe3_balance_max_factor': 2.0,
     'moe3_preprocess_batch_size': 64,
     'moe3_assignment_chunk_size': 4096,
+    'moe3_bias_calibration_samples': 32768,
+    'moe3_bias_calibration_iters': 100,
     'moe3_prefetch_windows': 1,
     'moe3_val_quota': 0,
     'train_type': 'shortcut'  # or naive.
@@ -149,8 +154,6 @@ def main(_):
             raise ValueError('moe3 requires --model.class_dropout_prob 0')
         if FLAGS.model.num_classes != FLAGS.model.moe3_num_clusters:
             raise ValueError('moe3 requires --model.num_classes == --model.moe3_num_clusters')
-        if FLAGS.batch_size % FLAGS.model.moe3_num_clusters != 0:
-            raise ValueError('moe3 requires batch_size divisible by moe3_num_clusters')
         if FLAGS.mode == 'train':
             from utils.moe3 import prepare_moe3_cache
             moe3_cache = prepare_moe3_cache(FLAGS, vae_encode, dataset_data_dir)
