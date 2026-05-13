@@ -41,6 +41,7 @@ def log_summary(step, metrics, phase='training', force=False):
     _WRITTEN.add(key)
     _append_rows(_SUMMARY_PATH, step, phase, metrics)
     if _WANDB_UPLOAD:
+        _upload(_METRICS_PATH)
         _upload(_SUMMARY_PATH)
 
 

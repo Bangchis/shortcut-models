@@ -47,7 +47,7 @@ flags.DEFINE_string('mode', 'train', 'train or inference.')
 flags.DEFINE_string('metrics_csv_path', None, 'Optional long-format CSV for periodic metrics.')
 flags.DEFINE_string('summary_csv_path', None, 'Optional long-format CSV for selected summary steps.')
 flags.DEFINE_string('summary_csv_steps', '', 'Comma-separated steps to write to summary CSV.')
-flags.DEFINE_integer('summary_csv_wandb_upload', 0, 'Upload summary CSV to wandb when updated.')
+flags.DEFINE_integer('summary_csv_wandb_upload', 1, 'Upload CSV files to wandb when summary is updated.')
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
