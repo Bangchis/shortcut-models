@@ -47,7 +47,8 @@ def eval_moe3_fid(
                 key = jax.random.PRNGKey(42)
                 key = jax.random.fold_in(key, fid_it)
                 key = jax.random.fold_in(key, jax.process_index())
-                x = jax.random.normal(key, image_shape)
+                eps_key, _ = jax.random.split(key)
+                x = jax.random.normal(eps_key, image_shape)
                 labels = assign_labels_from_noise(x, centroids, bias)
                 label_counts += np.bincount(
                     np.asarray(labels), minlength=FLAGS.model.num_classes)
