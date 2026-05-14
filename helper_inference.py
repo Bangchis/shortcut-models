@@ -88,7 +88,8 @@ def do_inference(
         moe3_bias = None
         if FLAGS.model.train_type == 'moe3':
             from utils.moe3 import load_moe3_inference_state, assign_labels_from_noise
-            moe3_centroids, moe3_bias = load_moe3_inference_state(FLAGS.model.moe3_cache_dir)
+            if FLAGS.model.moe3_condition_on_k:
+                moe3_centroids, moe3_bias = load_moe3_inference_state(FLAGS.model.moe3_cache_dir)
             cfg_scale = 1
         x0 = []
         x1 = []
@@ -104,7 +105,10 @@ def do_inference(
             eps_key, label_key = jax.random.split(key)
             x = jax.random.normal(eps_key, images_shape)
             if FLAGS.model.train_type == 'moe3':
-                labels = assign_labels_from_noise(x, moe3_centroids, moe3_bias)
+                if FLAGS.model.moe3_condition_on_k:
+                    labels = assign_labels_from_noise(x, moe3_centroids, moe3_bias)
+                else:
+                    labels = jnp.zeros((images_shape[0],), dtype=jnp.int32)
             else:
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
             x, labels = shard_data(x, labels)

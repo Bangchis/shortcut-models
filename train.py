@@ -78,6 +78,7 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_dt_bias': 0,
     'moe3_cache_dir': '/kaggle/working/moe3_cache',
     'moe3_num_clusters': 32,
+    'moe3_condition_on_k': 0,
     'moe3_window_length': 32,
     'moe3_kmeans_iters': 20,
     'moe3_balance_lambda': 0.2,
@@ -169,10 +170,14 @@ def main(_):
             raise ValueError('moe3 requires --model.use_stable_vae 1')
         if FLAGS.model.cfg_scale != 1:
             raise ValueError('moe3 requires --model.cfg_scale 1')
-        if FLAGS.model.class_dropout_prob != 0:
-            raise ValueError('moe3 requires --model.class_dropout_prob 0')
-        if FLAGS.model.num_classes != FLAGS.model.moe3_num_clusters:
-            raise ValueError('moe3 requires --model.num_classes == --model.moe3_num_clusters')
+        if FLAGS.model.moe3_condition_on_k:
+            if FLAGS.model.num_classes != FLAGS.model.moe3_num_clusters:
+                raise ValueError('moe3 with k conditioning requires --model.num_classes == --model.moe3_num_clusters')
+        else:
+            if FLAGS.model.num_classes != 1:
+                raise ValueError('moe3 no-k requires --model.num_classes 1')
+            if FLAGS.model.class_dropout_prob != 0:
+                raise ValueError('moe3 no-k requires --model.class_dropout_prob 0')
         if FLAGS.mode == 'train':
             from utils.moe3 import prepare_moe3_cache
             moe3_cache = prepare_moe3_cache(FLAGS, vae_encode, dataset_data_dir)

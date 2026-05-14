@@ -4,7 +4,7 @@ import numpy as np
 
 
 def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1):
-    time_key = key
+    label_key, time_key = jax.random.split(key)
     info = {}
 
     t = jax.random.randint(
@@ -26,6 +26,17 @@ def get_targets(FLAGS, key, train_state, images, labels, force_t=-1, force_dt=-1
 
     dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
     dt_base = jnp.ones(images.shape[0], dtype=jnp.int32) * dt_flow
+
+    if FLAGS.model.moe3_condition_on_k:
+        labels_dropout = jax.random.bernoulli(
+            label_key, FLAGS.model['class_dropout_prob'], (labels.shape[0],))
+        labels = jnp.where(labels_dropout, FLAGS.model['num_classes'], labels)
+        info['moe3/dropped_ratio'] = jnp.mean(labels == FLAGS.model['num_classes'])
+        info['moe3/condition_on_k'] = jnp.array(1.0, dtype=jnp.float32)
+    else:
+        labels = jnp.zeros(labels.shape, dtype=jnp.int32)
+        info['moe3/dropped_ratio'] = jnp.array(0.0, dtype=jnp.float32)
+        info['moe3/condition_on_k'] = jnp.array(0.0, dtype=jnp.float32)
 
     info['moe3/x0_norm'] = jnp.sqrt(jnp.mean(jnp.square(x_0)))
     info['moe3/x1_norm'] = jnp.sqrt(jnp.mean(jnp.square(x_1)))

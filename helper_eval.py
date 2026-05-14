@@ -27,7 +27,9 @@ def eval_moe3_fid(
     from utils.moe3 import load_moe3_inference_state, assign_labels_from_noise
 
     with jax.spmd_mode('allow_all'):
-        centroids, bias = load_moe3_inference_state(FLAGS.model.moe3_cache_dir)
+        centroids, bias = None, None
+        if FLAGS.model.moe3_condition_on_k:
+            centroids, bias = load_moe3_inference_state(FLAGS.model.moe3_cache_dir)
 
         @partial(jax.jit, static_argnums=(5,))
         def call_model(train_state, images, t, dt, labels, use_ema=True):
@@ -49,7 +51,10 @@ def eval_moe3_fid(
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, _ = jax.random.split(key)
                 x = jax.random.normal(eps_key, image_shape)
-                labels = assign_labels_from_noise(x, centroids, bias)
+                if FLAGS.model.moe3_condition_on_k:
+                    labels = assign_labels_from_noise(x, centroids, bias)
+                else:
+                    labels = np.zeros((image_shape[0],), dtype=np.int32)
                 label_counts += np.bincount(
                     np.asarray(labels), minlength=FLAGS.model.num_classes)
                 x, labels = shard_data(x, labels)
